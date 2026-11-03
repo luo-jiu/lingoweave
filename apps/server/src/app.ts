@@ -4,10 +4,15 @@ import { isAbsolute, join } from 'node:path';
 import fastifyStatic from '@fastify/static';
 import { type ApiError, type HealthResponse } from '@lingoweave/contracts';
 import Fastify from 'fastify';
+import { ZodError } from 'zod';
+import { LearningError } from './learning-store.js';
+import { registerLearningRoutes } from './learning-routes.js';
+import type { PreparationService } from './preparation-service.js';
 
 export interface AppOptions {
   logger?: boolean;
   staticRoot?: string;
+  learning?: PreparationService;
 }
 
 function errorBody(code: string, message: string, requestId: string): ApiError {
@@ -58,6 +63,16 @@ export function buildApp(options: AppOptions = {}) {
   }));
 
   app.setErrorHandler((error, request, reply) => {
+    if (error instanceof LearningError) {
+      void reply.code(error.statusCode).send(errorBody(error.code, error.message, request.id));
+      return;
+    }
+    if (error instanceof ZodError) {
+      void reply
+        .code(400)
+        .send(errorBody('INVALID_INPUT', '提交内容格式不正确，请刷新页面后重试。', request.id));
+      return;
+    }
     const errorDetails = typeof error === 'object' && error !== null ? error : {};
     const suppliedStatus = 'statusCode' in errorDetails ? errorDetails.statusCode : undefined;
     const statusCode =
@@ -78,6 +93,8 @@ export function buildApp(options: AppOptions = {}) {
     const message = statusCode >= 500 ? 'An internal error occurred.' : 'The request is invalid.';
     void reply.code(statusCode).send(errorBody(code, message, request.id));
   });
+
+  if (options.learning) registerLearningRoutes(app, options.learning);
 
   if (options.staticRoot) {
     app.register(fastifyStatic, { root: options.staticRoot });

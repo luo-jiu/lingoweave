@@ -12,6 +12,7 @@ uploads/
 exports/
 *.sqlite
 *.sqlite-*
+*.sqlite.lock
 .pnpm-store/
 .vscode/
 .idea/

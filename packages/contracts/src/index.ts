@@ -1,5 +1,7 @@
 import { z } from 'zod';
 
+export * from './learning.js';
+
 export const healthResponseSchema = z.object({
   status: z.literal('ok'),
   service: z.literal('lingoweave-api'),
