@@ -1,0 +1,17 @@
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+.DS_Store
+*.log
+.env
+.env.*
+!.env.example
+data/
+uploads/
+exports/
+*.sqlite
+*.sqlite-*
+.pnpm-store/
+.vscode/
+.idea/
