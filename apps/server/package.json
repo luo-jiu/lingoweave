@@ -7,12 +7,13 @@
     "dev": "tsx watch src/index.ts",
     "typecheck": "tsc --noEmit",
     "build": "tsc -p tsconfig.build.json",
-    "test": "node --import tsx --test src/*.test.ts",
+    "test": "node --import tsx --test src/*.test.ts src/codex/*.test.ts",
     "start": "node dist/index.js"
   },
   "dependencies": {
     "@fastify/static": "8.3.0",
     "@lingoweave/contracts": "workspace:*",
+    "@modelcontextprotocol/sdk": "1.32.2",
     "fastify": "5.12.8",
     "zod": "4.6.7"
   }

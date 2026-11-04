@@ -132,11 +132,19 @@ test('missing production frontend build fails before startup', () => {
 });
 
 test('configuration uses local defaults and accepts valid overrides', () => {
-  assert.deepEqual(parseConfig({}), { nodeEnv: 'development', host: '127.0.0.1', port: 4310 });
+  assert.deepEqual(parseConfig({}), {
+    nodeEnv: 'development',
+    host: '127.0.0.1',
+    port: 4310,
+    dataDir: 'data',
+    codexBin: 'codex',
+  });
   assert.deepEqual(parseConfig({ NODE_ENV: 'production', HOST: '127.0.0.1', PORT: '4321' }), {
     nodeEnv: 'production',
     host: '127.0.0.1',
     port: 4321,
+    dataDir: 'data',
+    codexBin: 'codex',
   });
 });
 
