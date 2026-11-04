@@ -61,6 +61,7 @@ pnpm start
 
 ## 开发入口
 
+- [文档导航](docs/README.md)：当前规范、完整研究资料与历史方案的统一入口。
 - [产品规则](docs/product.md)：学习流程、算法与 AI 的职责。
 - [架构说明](docs/architecture.md)：已实现的备课链路与后续模块。
 - [开发指南](docs/development.md)：Node.js / TypeScript 后端运行方式、配置与恢复。

@@ -9,6 +9,7 @@ LingoWeave（语织）是面向个人英语读写学习的独立应用。当前�
 - `apps/server`：Node.js、TypeScript、Fastify 后端。修改前阅读该目录的 `AGENTS.md`。
 - `packages/contracts`：前后端共用的接口结构与运行时校验，不能依赖浏览器或服务端框架。
 - `docs`：架构、开发指南、产品与 Demo 计划。更新文档时区分已实现能力和后续计划。
+- 项目文档统一维护在 `docs/`，入口见 `docs/README.md`；不再向下载目录写入或同步方案副本。`docs/research/` 保存研究依据与验证材料，`docs/archive/` 仅保留历史原稿；当前规则以产品文档、实施计划和专题规则为准。
 
 ## 通用规则
 

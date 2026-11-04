@@ -1,0 +1,159 @@
+{
+  "purpose": "Mechanism verification with scripted outcomes; not evidence of learning efficacy or calibrated recall probabilities.",
+  "library": "v5.4.2 using FSRS-6.0",
+  "node": "v22.22.0",
+  "parameters": {
+    "request_retention": 0.9,
+    "maximum_interval": 36500,
+    "w": [
+      0.212, 1.2931, 2.3065, 8.2956, 6.4133, 0.8334, 3.0194, 0.001, 1.8722, 0.1666, 0.796, 1.4835,
+      0.0614, 0.2629, 1.6483, 0.6014, 1.8729, 0.5425, 0.0912, 0.0658, 0.1542
+    ],
+    "enable_fuzz": false,
+    "enable_short_term": true,
+    "learning_steps": ["10m"],
+    "relearning_steps": ["10m"]
+  },
+  "exampleHistory": [
+    {
+      "reviewedAt": "2026-11-02T01:00:00.000Z",
+      "stability": 2.3065,
+      "nextDue": "2026-11-04T01:00:00.000Z"
+    },
+    {
+      "reviewedAt": "2026-11-04T01:00:00.000Z",
+      "stability": 10.96433194,
+      "nextDue": "2026-11-15T01:00:00.000Z"
+    },
+    {
+      "reviewedAt": "2026-11-15T01:00:00.000Z",
+      "stability": 46.28021494,
+      "nextDue": "2026-12-31T01:00:00.000Z"
+    }
+  ],
+  "aging": [
+    {
+      "daysSinceLastReview": 0,
+      "predictedRecall": 1
+    },
+    {
+      "daysSinceLastReview": 7,
+      "predictedRecall": 0.9789052
+    },
+    {
+      "daysSinceLastReview": 30,
+      "predictedRecall": 0.92694868
+    },
+    {
+      "daysSinceLastReview": 46,
+      "predictedRecall": 0.90041669
+    },
+    {
+      "daysSinceLastReview": 90,
+      "predictedRecall": 0.8482997
+    },
+    {
+      "daysSinceLastReview": 180,
+      "predictedRecall": 0.78482477
+    }
+  ],
+  "lateReview": {
+    "actualElapsedDays": 90,
+    "beforeStability": 46.28021494,
+    "afterGoodStability": 227.66039718,
+    "afterAgainStability": 3.19563928
+  },
+  "capacityScenario": {
+    "firstDayStudied": 100,
+    "nextDayWordBudget": 1,
+    "nextDayDueBefore": 60,
+    "selected": "word-000",
+    "unchangedTargets": 99,
+    "absentDayBudget": 0,
+    "returnDay": 21,
+    "returnSelection": "word-001"
+  },
+  "groupScenario": {
+    "id": "group-1",
+    "words": ["g1", "g2", "g3", "g4", "g5"],
+    "completed": ["g1", "g2", "g3"]
+  },
+  "checks": [
+    {
+      "name": "Unobserved time decreases predicted recall without mutating the card",
+      "passed": true
+    },
+    {
+      "name": "A previously stable word becomes due without an additional failure",
+      "passed": true
+    },
+    {
+      "name": "An unassessed new word has unknown recall, not a measured zero",
+      "passed": true
+    },
+    {
+      "name": "Late success uses the actual elapsed interval",
+      "passed": true
+    },
+    {
+      "name": "An observed failure changes stability and adds one lapse",
+      "passed": true
+    },
+    {
+      "name": "After 100 studied words, a one-word budget selects only one target",
+      "passed": true
+    },
+    {
+      "name": "The 99 unselected words retain all real dates, counts and memory states",
+      "passed": true
+    },
+    {
+      "name": "A zero-word day produces no selection or memory change",
+      "passed": true
+    },
+    {
+      "name": "After a 20-day absence the current queue can be rebuilt without resetting history",
+      "passed": true
+    },
+    {
+      "name": "A stale plan is not the complete candidate set after a long interruption",
+      "passed": true
+    },
+    {
+      "name": "The persisted fifth-target slot protects an older word even with one word per session",
+      "passed": true
+    },
+    {
+      "name": "A supported practice moves the fairness turn without changing the memory due date",
+      "passed": true
+    },
+    {
+      "name": "A taught but unassessed word can be selected without fabricating a recall probability",
+      "passed": true
+    },
+    {
+      "name": "An unassessed word can reach a fairness slot even with an existing review backlog",
+      "passed": true
+    },
+    {
+      "name": "Retrying the same answer does not apply a second FSRS update",
+      "passed": true
+    },
+    {
+      "name": "Copying after reveal and uncertain grading preserve evidence without changing FSRS",
+      "passed": true
+    },
+    {
+      "name": "Exiting after three of five leaves the group partial and preserves three completed targets",
+      "passed": true
+    },
+    {
+      "name": "A one-word continuation can resume the same group without requiring the other four",
+      "passed": true
+    },
+    {
+      "name": "Completing meaning recall does not update an untested spelling state",
+      "passed": true
+    }
+  ]
+}
