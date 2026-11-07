@@ -9,6 +9,29 @@
       content="LingoWeave 语织，一个从词汇出发、逐步练习英语阅读与表达的个人学习空间。"
     />
     <meta name="theme-color" content="#f7f8f2" />
+    <script>
+      // Set the first frame before loading the app; runtime changes live in lib/theme.ts.
+      (() => {
+        let preference = 'system';
+        try {
+          const stored = localStorage.getItem('lingoweave.theme');
+          if (stored === 'light' || stored === 'dark') preference = stored;
+        } catch {
+          // Theme switching also works when browser storage is unavailable.
+        }
+        const theme =
+          preference === 'system'
+            ? matchMedia('(prefers-color-scheme: dark)').matches
+              ? 'dark'
+              : 'light'
+            : preference;
+        document.documentElement.dataset.theme = theme;
+        document.documentElement.style.colorScheme = theme;
+        document
+          .querySelector('meta[name="theme-color"]')
+          ?.setAttribute('content', theme === 'dark' ? '#151e19' : '#f7f8f2');
+      })();
+    </script>
     <title>LingoWeave · 语织</title>
   </head>
   <body>

@@ -102,18 +102,24 @@ export function PreparationWorkspace() {
     <div className="preparation-workspace">
       <section className="workspace-intro" aria-labelledby="workspace-title">
         <div>
-          <div className="eyebrow">
+          <div className="eyebrow" data-compact-hide>
             <span aria-hidden="true" />
             你的英语读写学习空间
           </div>
-          <h1 id="workspace-title">
+          <h1 id="workspace-title" data-compact-hide>
             先从五个词，
             <br />
             开始编织。
           </h1>
-          <p>给自己一个小小的起点。让 AI 准备简单例句，慢慢把单词放进句子里。</p>
+          <p data-compact-hide>给自己一个小小的起点。让 AI 准备简单例句，慢慢把单词放进句子里。</p>
+          <div className="study-entry">
+            <a className="primary-button study-entry-link" href="/study">
+              开始学习 <span aria-hidden="true">↗</span>
+            </a>
+            <span>体验新版学习空间 · 使用演示词组</span>
+          </div>
         </div>
-        <div className="workspace-note">
+        <div className="workspace-note" data-compact-hide>
           <span className="note-star" aria-hidden="true">
             ✳
           </span>
@@ -130,13 +136,15 @@ export function PreparationWorkspace() {
         <div className="learning-main">
           <section className="preparation-panel" aria-labelledby="preparation-title">
             <div className="panel-topline">
-              <span className="section-label">YOUR FIRST WORDS</span>
+              <span className="section-label" data-compact-hide>
+                YOUR FIRST WORDS
+              </span>
               <span className="small-tag">备课体验</span>
             </div>
             <div className="preparation-heading">
               <div>
                 <h2 id="preparation-title">{snapshot?.group?.title ?? '我的第一组学习材料'}</h2>
-                <p className="panel-description">
+                <p className="panel-description" data-compact-hide>
                   {ready
                     ? '材料已保存。重新打开页面，也能继续查看。'
                     : '平台选好词组，AI 为每个词准备一句简单英文和中文释义。'}
@@ -265,7 +273,9 @@ export function PreparationWorkspace() {
 
         <aside className="learning-sidebar" aria-label="备课助手与状态">
           <section className="runtime-panel" id="connection" aria-labelledby="runtime-title">
-            <div className="section-label">YOUR PREPARATION ASSISTANT</div>
+            <div className="section-label" data-compact-hide>
+              YOUR PREPARATION ASSISTANT
+            </div>
             <div className="connection-heading">
               <h2 id="runtime-title">备课助手</h2>
               <span
@@ -314,7 +324,9 @@ export function PreparationWorkspace() {
 
           <section className="assistant-panel" aria-labelledby="assistant-title">
             <div className="panel-topline">
-              <div className="section-label">PREPARATION NOTES</div>
+              <div className="section-label" data-compact-hide>
+                PREPARATION NOTES
+              </div>
               <span
                 className={`stream-label ${state.streamState === 'reconnecting' ? 'is-disconnected' : ''}`}
               >

@@ -1,20 +1,13 @@
 import { PreparationWorkspace } from './features/PreparationWorkspace';
-
-function WeaveMark() {
-  return (
-    <svg viewBox="0 0 48 48" fill="none" aria-hidden="true">
-      <rect width="48" height="48" rx="14" fill="currentColor" />
-      <path
-        d="M13 13v15a7 7 0 0 0 7 7h15M23 13v15a7 7 0 0 0 7 7M13 23h15a7 7 0 0 1 7 7v5"
-        stroke="#eaf3bd"
-        strokeWidth="3"
-        strokeLinecap="round"
-      />
-    </svg>
-  );
-}
+import { StudyWorkspace } from './features/StudyWorkspace';
+import { WeaveMark } from './components/WeaveMark';
+import { AppearanceSettings } from './components/AppearanceSettings';
 
 export function App() {
+  if (window.location.pathname.replace(/\/$/, '') === '/study') {
+    return <StudyWorkspace />;
+  }
+
   return (
     <>
       <a className="skip-link" href="#main">
@@ -30,10 +23,13 @@ export function App() {
               LingoWeave <span>语织</span>
             </span>
           </a>
-          <nav aria-label="页面导航">
-            <a href="#words">本组词条</a>
-            <a href="#connection">备课助手</a>
-          </nav>
+          <div className="site-header-actions">
+            <nav aria-label="页面导航">
+              <a href="#words">本组词条</a>
+              <a href="#connection">备课助手</a>
+            </nav>
+            <AppearanceSettings />
+          </div>
         </header>
         <main id="main">
           <PreparationWorkspace />

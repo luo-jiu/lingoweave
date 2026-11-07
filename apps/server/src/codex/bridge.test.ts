@@ -42,7 +42,10 @@ async function fixture(t: TestContext, scenario = 'success', turnTimeoutMs = 1_0
   `,
     { mode: 0o755 },
   );
-  const bridge = new CodexBridge({ cwd, executable, requestTimeoutMs: 1_000, turnTimeoutMs });
+  // These are protocol/behavior tests: allow for cold child-process startup
+  // while the workspace suites run in parallel. Dedicated timeout scenarios
+  // retain their explicit short deadlines below and in transport.test.ts.
+  const bridge = new CodexBridge({ cwd, executable, requestTimeoutMs: 5_000, turnTimeoutMs });
   t.after(() => bridge.close());
   return bridge;
 }

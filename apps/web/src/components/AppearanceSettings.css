@@ -1,0 +1,79 @@
+.appearance-settings {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+  gap: 6px;
+}
+
+.appearance-settings-trigger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 33px;
+  height: 33px;
+  padding: 0;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  background: var(--color-surface);
+  color: var(--color-muted);
+  cursor: pointer;
+}
+
+.appearance-settings-trigger:hover,
+.appearance-settings-trigger[aria-expanded='true'] {
+  border-color: var(--color-focus);
+  color: var(--color-text);
+}
+
+.appearance-settings-panel {
+  position: fixed;
+  inset: 72px 16px auto auto;
+  width: 288px;
+  max-width: calc(100vw - 32px);
+  max-height: calc(100dvh - 32px);
+  margin: 0;
+  padding: 18px;
+  overflow: auto;
+  border: 1px solid var(--color-border);
+  border-radius: 12px;
+  background: var(--color-surface);
+  color: var(--color-text);
+  box-shadow: 0 12px 32px #10201824;
+  font-size: 13px;
+  line-height: 1.6;
+  white-space: normal;
+}
+
+.appearance-compact-option {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: fit-content;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.appearance-compact-option input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  accent-color: var(--color-primary);
+}
+
+.appearance-settings-panel p {
+  margin: 8px 0 0 25px;
+  color: var(--color-muted);
+}
+
+html[data-compact='true'] [data-compact-hide] {
+  display: none;
+}
+
+html[data-compact='true'] .workspace-intro {
+  padding: 24px 0;
+}
+
+html[data-compact='true'] .study-entry {
+  margin-top: 0;
+}

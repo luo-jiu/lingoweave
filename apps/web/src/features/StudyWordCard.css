@@ -1,0 +1,97 @@
+.study-card-tools {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  min-height: 26px;
+}
+
+.study-card-practice-toggle {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--color-muted);
+}
+
+.study-card-practice-toggle:hover {
+  border-color: var(--color-border);
+  background: var(--color-surface);
+  color: var(--color-text);
+}
+
+.study-word-card:has(> .study-card-practice) {
+  display: flex;
+  flex-direction: column;
+}
+
+.study-card-practice {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding-top: 6px;
+  min-width: 0;
+  animation: study-reveal 180ms ease-out;
+}
+
+.study-card-practice .study-word-meaning {
+  margin: 0;
+  line-height: 20px;
+  text-align: center;
+  overflow-wrap: anywhere;
+}
+
+.study-card-practice .study-card-practice-input {
+  width: 100%;
+  min-width: 0;
+  height: 44px;
+  border: 1px solid var(--color-border);
+  border-radius: 7px;
+  background: var(--color-input, #fff);
+  padding: 0 7px;
+  font:
+    21px/1.4 Georgia,
+    serif;
+  color: var(--color-text);
+  text-align: center;
+}
+
+.study-card-practice-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  width: 100%;
+  gap: 6px;
+  margin-top: auto;
+}
+
+.study-card-practice-actions :is(.primary-button, .secondary-button) {
+  height: 34px;
+  padding: 0 6px;
+  font-size: 12px;
+}
+
+.study-card-practice-feedback {
+  min-height: 18px;
+  width: 100%;
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--color-text);
+  text-align: center;
+  overflow-wrap: anywhere;
+}
+
+.study-card-practice-feedback[data-correct='false'] {
+  color: var(--color-error-text, #8e4d36);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .study-card-practice {
+    animation: none;
+  }
+}
