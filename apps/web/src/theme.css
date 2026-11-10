@@ -1,0 +1,84 @@
+/* Core colors are shared by page chrome and the theme control. */
+:root {
+  color-scheme: light;
+  --color-canvas: #f7f8f2;
+  --color-text: #253c31;
+  --color-surface: #fdfef9;
+  --color-border: #dfe5d6;
+  --color-muted: #65725f;
+  --color-primary: #254e3c;
+  --color-on-primary: #fff;
+  --color-primary-hover: #34634c;
+  --color-focus: #598a4b;
+  --color-logo-stroke: #eaf3bd;
+
+  --color-review-forgotten-surface: #fbefeb;
+  --color-review-forgotten-border: #e9cfc4;
+  --color-review-fuzzy-surface: #faf6e5;
+  --color-review-fuzzy-border: #e4dbb5;
+  --color-review-clear-surface: #f0f4e8;
+  --color-review-clear-border: #cbd9bd;
+}
+
+/* Daylight fallbacks in the component styles preserve their original colors.
+   Night mode supplies semantic colors for every surface and interaction state. */
+:root[data-theme='dark'] {
+  color-scheme: dark;
+  --color-canvas: #151e19;
+  --color-text: #e3ebdf;
+  --color-surface: #1b2720;
+  --color-border: #3b4b3c;
+  --color-muted: #acbba4;
+  --color-primary: #aec49c;
+  --color-on-primary: #17251b;
+  --color-primary-hover: #c1d3af;
+  --color-focus: #b4cf98;
+  --color-logo-stroke: #243b2b;
+
+  --color-text-strong: #d0e0c8;
+  --color-text-secondary: #bbcab0;
+  --color-text-muted: #acbba4;
+  --color-text-subtle: #96a68e;
+  --color-disabled-text: #84907c;
+  --color-disabled-surface: #28332a;
+
+  --color-surface-soft: #223128;
+  --color-surface-hover: #2b3d2e;
+  --color-note-surface: #2d3b2b;
+  --color-table-surface: #1b2720;
+  --color-input: #152019;
+  --color-chat-message: #2b3e2c;
+  --color-divider: #344334;
+  --color-border-soft: #3b4b3c;
+  --color-scrollbar: #4f6349;
+
+  --color-active-step: #a6bf91;
+  --color-on-active-step: #17251b;
+  --color-active-step-ring: #8fa47626;
+  --color-accent-indicator: #98b878;
+  --color-offline-indicator: #8b9b84;
+  --color-success-indicator: #98b878;
+  --color-success-halo: #98b87820;
+  --color-success-surface: #2a3d2a;
+  --color-success-surface-hover: #354a2e;
+  --color-success-border: #5a7350;
+
+  --color-warning-indicator: #d4bd70;
+  --color-warning-text: #d8cb8c;
+  --color-warning-halo: #d4bd7020;
+  --color-warning-surface: #363322;
+  --color-warning-border: #716641;
+
+  --color-error-indicator: #e2a089;
+  --color-error-text: #efb49a;
+  --color-error-halo: #e2a08920;
+  --color-error-surface: #3d2c25;
+  --color-error-border: #7b5a45;
+
+  --color-review-forgotten-surface: #352824;
+  --color-review-forgotten-border: #6d4e42;
+  --color-review-fuzzy-surface: #333121;
+  --color-review-fuzzy-border: #6b613e;
+  --color-review-clear-surface: #2a3d2a;
+  --color-review-clear-border: #5a7350;
+}
