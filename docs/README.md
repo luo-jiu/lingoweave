@@ -9,6 +9,7 @@
 | [产品与学习规则](product.md)                       | 学什么、怎样学、学习事实与 AI 的职责边界 |
 | [首个 Demo 实施计划](demo-plan.md)                 | 当前唯一实施计划、开发阶段与验收范围     |
 | [学习工作区交互原型](study-workspace-prototype.md) | 本次界面、复习循环、演示边界与下一步接入 |
+| [macOS 悬浮词卡](macos-mini.md)                    | 独立小窗的构建、词表和 AI 聊天           |
 | [架构](architecture.md)                            | 已实现模块、数据保存与 Codex 接入        |
 | [开发指南](development.md)                         | 启动、配置、检查与恢复                   |
 | [测量规则](measurement-rules.md)                   | 独立回忆、帮助、间隔与成绩资格           |
