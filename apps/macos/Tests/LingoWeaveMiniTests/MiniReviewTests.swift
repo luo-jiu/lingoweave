@@ -14,7 +14,8 @@ struct MiniReviewTests {
         tests.testEmptyAndRepeatedDeckEntries()
         tests.testJudgmentProgressKeepsDeckOrderAndDistinguishesCappedWords()
         tests.testSpellingProgressKeepsCorrectionsPendingUntilLaterFirstSuccess()
-        print("7 review behavior tests passed.")
+        tests.testErrorRetriesKeepFirstCorrectWordsOutAndCapAtFive()
+        print("8 review behavior tests passed.")
     }
 
     private func expect(_ condition: Bool, file: StaticString = #file, line: UInt = #line) {
@@ -190,6 +191,28 @@ struct MiniReviewTests {
         expect(session.advanceSpelling())
         expect(session.progressDots.map(\.id) == words)
         expect(session.progressDots.map(\.state) == [.passed, .passed, .passed])
+    }
+
+    private func testErrorRetriesKeepFirstCorrectWordsOutAndCapAtFive() {
+        var session = MiniReviewSession(words: [apple, book], startingWithSpelling: true)
+        expect(session.submitSpelling("apple"))
+        expect(session.currentWord == apple && session.spellingState == .readyToAdvance)
+        expect(session.advanceSpelling() && session.currentWord == book)
+        for round in 1...5 {
+            expect(session.currentWord == book && session.currentSpellingRound == round)
+            expect(session.submitSpelling("miss-\(round)"))
+            if round < 5 {
+                expect(session.spellingState == .correcting && !session.advanceSpelling())
+                expect(session.submitSpelling("book") && session.spellingState == .readyToAdvance)
+                expect(session.advanceSpelling())
+            }
+        }
+        expect(session.phase == .finished && session.currentWord == nil)
+        expect(session.spellingSkips?.map(\.word) == [book])
+        expect(session.spellingAttempts.filter { $0.word == apple }.count == 1)
+        expect(session.spellingAttempts.filter { $0.word == book && $0.kind == .first }.count == 5)
+        expect(session.spellingAttempts.filter { $0.word == book && $0.kind == .correction }.count == 4)
+        expect(session.progressDots.map(\.state) == [.passed, .capped])
     }
 
     private func readyForSpelling(_ words: [MiniWord]) -> MiniReviewSession {

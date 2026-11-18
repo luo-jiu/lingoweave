@@ -6,18 +6,54 @@ struct MiniHomeView: View {
     let start: () -> Void
     var error: String? = nil
     var hasLegacyReview = false
+    var context: MiniPlanContext? = nil
+    var saving = false
+    var startRecovery: (() -> Void)? = nil
+    var overrideRest: (() -> Void)? = nil
+    var openPlan: (() -> Void)? = nil
+    var continueGroup: ((String) -> Void)? = nil
+    var deckName = "自定义词表"
+    var assessmentClient: MiniAssessmentClient? = nil
+    var assessmentUpdated: (() async -> Void)? = nil
+    var assessmentPreview: MiniAssessmentSnapshot? = nil
+    var assessmentPreviewDetail: MiniAssessmentDetail? = nil
+    @State private var showingRetainedGroups = false
+    @State private var showingActivity = false
 
     var body: some View {
-        let calendar = Calendar.current
+        var calendar = Calendar.current
+        if let timezone = context?.timezone, let zone = TimeZone(identifier: timezone) { calendar.timeZone = zone }
         let now = Date.now
         let activity = ledger.map { MiniActivityGrid(ledger: $0, now: now, calendar: calendar) }
 
-        VStack(spacing: 8) {
+        return VStack(spacing: 8) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 10) {
-                    plan(now: now, calendar: calendar)
+                    plan
+                    if let ledger {
+                        todayActivity(MiniTodayActivity(ledger: ledger, now: now, calendar: calendar))
+                    }
+                    if let context, !context.pendingGroups.isEmpty {
+                        retainedGroups(context)
+                    }
+                    if assessmentClient != nil || assessmentPreview != nil {
+                        MiniAssessmentHomeView(client: assessmentClient, preview: assessmentPreview,
+                                               previewDetail: assessmentPreviewDetail, didUpdate: assessmentUpdated)
+                            .id(assessmentPreview?.jobs.first?.status.rawValue ?? "live")
+                    }
                     if let activity {
-                        heatmap(activity)
+                        DisclosureGroup(isExpanded: $showingActivity) {
+                            heatmap(activity)
+                        } label: {
+                            HStack {
+                                Text("学习记录")
+                                Spacer(minLength: 4)
+                                Text("近 4 个月 · \(activity.activeDays) 天")
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .font(.caption)
+                        .accessibilityIdentifier("homeActivity")
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -25,10 +61,12 @@ struct MiniHomeView: View {
                 .padding(.bottom, 2)
             }
 
-            if let action = actionLabel(now: now, calendar: calendar) {
-                Button(action, action: start)
-                    .buttonStyle(.borderedProminent)
-                    .accessibilityIdentifier("startDailyStudy")
+            VStack(spacing: 4) {
+                if let next = nextTaskDescription {
+                    Text(next).font(.caption).foregroundStyle(.secondary)
+                }
+                homeActions(now: now, calendar: calendar)
+                    .disabled(saving)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -36,48 +74,152 @@ struct MiniHomeView: View {
     }
 
     @ViewBuilder
-    private func plan(now: Date, calendar: Calendar) -> some View {
-        if let day {
-            let isToday = calendar.isDate(day.startedAt, inSameDayAs: now)
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(alignment: .firstTextBaseline, spacing: 6) {
-                    Text(isToday ? "今日学习" : "上次任务")
-                        .font(.headline)
-                    Spacer(minLength: 4)
-                    Text(planStatus(day, isToday: isToday))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+    private var plan: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(alignment: .firstTextBaseline) {
+                Text("学习计划").font(.headline)
+                Spacer(minLength: 4)
+                if let context {
+                    Text(context.effective.mode.label).font(.caption).foregroundStyle(.secondary)
                 }
-
-                if day.translationCount > 0 {
-                    HStack(spacing: 6) {
-                        progressStat("复习", done: passedWords(day.review), total: day.reviewWords.count, unit: "词")
-                        progressStat("新词", done: passedWords(day.learning), total: day.learningWords.count, unit: "词")
-                        progressStat("翻译", done: day.translation.count { $0.feedback != nil }, total: day.translationCount, unit: "题")
-                    }
+                if let openPlan {
+                    Button("调整", action: openPlan)
+                        .font(.caption)
+                        .buttonStyle(.plain)
+                        .foregroundStyle(Color.accentColor)
+                        .disabled(saving)
+                        .accessibilityIdentifier("homeOpenPlan")
                 }
             }
-        } else {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("今日学习").font(.headline)
-                if let error {
-                    Text(error).font(.caption).foregroundStyle(.secondary)
-                } else if ledger == nil {
-                    ProgressView("读取本机学习记录…").controlSize(.small)
-                } else {
-                    Text("还没有今日任务").font(.caption).foregroundStyle(.secondary)
+            Text(deckName).font(.callout).lineLimit(2)
+            if let context {
+                if context.effective.mode != .rest {
+                    Text("每日新词 \(context.effective.budget.effectiveDailyGoal) 词 · 每组 \(context.effective.budget.effectiveGroupSize) 词")
+                        .font(.caption).foregroundStyle(.secondary)
                 }
+                if context.recoverySuggested {
+                    Text("已有 \(context.absenceDays) 天未学习，可以先从 \(context.recoveryWordLimit) 个词恢复。")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                if let reason = context.blockedReason {
+                    Text(reason).font(.caption).foregroundStyle(.secondary)
+                }
+            } else if let error {
+                Text(error).font(.caption).foregroundStyle(.secondary)
+            } else if ledger == nil {
+                ProgressView("读取本机学习记录…").controlSize(.small)
             }
         }
     }
 
-    private func planStatus(_ day: MiniDailyDay, isToday: Bool) -> String {
-        if day.translationCount == 0 { return isToday ? "暂无待学或待复习的词" : "暂无学习任务" }
-        if day.phase == .finished { return "已完成" }
-        if day.paused { return "已暂停" }
-        if !isToday { return day.startedAt.formatted(.dateTime.month(.defaultDigits).day()) + " · 未完成" }
-        if hasStarted(day) { return "进行中" }
-        return "待开始"
+    private func todayActivity(_ activity: MiniTodayActivity) -> some View {
+        let completed = context?.completedNewCount ?? activity.completedNewWords
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .firstTextBaseline) {
+                Text("今日记录").font(.subheadline.weight(.semibold))
+                Spacer(minLength: 4)
+                if let context {
+                    Text("到期复习 \(context.dueCount) 词").font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            HStack(spacing: 6) {
+                activityStat(completed == nil ? "新词记忆" : "完成新词",
+                             value: completed ?? activity.learnedWords, unit: "词")
+                    .help(completed == nil ? "今天完成记忆的新词，按单词与释义去重"
+                          : "完成记忆、拼写及翻译确认的新词；不等待后台评价")
+                activityStat("复习练习", value: activity.reviewedWords, unit: "词")
+                    .help("今天实际判断或拼写过的复习词，重复练习只计一次")
+                activityStat("写作提交", value: activity.writingAnswers, unit: "题")
+                    .help("今天实际提交的翻译答案，等待反馈的答案也计入")
+            }
+        }
+        .accessibilityIdentifier("homeTodayActivity")
+    }
+
+    private var nextTaskDescription: String? {
+        guard !hasLegacyReview, context?.effective.mode != .rest else { return nil }
+        let pending: MiniDailyDay?
+        if let context {
+            pending = ledger?.days.first { $0.id == context.pendingDayId }
+        } else { pending = day }
+        guard let pending, pending.phase != .finished else { return nil }
+        let stage: String
+        switch pending.phase {
+        case .review:
+            stage = pending.memoryWindow != nil ? "复习重学" : (pending.review?.phase == .spelling ? "复习拼写" : "复习判断")
+        case .learning:
+            if let visit = pending.memoryWindow?.visit {
+                stage = ["初见记忆", "语境回忆", "词义回忆"][visit.stage]
+            } else if let memory = pending.memory, memory.round <= 3 {
+                stage = ["初见记忆", "语境回忆", "词义回忆"][max(0, memory.round - 1)]
+            } else {
+                stage = pending.nextUnstudiedWord == nil ? "新词拼写" : "新词记忆"
+            }
+        case .translation: stage = "写作练习"
+        case .finished: return nil
+        }
+        return "接着" + stage
+    }
+
+    private func retainedGroups(_ context: MiniPlanContext) -> some View {
+        DisclosureGroup(isExpanded: $showingRetainedGroups) {
+            VStack(alignment: .leading, spacing: 5) {
+                ForEach(context.pendingGroups) { group in
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Text(group.label + (ledger?.days.first { $0.id == group.dayId }?.flow == nil ? " · 旧流程" : "")).font(.caption)
+                        Spacer(minLength: 3)
+                        if group.canContinue, let continueGroup {
+                            Button("继续") { continueGroup(group.dayId) }
+                                .font(.caption)
+                                .disabled(saving)
+                        } else {
+                            Text("进度保留").font(.caption2).foregroundStyle(.secondary)
+                        }
+                    }
+                    if let reason = group.blockedReason {
+                        Text(reason).font(.caption2).foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .padding(.top, 3)
+        } label: {
+            HStack {
+                Text("保留任务")
+                Spacer(minLength: 4)
+                Text("\(context.pendingGroups.count) 组").foregroundStyle(.secondary)
+            }
+        }
+        .font(.caption)
+        .accessibilityIdentifier("homeRetainedGroups")
+    }
+
+    @ViewBuilder
+    private func homeActions(now: Date, calendar: Calendar) -> some View {
+        if let context {
+            if context.effective.mode == .rest {
+                if let overrideRest {
+                    Button("今天临时学一次", action: overrideRest)
+                        .accessibilityIdentifier("overrideRestDay")
+                }
+            } else if context.recoverySuggested, context.canContinue || context.canStart, let startRecovery {
+                Button("先恢复少量学习", action: startRecovery)
+                    .buttonStyle(.borderedProminent)
+                    .accessibilityIdentifier("startRecoveryStudy")
+                if context.pendingDayId != nil, context.canContinue {
+                    Button("按原容量继续", action: start)
+                }
+            } else if hasLegacyReview || context.canContinue || context.canStart {
+                Button(hasLegacyReview ? "继续复习" : (context.pendingDayId != nil ? "继续学习" : "开始学习"), action: start)
+                    .buttonStyle(.borderedProminent)
+                    .accessibilityIdentifier("startDailyStudy")
+            } else if let openPlan, context.blockedReason != nil {
+                Button("调整学习计划", action: openPlan)
+            }
+        } else if let action = actionLabel(now: now, calendar: calendar) {
+            Button(action, action: start)
+                .buttonStyle(.borderedProminent)
+                .accessibilityIdentifier("startDailyStudy")
+        }
     }
 
     private func actionLabel(now: Date, calendar: Calendar) -> String? {
@@ -85,24 +227,19 @@ struct MiniHomeView: View {
         guard let day else { return error == nil ? (ledger == nil ? nil : "开始学习") : "重试读取" }
         let isToday = calendar.isDate(day.startedAt, inSameDayAs: now)
         if day.phase == .finished { return isToday ? nil : "开始今日任务" }
-        if !isToday { return "继续上次任务" }
+        if !isToday { return "继续学习" }
         return hasStarted(day) || day.paused ? "继续学习" : "开始学习"
     }
 
     private func hasStarted(_ day: MiniDailyDay) -> Bool {
         day.review?.judgmentEvents.isEmpty == false || day.review?.spellingAttempts.isEmpty == false
-            || !day.studiedWords.isEmpty || !day.translation.isEmpty
+            || !day.studiedWords.isEmpty || !day.translation.isEmpty || day.flow?.window.events.isEmpty == false
     }
 
-    private func passedWords(_ session: MiniReviewSession?) -> Int {
-        guard let session, session.phase != .judgment else { return 0 }
-        return session.totalCount - session.remainingCount
-    }
-
-    private func progressStat(_ title: String, done: Int, total: Int, unit: String) -> some View {
+    private func activityStat(_ title: String, value: Int, unit: String) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             Text(title).font(.caption2).foregroundStyle(.secondary)
-            Text("\(done)/\(total)")
+            Text("\(value) \(unit)")
                 .font(.callout.monospacedDigit().weight(.semibold))
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -111,19 +248,11 @@ struct MiniHomeView: View {
         .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 5))
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(title)
-        .accessibilityValue("已完成 \(done) \(unit)，共 \(total) \(unit)")
+        .accessibilityValue("\(value) \(unit)")
     }
 
     private func heatmap(_ activity: MiniActivityGrid) -> some View {
         VStack(alignment: .leading, spacing: 5) {
-            HStack(alignment: .firstTextBaseline, spacing: 6) {
-                Text("学习记录").font(.subheadline.weight(.semibold))
-                Spacer(minLength: 4)
-                Text(activity.activeDays == 0 ? "近 4 个月无学习记录" : "近 4 个月活跃 \(activity.activeDays) 天")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
             GeometryReader { geometry in
                 let weekCount = CGFloat(max(activity.weeks.count, 1))
                 let available = geometry.size.width - 11 - weekCount * 3
@@ -267,7 +396,19 @@ private struct MiniActivityGrid {
                 for event in session.judgmentEvents { count(event.selectedAt) }
                 for attempt in session.spellingAttempts { count(attempt.submittedAt) }
             }
-            for exposure in day.studiedWords { count(exposure.at) }
+            if let flow = day.flow {
+                for group in flow.groups {
+                    for attempt in group.spelling.spellingAttempts { count(attempt.submittedAt) }
+                }
+                for event in flow.window.events { count(event.confirmedAt) }
+                if let selected = flow.window.visit?.selectedAt { count(selected) }
+            } else {
+                for exposure in day.studiedWords { count(exposure.at) }
+            }
+            if let relearning = day.review?.relearning {
+                for event in relearning.events { count(event.confirmedAt) }
+                if let selected = relearning.visit?.selectedAt { count(selected) }
+            }
             for attempt in day.translation { count(attempt.submittedAt) }
         }
 

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { apiErrorSchema, healthResponseSchema } from '@lingoweave/contracts';
@@ -138,6 +138,7 @@ test('configuration uses local defaults and accepts valid overrides', () => {
     port: 4310,
     dataDir: 'data',
     codexBin: 'codex',
+    miniTtsRoot: join(homedir(), 'sdks', 'lingoweave-tts'),
   });
   assert.deepEqual(parseConfig({ NODE_ENV: 'production', HOST: '127.0.0.1', PORT: '4321' }), {
     nodeEnv: 'production',
@@ -145,6 +146,7 @@ test('configuration uses local defaults and accepts valid overrides', () => {
     port: 4321,
     dataDir: 'data',
     codexBin: 'codex',
+    miniTtsRoot: join(homedir(), 'sdks', 'lingoweave-tts'),
   });
 });
 

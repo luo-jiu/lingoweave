@@ -19,7 +19,7 @@ struct MiniReviewSession: Codable, Equatable, Sendable {
     }
 
     enum SpellingState: String, Codable, Sendable {
-        case awaitingFirst, correcting, readyToAdvance
+        case awaitingFirst, correcting, readyToAdvance, skipped
     }
 
     struct JudgmentEvent: Codable, Equatable, Sendable {
@@ -43,29 +43,48 @@ struct MiniReviewSession: Codable, Equatable, Sendable {
         let submittedAt: Date
         let lastAnswerRevealAt: Date?
         let revealedAnswerAt: Date?
+        var lastPotentialHelpAt: Date? = nil
+    }
+
+    struct SpellingSkip: Codable, Equatable, Sendable {
+        let word: MiniWord
+        let round: Int
+        let at: Date
     }
 
     private let words: [MiniWord]
     private var queue: [MiniWord]
     private let fullBatchSpelling: Bool?
+    private let spellingPolicy: String?
+    var relearning: MiniMemoryWindow? = nil
+    var relearningWords: [MiniWord]? = nil
+    private(set) var spellingSkips: [SpellingSkip]? = nil
     private(set) var phase: Phase
     private(set) var judgmentEvents: [JudgmentEvent] = []
     private(set) var spellingAttempts: [SpellingAttempt] = []
     private(set) var spellingState: SpellingState = .awaitingFirst
     var spellingDraft = ""
 
-    init(words: [MiniWord], startingWithSpelling: Bool = false) {
+    init(words: [MiniWord], startingWithSpelling: Bool = false, usesErrorRetries: Bool = true) {
         var seen = Set<MiniWord>()
         let unique = words.filter { seen.insert($0).inserted }
         self.words = unique
         self.queue = unique
         self.fullBatchSpelling = startingWithSpelling ? true : nil
+        self.spellingPolicy = usesErrorRetries ? "retry-errors-v1" : nil
+        self.spellingSkips = usesErrorRetries ? [] : nil
         self.phase = unique.isEmpty ? .finished : (startingWithSpelling ? .spelling : .judgment)
     }
 
     var currentWord: MiniWord? { queue.first }
+    var usesWindowFlow: Bool { spellingPolicy == "retry-errors-v2" }
     var totalCount: Int { words.count }
     var remainingCount: Int { queue.count }
+    var currentSpellingRound: Int {
+        if let attempt = lastSpellingAttempt { return attempt.encounter }
+        guard let word = currentWord else { return 1 }
+        return spellingAttempts.count { $0.word == word && $0.kind == .first } + 1
+    }
 
     var progressDots: [MiniReviewProgressDot] {
         let waiting = Set(queue)
@@ -85,6 +104,8 @@ struct MiniReviewSession: Codable, Equatable, Sendable {
             let state: MiniReviewProgressDot.State
             if word == current {
                 state = .current
+            } else if spellingSkips?.contains(where: { $0.word == word }) == true {
+                state = .capped
             } else if !waiting.contains(word) {
                 state = phase == .judgment && !clearedJudgment.contains(word) ? .capped : .passed
             } else {
@@ -141,7 +162,7 @@ struct MiniReviewSession: Codable, Equatable, Sendable {
 
     @discardableResult
     mutating func submitSpelling(_ raw: String, at time: Date = .now) -> Bool {
-        guard phase == .spelling, spellingState != .readyToAdvance, let word = currentWord else { return false }
+        guard phase == .spelling, spellingState != .readyToAdvance, spellingState != .skipped, let word = currentWord else { return false }
         let answer = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !answer.isEmpty, raw != lastSpellingAttempt?.answer else { return false }
 
@@ -160,15 +181,24 @@ struct MiniReviewSession: Codable, Equatable, Sendable {
         ))
         spellingDraft = raw
         spellingState = correct ? .readyToAdvance : .correcting
+        if spellingPolicy == "retry-errors-v1", kind == .first, !correct, encounter >= 5 {
+            if spellingSkips == nil { spellingSkips = [] }
+            spellingSkips?.append(SpellingSkip(word: word, round: encounter, at: time))
+            spellingState = .skipped
+            advanceSpelling()
+        }
         return true
     }
 
     @discardableResult
     mutating func advanceSpelling() -> Bool {
-        guard phase == .spelling, spellingState == .readyToAdvance,
+        guard phase == .spelling, spellingState == .readyToAdvance || spellingState == .skipped,
               let attempt = lastSpellingAttempt else { return false }
         queue.removeFirst()
-        if fullBatchSpelling == true {
+        if spellingPolicy == "retry-errors-v1" {
+            let first = spellingAttempts.first { $0.word == attempt.word && $0.encounter == attempt.encounter && $0.kind == .first }
+            if first?.correct == false, attempt.encounter < 5 { queue.append(attempt.word) }
+        } else if fullBatchSpelling == true {
             if queue.isEmpty && spellingAttempts.contains(where: {
                 $0.encounter == attempt.encounter && $0.kind == .first && !$0.correct
             }) {

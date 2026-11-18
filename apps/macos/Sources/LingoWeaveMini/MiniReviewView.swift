@@ -1,18 +1,41 @@
 import AppKit
 import SwiftUI
 
+struct MiniReviewCommands {
+    let draft: Binding<String>
+    let chooseJudgment: (MiniReviewJudgment) -> Void
+    let advanceJudgment: (Bool) -> Void
+    let submitSpelling: (String) -> Void
+    var advanceSpelling: (() -> Void)? = nil
+    var openDictation: (() -> Void)? = nil
+    var clearJudgment: (() -> Void)? = nil
+}
+
 struct MiniReviewView: View {
     @Binding var session: MiniReviewSession
     var onFinish: () -> Void
     var finishTitle = "复习完成"
     var finishLabel = "开始学习"
-    var sentenceForWord: (MiniWord) -> (english: String, chinese: String)? = { _ in nil }
+    var sentenceForWord: (MiniWord) -> MiniStudySentence? = { _ in nil }
+    var playWord: (MiniWord) -> Void = { _ in }
+    var playSentence: (MiniStudySentence) -> Void = { _ in }
+    var playSpellingResult: (MiniWord) -> Void = { _ in }
+    var commands: MiniReviewCommands? = nil
+    var saving = false
+    @State private var hiddenSpellingReferenceAt: Int?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         VStack(spacing: 8) {
-            if session.totalCount > 0 {
-                progressDots
+            if session.totalCount > 0 { progressDots }
+            if session.phase != .judgment {
+                let skippedCount = session.spellingSkips?.count ?? 0
+                Text("\(skippedCount) 词已暂缓，将优先复练")
+                    .font(.caption2).foregroundStyle(.secondary)
+                    .lineLimit(1).frame(height: 14)
+                    .opacity(skippedCount == 0 ? 0 : 1)
+                    .accessibilityHidden(skippedCount == 0)
+                    .accessibilityIdentifier("spellingSkipNotice")
             }
 
             GeometryReader { area in
@@ -23,6 +46,12 @@ struct MiniReviewView: View {
                         .padding(.vertical, 8)
                         .frame(maxWidth: .infinity, minHeight: area.size.height)
                 }
+            }
+        }
+        .disabled(saving)
+        .onChange(of: session.spellingAttempts.count) { previous, current in
+            if current > previous, let attempt = session.spellingAttempts.last {
+                playSpellingResult(attempt.word)
             }
         }
     }
@@ -82,7 +111,7 @@ struct MiniReviewView: View {
         case .passed: "已通过"
         case .repeatNext: "下一轮继续"
         case .pending: "未轮到"
-        case .capped: "已达到判断次数上限"
+        case .capped: session.phase == .judgment ? "已达到判断次数上限" : "已暂缓，将优先复练"
         }
     }
 
@@ -95,7 +124,7 @@ struct MiniReviewView: View {
             if let word = session.currentWord { spelling(for: word) }
         case .finished:
             VStack(spacing: 12) {
-                Text(finishTitle).font(.headline)
+                Text(session.spellingSkips?.isEmpty == false ? "本轮拼写结束" : finishTitle).font(.headline)
                 Button(finishLabel, action: onFinish)
             }
         }
@@ -106,20 +135,22 @@ struct MiniReviewView: View {
             Text(word.spelling)
                 .font(.system(size: 35, weight: .semibold, design: .serif))
                 .accessibilityIdentifier("reviewEnglish")
+                .onTapGesture { playWord(word) }
+                .accessibilityAddTraits(.isButton)
 
             if session.currentJudgment != nil {
                 Text(word.meaning.isEmpty ? "暂无中文释义" : word.meaning)
                     .accessibilityIdentifier("reviewMeaning")
                 example(for: word)
                 HStack(spacing: 8) {
-                    Button("记错了") { session.advanceJudgment(markWrong: true) }
-                    Button("下一个") { session.advanceJudgment() }
+                    Button("记错了") { advanceJudgment(markWrong: true) }
+                    Button("下一个") { advanceJudgment(markWrong: false) }
                 }
             } else {
                 HStack(spacing: 8) {
-                    Button("遗忘") { session.chooseJudgment(.forgotten) }
-                    Button("模糊") { session.chooseJudgment(.fuzzy) }
-                    Button("清晰") { session.chooseJudgment(.clear) }
+                    Button("遗忘") { chooseJudgment(.forgotten) }
+                    Button("模糊") { chooseJudgment(.fuzzy) }
+                    Button("清晰") { chooseJudgment(.clear) }
                 }
             }
         }
@@ -130,7 +161,9 @@ struct MiniReviewView: View {
         if let sentence = sentenceForWord(word) {
             VStack(spacing: 3) {
                 Text(sentence.english).font(.callout)
-                Text(sentence.chinese).font(.caption).foregroundStyle(.secondary)
+                    .onTapGesture { playSentence(sentence) }
+                    .accessibilityAddTraits(.isButton)
+                Text(sentence.attributedTranslation).font(.caption).foregroundStyle(.secondary)
             }
             .textSelection(.enabled)
             .accessibilityIdentifier("studyExample")
@@ -139,6 +172,12 @@ struct MiniReviewView: View {
 
     private func spelling(for word: MiniWord) -> some View {
         let correcting = session.spellingState == .correcting
+        let accepted = session.spellingState == .readyToAdvance
+        let skipped = session.spellingState == .skipped
+        let draft = commands?.draft ?? $session.spellingDraft
+        let showingReference = skipped || (correcting
+            && hiddenSpellingReferenceAt != session.spellingAttempts.count
+            && session.lastSpellingAttempt?.answer == draft.wrappedValue)
 
         return VStack(spacing: 9) {
             Text(word.meaning)
@@ -147,33 +186,74 @@ struct MiniReviewView: View {
 
             VStack(spacing: 2) {
                 ReviewAnswerField(
-                    text: $session.spellingDraft,
-                    selectOnFocus: correcting && session.lastSpellingAttempt?.answer == session.spellingDraft,
-                    onSubmit: submitSpelling
+                    text: draft,
+                    selectOnFocus: correcting && showingReference,
+                    onSubmit: submitSpelling,
+                    accepted: accepted
                 )
                 .frame(height: 30)
                 Divider()
             }
             .frame(width: 206)
 
-            if correcting {
-                Text(word.spelling)
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .accessibilityLabel("正确拼写 \(word.spelling)")
-                    .accessibilityIdentifier("reviewExpectedSpelling")
+            ZStack(alignment: .top) {
+                Color.clear
+                VStack(spacing: 6) {
+                    if accepted || skipped {
+                        Button("下一词", action: advanceSpelling).keyboardShortcut(.defaultAction)
+                            .font(.caption)
+                            .accessibilityIdentifier("advanceCorrectSpelling")
+                    }
+                    if skipped {
+                        Text("已暂缓，将优先复练").font(.caption).foregroundStyle(.secondary)
+                    }
+                    if showingReference {
+                        Text(word.spelling)
+                            .font(.callout).foregroundStyle(.secondary)
+                            .lineLimit(1).minimumScaleFactor(0.65)
+                            .accessibilityLabel("正确拼写 \(word.spelling)")
+                            .accessibilityIdentifier("reviewExpectedSpelling")
+                    }
+                }
+            }.frame(height: 68)
+        }
+        .onChange(of: draft.wrappedValue) { _, current in
+            if correcting, current != session.lastSpellingAttempt?.answer {
+                hiddenSpellingReferenceAt = session.spellingAttempts.count
             }
         }
     }
 
     /// Returns true when the rejected answer should stay selected for editing.
     private func submitSpelling(_ answer: String) -> Bool {
+        if session.spellingState == .readyToAdvance || session.spellingState == .skipped {
+            advanceSpelling()
+            return false
+        }
+        if let commands {
+            commands.submitSpelling(answer)
+            return false
+        }
         var updated = session
         guard updated.submitSpelling(answer) else { return false }
         let shouldSelectAnswer = updated.spellingState == .correcting
-        if updated.spellingState == .readyToAdvance { updated.advanceSpelling() }
         session = updated
         return shouldSelectAnswer
+    }
+
+    private func advanceSpelling() {
+        if let commands { commands.advanceSpelling?() }
+        else { session.advanceSpelling() }
+    }
+
+    private func chooseJudgment(_ judgment: MiniReviewJudgment) {
+        if let commands { commands.chooseJudgment(judgment) }
+        else { session.chooseJudgment(judgment) }
+    }
+
+    private func advanceJudgment(markWrong: Bool) {
+        if let commands { commands.advanceJudgment(markWrong) }
+        else { session.advanceJudgment(markWrong: markWrong) }
     }
 }
 
@@ -209,10 +289,16 @@ private struct SpellingProgressShape: Shape {
     }
 }
 
-private struct ReviewAnswerField: NSViewRepresentable {
+struct ReviewAnswerField: NSViewRepresentable {
     @Binding var text: String
     let selectOnFocus: Bool
     let onSubmit: (String) -> Bool
+    var accepted = false
+    var incorrect = false
+    var inputLocked = false
+    var focusRequest = 0
+    @Environment(\.isEnabled) private var isEnabled
+    private var answerColor: NSColor { accepted ? .systemGreen : (incorrect ? .systemRed : .labelColor) }
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
@@ -223,6 +309,8 @@ private struct ReviewAnswerField: NSViewRepresentable {
         field.isBezeled = false
         field.drawsBackground = false
         field.isEditable = true
+        field.isEnabled = isEnabled
+        field.answerWasEnabled = isEnabled
         field.isSelectable = true
         field.focusRingType = .none
         field.maximumNumberOfLines = 1
@@ -230,6 +318,7 @@ private struct ReviewAnswerField: NSViewRepresentable {
         field.cell?.isScrollable = true
         field.alignment = .center
         field.font = .systemFont(ofSize: 21, weight: .medium)
+        field.textColor = answerColor
         field.isAutomaticTextCompletionEnabled = false
         if #available(macOS 15.2, *) { field.allowsWritingTools = false }
         field.setAccessibilityLabel("拼写答案")
@@ -241,9 +330,25 @@ private struct ReviewAnswerField: NSViewRepresentable {
 
     func updateNSView(_ field: AnswerTextField, context: Context) {
         context.coordinator.owner = self
+        let becameEnabled = isEnabled && !field.answerWasEnabled
+        field.isEnabled = isEnabled
+        field.answerWasEnabled = isEnabled
+        field.textColor = answerColor
+        let shouldSelect = selectOnFocus && !field.selectOnFocus
         field.selectOnFocus = selectOnFocus
+        if becameEnabled || field.focusRequest != focusRequest {
+            field.focusRequest = focusRequest
+            field.requestAnswerFocus()
+        }
         if let editor = field.currentEditor() as? NSTextView {
-            guard !editor.hasMarkedText(), editor.string != text else { return }
+            guard !editor.hasMarkedText() else { return }
+            editor.textColor = answerColor
+            editor.selectedTextAttributes[.foregroundColor] = accepted || incorrect ? answerColor : NSColor.selectedTextColor
+            if shouldSelect, editor.string == text {
+                editor.setSelectedRange(NSRange(location: 0, length: text.utf16.count))
+                return
+            }
+            guard editor.string != text else { return }
             editor.string = text
             editor.setSelectedRange(NSRange(location: text.utf16.count, length: 0))
         } else if field.stringValue != text {
@@ -260,13 +365,15 @@ private struct ReviewAnswerField: NSViewRepresentable {
             guard let field = notification.object as? NSTextField,
                   let editor = field.currentEditor() as? NSTextView,
                   !editor.hasMarkedText() else { return }
-            owner.text = editor.string
+            if owner.accepted || owner.inputLocked { editor.string = owner.text }
+            else { owner.text = editor.string }
         }
 
         func control(_ control: NSControl, textView: NSTextView, doCommandBy command: Selector) -> Bool {
             guard command == #selector(NSResponder.insertNewline(_:)), !textView.hasMarkedText() else {
                 return false
             }
+            guard NSApp.currentEvent?.isARepeat != true else { return true }
             if owner.onSubmit(textView.string) {
                 textView.setSelectedRange(NSRange(location: 0, length: textView.string.utf16.count))
             }
@@ -275,19 +382,37 @@ private struct ReviewAnswerField: NSViewRepresentable {
     }
 }
 
-private final class AnswerTextField: NSTextField {
+final class AnswerTextField: NSTextField {
     var selectOnFocus = false
+    var focusRequest = 0
+    var answerWasEnabled = false
+    private var needsAnswerFocus = true
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        NotificationCenter.default.removeObserver(self, name: NSWindow.didBecomeKeyNotification, object: nil)
         guard window != nil else { return }
+        NotificationCenter.default.addObserver(self, selector: #selector(answerWindowBecameKey),
+                                               name: NSWindow.didBecomeKeyNotification, object: window)
+        requestAnswerFocus()
+    }
+
+    func requestAnswerFocus() {
+        needsAnswerFocus = true
         DispatchQueue.main.async { [weak self] in
-            guard let self, let window, window.makeFirstResponder(self),
-                  let editor = currentEditor() as? NSTextView else { return }
-            let length = editor.string.utf16.count
-            editor.setSelectedRange(selectOnFocus
-                ? NSRange(location: 0, length: length)
-                : NSRange(location: length, length: 0))
+            self?.focusAnswerIfNeeded()
         }
+    }
+
+    @objc private func answerWindowBecameKey() { focusAnswerIfNeeded() }
+
+    private func focusAnswerIfNeeded() {
+        guard needsAnswerFocus, isEnabled, let window,
+              window.makeFirstResponder(self), let editor = currentEditor() as? NSTextView else { return }
+        needsAnswerFocus = false
+        let length = editor.string.utf16.count
+        editor.setSelectedRange(selectOnFocus
+            ? NSRange(location: 0, length: length)
+            : NSRange(location: length, length: 0))
     }
 }

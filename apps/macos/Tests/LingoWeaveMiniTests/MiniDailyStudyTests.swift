@@ -20,11 +20,59 @@ struct MiniDailyStudyTests {
         try tests.testPendingTranslationAndFeedbackSurviveRelaunch()
         tests.testDueWindowsUseFirstAnswersAndReuseCanonicalSentences()
         try tests.testCorruptionIsNotOverwritten()
-        print("5 daily study behavior tests passed.")
+        try tests.testMemoryRoundsDraftRevealAndUndoSurviveRelaunch()
+        tests.testTodayActivityCountsLateWorkAcrossGroupsAndDeduplicates()
+        tests.testTodayActivityUsesTheCalendarAndIgnoresFutureEvents()
+        tests.testTodayActivityWaitsForTheFinalMemoryRound()
+        try tests.testSentenceHighlightsWholeWordsAndInflections()
+        try tests.testWindowDotsReflectTheCurrentAnswer()
+        print("11 daily study behavior tests passed.")
     }
 
     private func expect(_ condition: Bool, _ explanation: String, file: StaticString = #file, line: UInt = #line) {
         precondition(condition, explanation, file: file, line: line)
+    }
+
+    private func testWindowDotsReflectTheCurrentAnswer() throws {
+        let id = UUID(), opened = date(1), answered = date(1, hour: 13)
+        for stage in 0..<3 {
+            let pending = MiniMemoryWindow.Visit(id: id, word: apple, stage: stage, openedAt: opened,
+                initial: nil, selectedAt: nil, revealedAt: nil, correctedAt: nil, draft: "")
+            expect(pending.completedStages == stage, "An unanswered visit shows its previous progress")
+            let remembered = MiniMemoryWindow.Visit(id: id, word: apple, stage: stage, openedAt: opened,
+                initial: true, selectedAt: answered, revealedAt: answered, correctedAt: nil, draft: "")
+            expect(remembered.completedStages == stage + 1,
+                   "Remembering immediately lights the current stage before advancing to another word")
+            expect(remembered.stage == stage && remembered.id == id,
+                   "Dot feedback retains the current card while the user checks the answer")
+            let restored = try JSONDecoder().decode(MiniMemoryWindow.Visit.self, from: JSONEncoder().encode(remembered))
+            expect(restored.completedStages == stage + 1, "Restored confirmation keeps the current answer's dots")
+            let forgotten = MiniMemoryWindow.Visit(id: id, word: apple, stage: stage, openedAt: opened,
+                initial: false, selectedAt: answered, revealedAt: answered, correctedAt: nil, draft: "")
+            expect(forgotten.completedStages == 0, "Forgetting immediately clears all three dots")
+            let corrected = MiniMemoryWindow.Visit(id: id, word: apple, stage: stage, openedAt: opened,
+                initial: true, selectedAt: answered, revealedAt: answered, correctedAt: answered, draft: "")
+            expect(corrected.completedStages == 0 && corrected.initial == true,
+                   "Correcting a mistaken recall immediately clears progress and retains the original choice")
+        }
+    }
+
+    private func testSentenceHighlightsWholeWordsAndInflections() throws {
+        let music = MiniStudySentence(word: MiniWord(spelling: "music", meaning: "音乐"),
+            english: "🎵 Music and music help the musician.", chinese: "音乐让音乐家愉快。")
+        expect(music.highlightedRanges.map { String(music.english[$0]) } == ["Music", "music"],
+               "All complete target occurrences are highlighted while longer words remain distinct")
+        let gave = MiniStudySentence(word: MiniWord(spelling: "give", meaning: "给"),
+            english: "She gave me a book.", chinese: "她给了我一本书。", targetForms: ["gave"])
+        expect(gave.highlightedRanges.map { String(gave.english[$0]) } == ["gave"],
+               "AI-provided irregular forms select the actual English span")
+        let restored = try JSONDecoder().decode(MiniStudySentence.self, from: JSONEncoder().encode(gave))
+        expect(restored.targetForms == ["gave"] && restored.highlightedRanges.count == 1,
+               "Target forms persist with canonical learning material")
+        let old = MiniStudySentence(word: MiniWord(spelling: "read", meaning: "阅读"),
+            english: "She reads every day, and I read too.", chinese: "她每天阅读，我也阅读。")
+        expect(old.highlightedRanges.map { String(old.english[$0]) } == ["reads", "read"],
+               "Existing material can match its English lemma without another preparation request")
     }
 
     private func date(_ day: Int, hour: Int = 12) -> Date {
@@ -104,6 +152,79 @@ struct MiniDailyStudyTests {
         expect(day.scheduleUpdates.isEmpty, "Unfinished learning produces no due dates")
     }
 
+    private func testTodayActivityCountsLateWorkAcrossGroupsAndDeduplicates() {
+        let now = date(4), actionTime = date(4, hour: 11)
+        var firstLedger = MiniDailyLedger()
+        var first = firstLedger.beginOrResume(deck: [apple], at: date(1), calendar: calendar)
+        prepareAndStudy(&first, at: actionTime)
+        let variant = MiniWord(spelling: " APPLE ", meaning: " 苹果 ", phonetic: "other IPA")
+        var variantLedger = MiniDailyLedger()
+        var duplicate = variantLedger.beginOrResume(deck: [variant], at: date(2), calendar: calendar)
+        prepareAndStudy(&duplicate, at: actionTime)
+
+        var reviewLedger = MiniDailyLedger()
+        var seed = reviewLedger.beginOrResume(deck: [apple], at: date(1), calendar: calendar)
+        finishLearning(&seed, at: date(1))
+        finishTranslations(&seed, at: date(1))
+        reviewLedger.days[0] = seed
+        var oldReview = reviewLedger.beginOrResume(deck: [apple], at: date(3), calendar: calendar)
+        guard var review = oldReview.review else { preconditionFailure("Missing due review") }
+        expect(review.chooseJudgment(.clear, at: actionTime) && review.advanceJudgment(at: actionTime),
+               "Resume an older group with an actual review judgment today")
+        expect(review.submitSpelling("appl", at: actionTime) && review.submitSpelling("apple", at: actionTime),
+               "Record several real review actions for the same word")
+        oldReview.review = review
+
+        var writingLedger = MiniDailyLedger()
+        var writing = writingLedger.beginOrResume(deck: [book], at: date(1), calendar: calendar)
+        finishLearning(&writing, at: date(1))
+        expect(writing.submitTranslation("书", at: actionTime) != nil, "An older group's answer is submitted today")
+        let ledger = MiniDailyLedger(days: [first, duplicate, seed, oldReview, writing, writing])
+        let activity = MiniTodayActivity(ledger: ledger, now: now, calendar: calendar)
+        expect(activity.learnedWords == 1, "Today's studied words use normalized spelling and meaning across groups")
+        expect(activity.reviewedWords == 1, "Repeated judgments and spelling attempts count as one reviewed word")
+        expect(activity.writingAnswers == 1, "Today's submitted answer counts once by its durable attempt identity before feedback")
+    }
+
+    private func testTodayActivityUsesTheCalendarAndIgnoresFutureEvents() {
+        var ledger = MiniDailyLedger()
+        var day = ledger.beginOrResume(deck: [apple, book, water], at: date(1), calendar: calendar)
+        expect(day.addSentences([example(apple), example(book), example(water)]), "Prepare the three study targets")
+        expect(day.markStudied(apple, at: date(3, hour: 23)), "Record a previous local day's mark")
+        expect(day.markStudied(book, at: date(4, hour: 0)), "Record a mark at the local midnight boundary")
+        expect(day.markStudied(water, at: date(4, hour: 13)), "Include a future timestamp in the read-only fixture")
+        ledger.days[0] = day
+        let now = date(4)
+        expect(MiniTodayActivity(ledger: ledger, now: now, calendar: calendar).learnedWords == 1,
+               "Today's local midnight is included while yesterday and later today are excluded")
+        var utc = Calendar(identifier: .gregorian)
+        utc.timeZone = TimeZone(secondsFromGMT: 0)!
+        expect(MiniTodayActivity(ledger: ledger, now: now, calendar: utc).learnedWords == 0,
+               "The supplied plan calendar decides which local date each event belongs to")
+        expect(MiniTodayActivity(ledger: ledger, now: date(5), calendar: calendar).learnedWords == 0,
+               "A group with historical progress does not create activity on a later day")
+    }
+
+    private func testTodayActivityWaitsForTheFinalMemoryRound() {
+        var ledger = MiniDailyLedger()
+        var day = ledger.beginOrResume(deck: [apple], at: date(1), calendar: calendar, memoryRounds: true)
+        expect(day.addSentences([example(apple)]), "Prepare the memory-round example")
+        for _ in 0..<2 {
+            expect(day.advanceMemory(remembered: true, at: date(4)), "Complete an early memory round")
+        }
+        ledger.days[0] = day
+        expect(MiniTodayActivity(ledger: ledger, now: date(4), calendar: calendar).learnedWords == 0,
+               "The first two memory rounds do not count as completed new-word memory")
+        expect(day.advanceMemory(remembered: true, at: date(4)), "Complete the third memory round")
+        ledger.days[0] = day
+        expect(MiniTodayActivity(ledger: ledger, now: date(4), calendar: calendar).learnedWords == 1,
+               "The actual final-round study mark supplies today's new-word count")
+        expect(day.undoMemory(at: date(4)), "Undo the final memory mark")
+        ledger.days[0] = day
+        expect(MiniTodayActivity(ledger: ledger, now: date(4), calendar: calendar).learnedWords == 0,
+               "An undone memory mark no longer contributes to today's completed new words")
+    }
+
     private func testPendingTranslationAndFeedbackSurviveRelaunch() throws {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -171,8 +292,30 @@ struct MiniDailyStudyTests {
         expect(next.currentTranslation?.direction == .chineseToEnglish, "Review alternates its prior actual translation direction")
         guard let id = next.submitTranslation("The book", at: date(6)) else { preconditionFailure("Expected late translation") }
         expect(next.gradeTranslation(id: id, feedback: partial, at: date(6), calendar: calendar), "Grade the late response")
-        expect(next.scheduleUpdates.last?.dueAt == date(5, hour: 0), "A weak late grade never postpones the previous due date")
-        expect(next.scheduleUpdates.last?.step == 0 && next.scheduleUpdates.last?.source == .translation, "Weak grade resets the local cadence")
+        expect(next.scheduleUpdates.first?.dueAt == date(5, hour: 0), "Teaching feedback preserves the deterministic review due date")
+        expect(!next.scheduleUpdates.contains { $0.source == .translation }, "AI translation feedback never schedules a review")
+    }
+
+    private func testMemoryRoundsDraftRevealAndUndoSurviveRelaunch() throws {
+        var ledger = MiniDailyLedger()
+        var day = ledger.beginOrResume(deck: [apple, book], at: date(1), calendar: calendar, memoryRounds: true)
+        expect(day.addSentences([example(apple), example(book)]), "Prepare actual memory material")
+        expect(day.saveMemoryDraft("  appl  "), "Keep the raw scratchpad from first encounter")
+        for _ in 0..<2 { expect(day.advanceMemory(remembered: true, at: date(1)), "Complete the first memory round") }
+        expect(day.memory?.round == 2 && day.memory?.completedRounds(for: apple) == 1 && day.studiedWords.isEmpty,
+               "First encounter fills exactly one point and leaves the formal gate pending")
+        expect(day.revealMemory(at: date(1)), "A second-round reveal is an explicit fact")
+        expect(day.advanceMemory(remembered: true, at: date(1)) && day.undoMemory(at: date(1)), "Undo an actual round completion")
+        expect(day.memory?.currentWord == apple && day.memory?.completedRounds(for: apple) == 1,
+               "Undo restores the same target and its completed points")
+        day = try JSONDecoder().decode(MiniDailyDay.self, from: JSONEncoder().encode(day))
+        expect(day.memory?.drafts.first?.text == "  appl  " && day.memory?.events.contains(where: { $0.undoneAt != nil }) == true,
+               "Relaunch keeps raw draft and undone event history")
+        while day.memory?.currentWord != nil { expect(day.advanceMemory(remembered: true, at: date(1)), "Finish the real remaining memory rounds") }
+        expect(day.memory?.round == 4 && day.memory?.progress.allSatisfy { $0.completedRounds == 3 } == true,
+               "All three points complete before total spelling")
+        expect(day.studiedWords.count == 2 && day.learning?.spellingAttempts.isEmpty == true,
+               "Memory completion preserves the untouched spelling first answers")
     }
 
     private func testCorruptionIsNotOverwritten() throws {

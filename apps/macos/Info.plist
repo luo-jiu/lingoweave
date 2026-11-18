@@ -10,6 +10,8 @@
     <string>com.lingoweave.mini</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
+    <key>CFBundleIconFile</key>
+    <string>app-icon.icns</string>
     <key>CFBundleName</key>
     <string>LingoWeave Mini</string>
     <key>CFBundlePackageType</key>
@@ -20,7 +22,5 @@
     <string>1</string>
     <key>LSMinimumSystemVersion</key>
     <string>14.0</string>
-    <key>LSUIElement</key>
-    <true/>
 </dict>
 </plist>

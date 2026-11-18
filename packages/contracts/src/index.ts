@@ -1,6 +1,13 @@
 import { z } from 'zod';
+export * from './mini-vocabulary.js';
 
 export * from './learning.js';
+export * from './mini.js';
+export * from './mini-assessment.js';
+export * from './mini-flow-scheduling.js';
+export * from './mini-memory.js';
+export * from './mini-ai.js';
+export * from './mini-audio.js';
 
 export const healthResponseSchema = z.object({
   status: z.literal('ok'),

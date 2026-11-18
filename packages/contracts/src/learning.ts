@@ -98,7 +98,15 @@ export const runtimeStatusSchema = z.object({
   available: z.boolean(),
   authenticated: z.boolean(),
   version: z.string().nullable(),
-  models: z.array(z.object({ id: z.string(), name: z.string(), isDefault: z.boolean() })),
+  models: z.array(
+    z.object({
+      id: z.string(),
+      name: z.string(),
+      isDefault: z.boolean(),
+      supportedReasoningEfforts: z.array(z.string()).optional(),
+      defaultReasoningEffort: z.string().optional(),
+    }),
+  ),
   error: z.string().nullable(),
 });
 export type RuntimeStatus = z.infer<typeof runtimeStatusSchema>;

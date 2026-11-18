@@ -10,6 +10,9 @@ export interface PreparationRuntime {
   prepare(options: {
     jobId: string;
     model?: string;
+    effort?: string;
+    tools?: string[];
+    prompt?: string;
     instructions: string;
     mcp: { command: string; args: string[]; env: Record<string, string> };
     skill?: { name: string; path: string };

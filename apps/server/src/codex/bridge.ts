@@ -15,6 +15,8 @@ const modelPageSchema = z.object({
       displayName: z.string(),
       isDefault: z.boolean(),
       hidden: z.boolean().optional(),
+      supportedReasoningEfforts: z.array(z.object({ reasoningEffort: z.string() })).optional(),
+      defaultReasoningEffort: z.string().optional(),
     }),
   ),
   nextCursor: z.string().nullable(),
@@ -87,6 +89,9 @@ export interface CodexBridgeOptions {
 export interface PrepareOptions {
   jobId: string;
   model?: string;
+  effort?: string;
+  tools?: string[];
+  prompt?: string;
   instructions: string;
   skill?: { name: string; path: string };
   mcp: { command: string; args: string[]; env: Record<string, string> };
@@ -148,7 +153,17 @@ export class CodexBridge {
       const effective = configSchema.parse(
         await process.request('config/read', { includeLayers: false }),
       );
-      const config = isolatedThreadConfig(effective.config, options.mcp);
+      if (
+        options.effort &&
+        !selected.supportedReasoningEfforts?.some(
+          (entry) => entry.reasoningEffort === options.effort,
+        )
+      )
+        throw new CodexError(
+          'CODEX_EFFORT_UNAVAILABLE',
+          '所选模型不支持该推理强度，请调整选择后重试。',
+        );
+      const config = isolatedThreadConfig(effective.config, options.mcp, options.tools);
       const started = threadSchema.parse(
         await process.request('thread/start', {
           model: selected.model,
@@ -159,16 +174,16 @@ export class CodexBridge {
           serviceName: 'lingoweave',
           config,
           baseInstructions:
-            'You prepare English learning materials for LingoWeave. Use only the scoped lingoweave learning tools. The platform owns all learning state; natural-language claims never save results. Do not use shell, files, web, other apps, or other MCP servers. Give only short public progress updates and a concise final summary; do not reveal private reasoning.',
+            'You are the English learning assistant for LingoWeave. Follow the task instructions and use only the tools assigned to this task. Use only the scoped lingoweave learning tools. The platform owns all learning state; natural-language claims never save results. Do not use shell, files, web, other apps, or other MCP servers. Give only short public progress updates and a concise final summary; do not reveal private reasoning.',
           developerInstructions: options.instructions,
         }),
       );
-      await this.verifyTools(process, started.thread.id);
+      await this.verifyTools(process, started.thread.id, options.tools);
       if (options.signal.aborted) throw cancelledError();
       const result = { threadId: started.thread.id, model: started.model };
       options.onThread?.(result);
       if (options.signal.aborted) throw cancelledError();
-      options.onProgress('已连接，正在读取词组并准备例句…');
+      options.onProgress('已连接，正在读取学习记录…');
       await this.runTurn(process, started.thread.id, started.model, options);
       return result;
     } catch (error) {
@@ -192,6 +207,9 @@ export class CodexBridge {
     if (this.closed) throw new CodexError('CODEX_CLOSED', '学习服务正在关闭，请重新打开后再试。');
     await mkdir(this.options.cwd, { recursive: true });
     if (this.closed) throw new CodexError('CODEX_CLOSED', '学习服务正在关闭，请重新打开后再试。');
+    const childEnv = { ...globalThis.process.env };
+    delete childEnv.OPENAI_API_KEY;
+    delete childEnv.CODEX_API_KEY;
     const process = new CodexTransport({
       executable: this.options.executable ?? 'codex',
       args: [
@@ -201,6 +219,7 @@ export class CodexBridge {
         ...processConfig.flatMap((value) => ['-c', value]),
       ],
       cwd: this.options.cwd,
+      env: childEnv,
       requestTimeoutMs: this.options.requestTimeoutMs,
     });
     this.processes.add(process);
@@ -256,6 +275,16 @@ export class CodexBridge {
           id: model.model,
           name: model.displayName,
           isDefault: model.isDefault,
+          ...(model.supportedReasoningEfforts
+            ? {
+                supportedReasoningEfforts: model.supportedReasoningEfforts.map(
+                  (entry) => entry.reasoningEffort,
+                ),
+              }
+            : {}),
+          ...(model.defaultReasoningEffort
+            ? { defaultReasoningEffort: model.defaultReasoningEffort }
+            : {}),
         })),
         error: authenticated ? null : '请先在本机 Codex 完成登录。',
       };
@@ -276,7 +305,11 @@ export class CodexBridge {
     }
   }
 
-  private async verifyTools(process: CodexTransport, threadId: string) {
+  private async verifyTools(
+    process: CodexTransport,
+    threadId: string,
+    expected = ['learning_get_context', 'learning_publish_materials'],
+  ) {
     const inventory = inventorySchema.parse(
       await process.request('mcpServerStatus/list', { threadId, limit: 100 }),
     );
@@ -292,9 +325,8 @@ export class CodexBridge {
     if (
       foreignActive ||
       own?.runtimeStatus !== 'connected' ||
-      !tools.includes('learning_get_context') ||
-      !tools.includes('learning_publish_materials') ||
-      tools.some((tool) => !['learning_get_context', 'learning_publish_materials'].includes(tool))
+      expected.some((tool) => !tools.includes(tool)) ||
+      tools.some((tool) => !expected.includes(tool))
     ) {
       throw new CodexError(
         'CODEX_TOOL_SCOPE',
@@ -366,9 +398,14 @@ export class CodexBridge {
             method === 'item/started'
           ) {
             options.onProgress(
-              event.item.tool === 'learning_publish_materials'
+              event.item.tool === 'learning_publish_materials' ||
+                event.item.tool === 'learning_commit'
                 ? '正在校验并保存学习材料…'
-                : '正在读取当前词组…',
+                : event.item.tool === 'learning_get_history'
+                  ? '正在查询学习记录…'
+                  : event.item.tool === 'learning_get_word'
+                    ? '正在查看已有重点…'
+                    : '正在读取当前词组…',
             );
           }
           if (
@@ -400,13 +437,20 @@ export class CodexBridge {
       > = [
         {
           type: 'text',
-          text: `Prepare the assigned learning group for job ${options.jobId}. Read learning_get_context, then submit all five bilingual example sentences using learning_publish_materials. Do not claim success before the tool confirms its receipt.`,
+          text:
+            options.prompt ??
+            `Prepare the assigned learning group for job ${options.jobId}. Read learning_get_context, then submit all five bilingual example sentences using learning_publish_materials. Do not claim success before the tool confirms its receipt.`,
           text_elements: [],
         },
       ];
       if (options.skill) input.push({ type: 'skill', ...options.skill });
       void process
-        .request('turn/start', { threadId, model, input })
+        .request('turn/start', {
+          threadId,
+          model,
+          input,
+          ...(options.effort ? { effort: options.effort } : {}),
+        })
         .then((value) => {
           const started = z.object({ turn: z.object({ id: z.string() }) }).parse(value);
           turnId = started.turn.id;
@@ -426,6 +470,7 @@ export class CodexBridge {
 export function isolatedThreadConfig(
   effective: Record<string, unknown>,
   mcp: PrepareOptions['mcp'],
+  tools = ['learning_get_context', 'learning_publish_materials'],
 ) {
   const inheritedServers = dictionarySchema.safeParse(effective.mcp_servers);
   const inheritedPlugins = dictionarySchema.safeParse(effective.plugins);
@@ -448,7 +493,7 @@ export function isolatedThreadConfig(
     required: true,
     startup_timeout_sec: 15,
     tool_timeout_sec: 20,
-    enabled_tools: ['learning_get_context', 'learning_publish_materials'],
+    enabled_tools: tools,
     default_tools_approval_mode: 'auto',
   };
   return { mcp_servers: servers, plugins };
