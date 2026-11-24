@@ -39,6 +39,23 @@ test('JSONL correlates out-of-order responses and preserves split UTF-8 notifica
   assert.deepEqual(await notification, { text: '你好' });
 });
 
+test('an RPC rejection reports only the originating method and numeric error code', async (t) => {
+  const transport = child(`
+    require('node:readline').createInterface({input:process.stdin}).on('line', line => {
+      const request = JSON.parse(line);
+      process.stdout.write(JSON.stringify({id:request.id, error:{
+        code:-32000, message:'private account details', data:request.params
+      }})+'\\n');
+    });
+  `);
+  t.after(() => transport.close());
+  await assert.rejects(transport.request('thread/start', { instructions: 'private task' }), {
+    code: 'CODEX_REQUEST_FAILED',
+    rpcCode: -32000,
+    message: 'Codex 拒绝了 thread/start 请求（RPC -32000）。',
+  });
+});
+
 test('invalid protocol and oversized unterminated lines reject pending calls', async (t) => {
   for (const source of [
     'process.stdout.write("not-json\\n");',

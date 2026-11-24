@@ -1,13 +1,19 @@
 import { randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
 import {
+  assessmentMcp,
+  feedbackSkill,
+  type MiniExpressionGrades,
+} from './mini-expression-grades.js';
+import {
+  defaultMiniAiSelection,
   miniAssessmentCommitSchema,
   miniAssessmentReceiptSchema,
   type MiniAssessmentApplication,
   type MiniAssessmentReceipt,
   type MiniAssessmentSource,
 } from '@lingoweave/contracts';
+import { translationRubric, validateTranslationGrade } from './mini-translation-rubric.js';
 import { LearningError } from './learning-store.js';
 import { CodexError } from './codex/transport.js';
 import type { PreparationRuntime } from './preparation-service.js';
@@ -20,13 +26,12 @@ export interface MiniAssessmentRepository {
   apply(application: MiniAssessmentApplication): MiniAssessmentReceipt;
 }
 
-const model = 'gpt-6.1-sol';
-const effort = 'xhigh';
 const rulesVersion = 'mini-assessment-v1';
 const prompt =
-  'This is a background learning assessment, not a learner conversation. Read learning_get_assessment and evaluate the frozen original answer with the referenced learning evidence. Call learning_submit_assessment once with the exact sourceId and inputHash. Assess meaning, target spelling, and use separately. Cite source evidence identifiers and give concise Chinese reasons. Do not request learner input or change scheduling.';
+  'Read learning_get_assessment and evaluate the assigned frozen version of the translation. Submit one learning_submit_assessment with its exact sourceId and inputHash. Judge the entire translation in source.answer for expressionGrade independently of the target-word observations. The learner will read this grade, summary, strengths, improvements and referenceTranslation together with this version of their answer. Explain the wording in beginner-friendly Chinese, offering a specific revision where helpful. If one reusable English expression from this question or feedback would help the learner, include reusablePhrase with its Chinese explanation. Keep evidence about meaning, spelling and use in the separate internal observations with evidence identifiers. Do not request learner input or change scheduling.';
 const instructions =
-  '只使用本任务冻结的原题、原答、学习事实和相关讨论。答后讨论不是首答；参考译法不是唯一答案。无法测到目标词时标记not_tested，目标判定存在真实歧义或缺失证据才用uncertain。近期学习、支持、eligibility=false、不能证明长期掌握都不是语义或拼写不确定，应在explanation中说明并由程序处理资格；不得因此填写uncertainties。uncertainties非空必须对应至少一个uncertain维度；如果三个维度都明确或not_tested，uncertainties必须为空。英译中没有英文产出时拼写与英文运用not_tested。保留原答中可明确判断的目标词拼写错误，其他词或风格问题不等于目标词遗忘。提交结构化评价，不给due、掌握或完成命令，不输出隐式推理。后台工作不向翻译页或聊天发送进度。';
+  translationRubric +
+  '只使用本任务冻结的原题、待评价版本的译文、学习事实和相关讨论。selfReportedFamiliar 表示学习者在完整词卡上点了「已认识」。这次自报跳过了后续两次回忆，判断该词的掌握表现须看实际拼写首答、订正和翻译原答。答后讨论不是首答；参考译法不是唯一答案。无法测到目标词时标记not_tested，目标判定存在真实歧义或缺失证据才用uncertain。近期学习、支持、eligibility=false、不能证明长期掌握都不是语义或拼写不确定，应在explanation中说明并由程序处理资格；不得因此填写uncertainties。uncertainties非空必须对应至少一个uncertain维度；如果三个维度都明确或not_tested，uncertainties必须为空。英译中没有英文产出时拼写与英文运用not_tested。保留本版译文中可明确判断的目标词拼写错误，其他词或风格问题不等于目标词遗忘。提交结构化评价，不给due、掌握或完成命令，不输出隐式推理。后台工作不向翻译页或聊天发送进度。';
 
 function failure(error: unknown) {
   return error instanceof LearningError || error instanceof CodexError
@@ -34,8 +39,17 @@ function failure(error: unknown) {
     : '评价暂未完成，原答案与已完成学习已保存，可在首页重试。';
 }
 
+function instructionsFor(source: MiniAssessmentSource) {
+  if (source.id === source.attemptId) return instructions;
+  return (
+    instructions +
+    '本任务评价修改稿：只按 source.answer 的当前文字给出表达档次、优点和改进建议；首答仅作背景。这份点评不调整复习排期。请用 source.id 引用本稿。'
+  );
+}
+
 function evidenceIds(source: MiniAssessmentSource): Set<string> {
   const ids = new Set([
+    source.id,
     source.attemptId,
     source.question.id,
     ...source.discussion.map((message) => message.id),
@@ -54,6 +68,7 @@ function evidenceIds(source: MiniAssessmentSource): Set<string> {
 }
 
 export class MiniAssessmentService {
+  readonly expressions: MiniExpressionGrades;
   private baseUrl: string | null = null;
   private closing = false;
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -76,6 +91,7 @@ export class MiniAssessmentService {
     private readonly runtime: PreparationRuntime,
     private readonly now: () => Date = () => new Date(),
   ) {
+    this.expressions = store.expressionGrades(runtime);
     // A persisted candidate is reapplied with the same request identity before
     // another model call. A process crash never becomes another learner answer.
     for (const detail of store.all()) {
@@ -88,6 +104,7 @@ export class MiniAssessmentService {
     if (parsed.protocol !== 'http:' || parsed.hostname !== '127.0.0.1')
       throw new LearningError('ASSESSMENT_URL_INVALID', '评价服务仅支持本机接口。');
     this.baseUrl = url;
+    this.expressions.setBaseUrl(url);
     this.wake();
     if (!this.timer) {
       this.timer = setInterval(() => {
@@ -154,6 +171,8 @@ export class MiniAssessmentService {
     try {
       if (controller.signal.aborted) return;
       if (this.applySaved(id)) return;
+      const { source } = this.store.detail(id);
+      const { model, effort } = source.aiSelection ?? defaultMiniAiSelection;
       this.store.status(id, 'running');
       const status = await this.runtime.status();
       if (controller.signal.aborted) return;
@@ -163,36 +182,22 @@ export class MiniAssessmentService {
       if (!selected)
         throw new LearningError('MODEL_UNAVAILABLE', '所选评价模型当前不可用，未更换模型。');
       if (!selected.supportedReasoningEfforts?.includes(effort))
-        throw new LearningError('EFFORT_UNAVAILABLE', '所选评价模型不支持 xhigh，已保留原配置。');
+        throw new LearningError(
+          'EFFORT_UNAVAILABLE',
+          `所选评价模型不支持 ${effort}，已保留原配置。`,
+        );
       const active = this.active.get(id);
-      if (!active) return;
-      const compiled = import.meta.url.endsWith('.js');
-      const entry = fileURLToPath(
-        new URL(
-          compiled ? './mini-assessment-mcp.js' : './mini-assessment-mcp.ts',
-          import.meta.url,
-        ),
-      );
-      const skillPath = fileURLToPath(
-        new URL('../../../skills/mini-feedback/SKILL.md', import.meta.url),
-      );
-      active.skillHash = miniAssessmentHash(readFileSync(skillPath, 'utf8'));
+      if (!active || !this.baseUrl) return;
+      active.skillHash = miniAssessmentHash(readFileSync(feedbackSkill.path, 'utf8'));
       const result = await this.runtime.prepare({
         jobId: id,
         model,
         effort,
         tools: ['learning_get_assessment', 'learning_submit_assessment'],
         prompt,
-        instructions,
-        skill: { name: 'mini-feedback', path: skillPath },
-        mcp: {
-          command: process.execPath,
-          args: compiled ? [entry] : ['--import', import.meta.resolve('tsx'), entry],
-          env: {
-            LINGOWEAVE_MINI_ASSESSMENT_URL: `${this.baseUrl}/api/internal/mini-assessment/${id}`,
-            LINGOWEAVE_MINI_ASSESSMENT_TOKEN: active.token,
-          },
-        },
+        instructions: instructionsFor(source),
+        skill: feedbackSkill,
+        mcp: assessmentMcp(this.baseUrl, id, active.token),
         onThread: (thread) => {
           if (thread.model !== model)
             throw new LearningError('MODEL_UNAVAILABLE', '评价运行时替换了所选模型，结果未采用。');
@@ -219,6 +224,7 @@ export class MiniAssessmentService {
   }
 
   tool(id: string, token: string, action: string, raw: unknown) {
+    if (this.expressions.handles(id)) return this.expressions.tool(id, token, action, raw);
     const active = this.active.get(id);
     if (!active || active.token !== token || active.controller.signal.aborted || this.closing)
       throw new LearningError('ASSESSMENT_TASK_EXPIRED', '评价任务已失效。', 403);
@@ -237,7 +243,9 @@ export class MiniAssessmentService {
         rulesVersion,
         evidenceIds: [...evidenceIds(detail.source)],
         evidenceGuidance:
-          'Cite the original attemptId, discussion message ids, or ids in learningEvidence. Only original answer content establishes answer correctness; later discussion is teaching.',
+          source.id === source.attemptId
+            ? 'Every correct or incorrect observation must cite source.id (the original attemptId). Discussion and learning facts can supplement it.'
+            : 'Evaluate source.answer as the revised answer and cite its source.id. The first answer and discussion are background; scheduling is based on the first answer alone.',
       };
     }
     if (action !== 'commit')
@@ -262,6 +270,11 @@ export class MiniAssessmentService {
         '不能评价另一份原答或其他版本的证据。',
         403,
       );
+    validateTranslationGrade(
+      source.question.direction,
+      input.result.expressionGrade,
+      input.result.improvements,
+    );
     const available = evidenceIds(source);
     for (const observation of [input.result.meaning, input.result.spelling, input.result.usage]) {
       if (
@@ -274,6 +287,15 @@ export class MiniAssessmentService {
           '评价必须引用这份原始记录中存在的证据。',
           400,
         );
+      if (
+        (observation.outcome === 'correct' || observation.outcome === 'incorrect') &&
+        !observation.evidenceIds.includes(source.id)
+      )
+        throw new LearningError(
+          'ASSESSMENT_EVIDENCE_INVALID',
+          '判断译文对错须引用本次提交的 source.id。讨论、题干和学习记录只能作为补充。',
+          400,
+        );
     }
     this.store.saveApplication(
       {
@@ -281,12 +303,11 @@ export class MiniAssessmentService {
         source: detail.source,
         result: input.result,
         trace: {
-          model,
-          effort,
+          ...(detail.source.aiSelection ?? defaultMiniAiSelection),
           rulesVersion,
           threadId: active.threadId,
           skillHash: active.skillHash,
-          promptHash: miniAssessmentHash({ prompt, instructions }),
+          promptHash: miniAssessmentHash({ prompt, instructions: instructionsFor(source) }),
           inputHash: hash,
           startedAt: active.startedAt,
           assessedAt: swiftTime(this.now()),
@@ -304,6 +325,7 @@ export class MiniAssessmentService {
     if (this.timer) clearInterval(this.timer);
     for (const active of this.active.values()) active.controller.abort();
     await Promise.allSettled([...this.active.values()].map((active) => active.promise));
+    await this.expressions.close();
     await this.runtime.close();
     this.store.close();
   }

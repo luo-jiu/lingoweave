@@ -585,3 +585,42 @@ test('book identity collisions roll back the import and removed active levels re
     store.close();
   }
 });
+
+test('book progress membership refreshes after an external course import or activation', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'lingoweave-vocabulary-membership-'));
+  const filename = join(directory, 'vocabulary.sqlite');
+  const reader = new MiniVocabularyStore(filename);
+  const writer = new MiniVocabularyStore(filename);
+  try {
+    const first = writer.import(input());
+    assert.equal(reader.activeBookIndex()?.keys.size, 2);
+    const selected = writer.activate({
+      requestId: randomUUID(),
+      expectedRevision: first.revision,
+      deckId: 'oxford3000-a1',
+    });
+    assert.equal(reader.activeBookIndex()?.id, 'oxford3000');
+    assert.equal(reader.activeBookIndex()?.keys.size, 2);
+    const request = input();
+    const entry = request.entries[0];
+    assert.ok(entry);
+    writer.import({
+      ...request,
+      expectedRevision: selected.revision,
+      entries: [entry],
+      requestId: randomUUID(),
+      activate: true,
+    });
+    assert.equal(reader.activeBookIndex()?.keys.size, 1);
+    writer.activate({
+      requestId: randomUUID(),
+      expectedRevision: writer.snapshot().revision,
+      deckId: null,
+    });
+    assert.equal(reader.activeBookIndex(), null);
+  } finally {
+    writer.close();
+    reader.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});

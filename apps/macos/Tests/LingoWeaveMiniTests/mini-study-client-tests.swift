@@ -7,6 +7,11 @@ struct MiniStudyClientTests {
         try tests.testLegacyBackupAndImportIdentity()
         try tests.testDamagedHistoryStopsImport()
         try tests.testPendingCommandRecovery()
+        try tests.testImmediateReviewInputs()
+        try tests.testAutomaticSpellingProjection()
+        try tests.testQueuedMemoryWindowFeedback()
+        try await tests.testSlowReviewJournal()
+        try tests.testBrowseViewportRecovery()
         try tests.testUnsubmittedDraftRecovery()
         try tests.testSnapshotKeepsSwiftDatesAndFacts()
         try tests.testPlanCommandRecoveryKeepsScope()
@@ -15,8 +20,9 @@ struct MiniStudyClientTests {
         try tests.testRebaseRejectsChangedFactsAndReplacedMaterials()
         try tests.testWindowReadModelAndCommandRecovery()
         try tests.testAssessmentAuditDecodesWithoutInventingScores()
+        try tests.testDailyTranslationCommentary()
         try tests.testAssessmentRebaseRequiresAnExactAppendOnlyChangeChain()
-        print("12 mini service client recovery tests passed.")
+        print("18 mini service client recovery and translation review tests passed.")
         let environment = ProcessInfo.processInfo.environment
         if let address = environment["MINI_TEST_SERVICE_URL"], let url = URL(string: address),
            let token = environment["MINI_TEST_TOKEN_PATH"] {
@@ -32,8 +38,8 @@ struct MiniStudyClientTests {
         }
         if let address = environment["MINI_TEST_GROUPS_SERVICE_URL"], let url = URL(string: address),
            let token = environment["MINI_TEST_GROUPS_TOKEN_PATH"] {
-            try await tests.testLivePreservedGroups(baseURL: url, tokenFile: URL(fileURLWithPath: token))
-            print("Swift → HTTP preserved-group and review-only integration passed.")
+            try await tests.testLiveDailyRestart(baseURL: url, tokenFile: URL(fileURLWithPath: token))
+            print("Swift → HTTP overnight restart, same-day resume and review-first integration passed.")
         }
     }
 
@@ -129,6 +135,176 @@ struct MiniStudyClientTests {
         expect(try client.pendingCommand() == nil, "A matching receipt clears the outbox")
     }
 
+    private func testImmediateReviewInputs() throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let second = MiniWord(spelling: "bag", meaning: "袋子")
+        let initial = MiniReviewSession(words: [word, second], startingWithSpelling: true)
+        var card = initial
+        var pending: [MiniReviewInput] = []
+        func input(_ type: MiniStudyAction.Kind, answer: String? = nil) -> MiniReviewInput {
+            var action = MiniStudyAction(type: type, target: .daily, dayId: "2026-11-20", session: .review, word: card.currentWord)
+            action.answer = answer
+            guard let result = MiniReviewInput(action: action, session: card) else { preconditionFailure("Expected a valid review input") }
+            pending.append(result)
+            return result
+        }
+        let miss = input(.submitSpelling, answer: "aple")
+        expect(miss.present(in: &card) && card.spellingState == .correcting, "Show an incorrect first answer without a receipt")
+        expect(!miss.present(in: &card), "A repeated or delayed submission cannot count a second attempt")
+        let correction = input(.submitSpelling, answer: " APPLE ")
+        expect(correction.present(in: &card) && card.spellingState == .readyToAdvance, "A fast correction turns green while its first answer is pending")
+        let next = input(.advanceSpelling)
+        expect(next.present(in: &card) && card.currentWord == second, "Use the server-provided next word before the preceding receipt")
+        let right = input(.submitSpelling, answer: "bag")
+        expect(right.present(in: &card) && card.spellingState == .readyToAdvance, "The new word accepts input before the preceding save completes")
+        let round = input(.advanceSpelling)
+        expect(!round.present(in: &card) && card.currentWord == second, "Leave assigning the next spelling round to the service")
+        expect(initial.spellingAttempts.isEmpty, "Visual feedback does not mutate the acknowledged snapshot")
+
+        let client = MiniStudyClient(legacyDirectory: root)
+        try client.saveReviewInputs(pending)
+        let recovered = try MiniStudyClient(legacyDirectory: root).pendingReviewInputs()
+        expect(recovered.map(\.id) == pending.map(\.id) && recovered.map(\.occurredAt) == pending.map(\.occurredAt),
+               "Relaunch retains each original input identity, order and occurrence time")
+        expect(recovered.map(\.action.answer) == ["aple", " APPLE ", nil, "bag", nil], "Preserve the exact original answers")
+        var afterReceipt = initial
+        expect(afterReceipt.submitSpelling("aple", at: miss.occurredAt), "Reconcile against a saved first answer")
+        for item in recovered.dropFirst() { item.present(in: &afterReceipt) }
+        expect(afterReceipt == card, "Removing a confirmed prefix preserves the newer displayed result")
+        expect(!MiniReviewSession.matchesSpelling("STRASSE", word: "Straße"), "Do not turn a distinct spelling green through localized comparison")
+    }
+
+    private func testAutomaticSpellingProjection() throws {
+        let words = [word, MiniWord(spelling: "bag", meaning: "袋子")]
+        var displayed = MiniReviewSession(windowWords: words, seed: UUID())
+        guard let first = displayed.currentWord, let second = words.first(where: { $0 != first }) else {
+            preconditionFailure("Missing spelling queue")
+        }
+        let at = Date(timeIntervalSinceReferenceDate: 812_345_678)
+        func input(_ answer: String) -> MiniReviewInput {
+            var action = MiniStudyAction(type: .submitSpelling, target: .daily, dayId: "2026-11-20",
+                                         session: .review, word: displayed.currentWord)
+            action.answer = answer
+            action.advanceOnCorrect = false
+            action.advanceAfterCorrect = true
+            guard let result = MiniReviewInput(action: action, session: displayed, at: at) else {
+                preconditionFailure("Missing spelling input")
+            }
+            return result
+        }
+        let wrong = input("wrong")
+        expect(wrong.present(in: &displayed) && displayed.currentWord == first &&
+               displayed.spellingState == .correcting, "A wrong answer still shows its correction in simple mode")
+        let correction = input(first.spelling)
+        let restored = try JSONDecoder().decode(MiniReviewInput.self, from: JSONEncoder().encode(correction))
+        expect(restored.action.advanceAfterCorrect == true, "Retry preserves the appearance's opt-in as part of the original input")
+        expect(restored.present(in: &displayed) && displayed.currentWord == second &&
+               displayed.spellingState == .awaitingFirst &&
+               displayed.spellingAttempts.map(\.correct) == [false, true],
+               "A correct correction advances immediately to the already assigned card and retains both attempts")
+        let boundary = input(second.spelling)
+        expect(boundary.present(in: &displayed) && displayed.currentWord == second &&
+               displayed.spellingState == .readyToAdvance,
+               "The shuffle at the next spelling round waits for the service receipt")
+    }
+
+    private func testQueuedMemoryWindowFeedback() throws {
+        let at = Date(timeIntervalSinceReferenceDate: 812_345_678)
+        var ledger = MiniDailyLedger()
+        let day = ledger.beginOrResume(deck: [word], at: at)
+        let groupId = UUID()
+        func visit(_ id: UUID = UUID(), stage: Int = 1) -> MiniMemoryWindow.Visit {
+            .init(id: id, word: word, stage: stage, openedAt: at, initial: nil, selectedAt: nil,
+                  revealedAt: nil, correctedAt: nil, draft: "")
+        }
+        func snapshot(_ visit: MiniMemoryWindow.Visit, revision: Int) throws -> MiniStudySnapshot {
+            var copy = ledger
+            let window = MiniMemoryWindow(version: "v2", size: 5, gap: 3, members: [], visit: visit,
+                                          events: [], sequence: 0, forceUnseen: false)
+            copy.days[0].flow = MiniLearningFlow(version: "v2", targetDate: day.id, dailyNewGoal: 10, completedBeforeRun: 0,
+                                                  groupSize: 10, candidates: [word], candidateIndex: 1, window: window, groupId: groupId,
+                                                  groupIndex: 1, groupStartedAt: at, groupTarget: 1, groupWords: [],
+                                                  translationWords: [], groups: [], completed: [], goalReached: false)
+            return try rebaseSnapshot(ledger: copy, revision: revision)
+        }
+        var displayed = visit()
+        let confirmed = displayed
+        func action(_ kind: MiniStudyAction.Kind) -> MiniStudyAction {
+            .window(kind, dayId: day.id, session: .learning, visit: displayed, draft: "")
+        }
+        var pick = action(.windowChoose)
+        pick.remembered = true
+        guard let choice = MiniReviewInput(action: pick, visit: displayed, at: at) else { preconditionFailure("Expected recall choice") }
+        expect(choice.present(in: &displayed) && displayed.showsFullCard && displayed.completedStages == 2,
+               "The current word reveals its card and gains a dot immediately while its receipt is pending")
+        let shown = displayed
+        let view = MiniStudyAction(type: .recordCardView, target: .daily, dayId: day.id, session: .learning, word: word)
+        guard let exposure = MiniReviewInput(action: view, visit: displayed),
+              let correction = MiniReviewInput(action: action(.windowCorrect), visit: displayed) else { preconditionFailure("Expected revealed card") }
+        expect(correction.present(in: &displayed) && displayed.completedStages == 0 && displayed.advancesAutomatically,
+               "A quick correction after recall clears the dots before saving")
+        guard let advance = MiniReviewInput(action: action(.windowAdvance), visit: displayed) else { preconditionFailure("Expected automatic advance") }
+        expect(!advance.present(in: &displayed), "Only the service chooses the next word")
+
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let client = MiniStudyClient(legacyDirectory: root)
+        try client.saveReviewInputs([choice, exposure, correction, advance])
+        let recovered = try client.pendingReviewInputs()
+        expect(recovered.map(\.id) == [choice.id, exposure.id, correction.id, advance.id],
+               "Rapid actions and the revealed exposure recover in their original order")
+        let first = try snapshot(confirmed, revision: 1)
+        let revealed = try snapshot(shown, revision: 2)
+        let corrected = try snapshot(displayed, revision: 3)
+        let later = try snapshot(visit(), revision: 4)
+        expect(choice.matches(first) && !exposure.matches(first) && exposure.matches(revealed)
+               && correction.matches(revealed) && !correction.matches(corrected) && advance.matches(corrected),
+               "Each queued action is sent only after its exact predecessor's state has arrived")
+        expect(recovered.allSatisfy { !$0.matches(later) }, "A new visit to the same word cannot receive even a delayed observation")
+        let full = visit(stage: 0)
+        var familiar = MiniStudyAction.window(.windowFamiliar, dayId: day.id, session: .learning, visit: full, draft: "")
+        expect(MiniReviewInput(action: familiar, visit: full) != nil, "A new full card accepts familiar while its observation is pending")
+        familiar.session = .review
+        expect(MiniReviewInput(action: familiar, visit: full) == nil, "Familiar does not skip review relearning")
+    }
+
+    private func testSlowReviewJournal() async throws {
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let client = MiniStudyClient(legacyDirectory: root)
+        var card = MiniReviewSession(words: [word], startingWithSpelling: true)
+        var action = MiniStudyAction(type: .submitSpelling, target: .review, recordId: UUID(), word: word)
+        action.answer = "aple"
+        guard let first = MiniReviewInput(action: action, session: card), first.present(in: &card) else {
+            preconditionFailure("Expected an incorrect answer")
+        }
+        action.answer = "apple"
+        guard let correction = MiniReviewInput(action: action, session: card) else {
+            preconditionFailure("Expected a correction")
+        }
+        let (started, signal) = AsyncStream<Bool>.makeStream()
+        let release = DispatchSemaphore(value: 0)
+        let journal = MiniReviewJournal { inputs in
+            if inputs.map(\.id) == [first.id] {
+                signal.yield(true)
+                signal.finish()
+                precondition(release.wait(timeout: .now() + 5) == .success, "A blocked write must leave the caller free to accept the correction")
+            }
+            try client.saveReviewInputs(inputs)
+        }
+        journal.replace([first])
+        var writes = started.makeAsyncIterator()
+        expect(await writes.next() == true, "The disk writer starts independently")
+        journal.replace([first, correction])
+        journal.replace([correction])
+        release.signal()
+        expect(await journal.flushed(), "The latest queued state reaches disk")
+        let recovered = try MiniStudyClient(legacyDirectory: root).pendingReviewInputs()
+        expect(recovered.map(\.id) == [correction.id] && recovered.first?.action.answer == "apple",
+               "An older slow write cannot overwrite a later submission or resurrect an acknowledged one")
+    }
+
     private func testUnsubmittedDraftRecovery() throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -139,6 +315,30 @@ struct MiniStudyClientTests {
                "Unsubmitted input survives relaunch independently of committed facts")
         expect(!FileManager.default.fileExists(atPath: root.appending(path: "DailyStudy/ledger.json").path),
                "Draft recovery does not create a second writable learning ledger")
+    }
+
+    private func testBrowseViewportRecovery() throws {
+        var viewport = MiniBrowseViewport()
+        let rows = (0..<90).map { MiniWord(spelling: "word\($0)", meaning: "释义\($0)") }
+        let otherSense = MiniWord(spelling: rows[0].spelling, meaning: "另一义项")
+        let layout = rows + [rows[0], otherSense]
+        let at = Date(timeIntervalSinceReferenceDate: 800_000_123)
+        let commands = viewport.update(layout, visible: true, revision: 17, at: at)
+        expect(commands.map { $0.action.words?.count } == [64, 27], "Large windows are bounded and exact duplicates are removed")
+        let duplicate = viewport.update(layout.reversed(), visible: true, revision: 18)
+        expect(duplicate.isEmpty, "Reordering the same visible words is not another exposure")
+        let scrolled = viewport.update([rows[0]], visible: true, revision: 18)
+        expect(scrolled.flatMap { $0.action.words ?? [] }.count == 90, "Only words that actually leave are recorded")
+        expect(viewport.update([rows[0]], visible: false, revision: 18).first?.action.words == [rows[0]], "Window hiding ends the remaining visible row")
+        expect(viewport.update([rows[1]], visible: false, revision: 18).isEmpty, "A background layout is not learner exposure")
+        expect(viewport.update(viewport.rows, visible: true, revision: 18).first?.action.words == [rows[1]], "Reopening records the currently displayed word")
+        let root = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let client = MiniStudyClient(legacyDirectory: root)
+        try client.saveBrowseViews(commands)
+        let replay = try MiniStudyClient(legacyDirectory: root).pendingBrowseViews()
+        expect(replay.map(\.requestId) == commands.map(\.requestId) && replay.allSatisfy { $0.occurredAt == at },
+               "Unacknowledged batches keep their exact original identity and times")
     }
 
     private func testSnapshotKeepsSwiftDatesAndFacts() throws {
@@ -194,11 +394,11 @@ struct MiniStudyClientTests {
                 "todayOverride": NSNull(), "dueCount": 17, "newCount": 23,
                 "lastActivityAt": 800_000_000.25, "absenceDays": 4,
                 "recoverySuggested": true, "recoveryWordLimit": 2,
-                "pendingDayId": "2026-11-10", "canStart": false, "canContinue": true, "blockedReason": NSNull(),
-                "pendingGroups": [["dayId": "2026-11-10~8ea55acf-a131-46f7-a15c-854f7ba58114", "phase": "learning",
+                "pendingDayId": "2026-11-14", "canStart": false, "canContinue": true, "blockedReason": NSNull(),
+                "pendingGroups": [["dayId": "2026-11-14~8ea55acf-a131-46f7-a15c-854f7ba58114", "phase": "learning",
                                    "paused": true, "startedAt": 800_000_000.25, "canContinue": false,
-                                   "blockedReason": "今天只复习，原组进度保留。"],
-                                  ["dayId": "2026-11-10", "phase": "review", "paused": false,
+                                   "blockedReason": "今天只安排到期复习。"],
+                                  ["dayId": "2026-11-14", "phase": "review", "paused": false,
                                    "startedAt": 800_000_001.25, "canContinue": true, "blockedReason": NSNull()]],
             ],
         ]
@@ -213,7 +413,21 @@ struct MiniStudyClientTests {
                "Planning timestamps keep the same Swift epoch as learning facts")
         expect(snapshot.planContext?.pendingGroups.first?.dayId.contains("~") == true
                && snapshot.planContext?.pendingGroups.first?.canContinue == false,
-               "A kept group uses its stable identity and service-owned continuation permission")
+               "Today's unavailable group keeps its stable identity and service-owned continuation permission")
+        let timestamp = ISO8601DateFormatter()
+        guard let zone = TimeZone(identifier: "Pacific/Auckland"),
+              let start = timestamp.date(from: "2026-11-13T11:00:00Z"),
+              let beforeMidnight = timestamp.date(from: "2026-11-14T10:59:59Z"),
+              let midnight = timestamp.date(from: "2026-11-14T11:00:00Z") else { preconditionFailure("Invalid test date") }
+        expect(snapshot.planContext?.includesDate(beforeMidnight) == true && snapshot.planContext?.includesDate(midnight) == false,
+               "A visible card expires at midnight in the plan timezone, including daylight saving")
+        expect(snapshot.planContext?.matchesLocalDay(at: beforeMidnight, in: zone) == true
+               && snapshot.planContext?.matchesLocalDay(at: beforeMidnight, in: .gmt) == false
+               && snapshot.planContext?.matchesLocalDay(at: midnight, in: zone) == false,
+               "A plan response crossing midnight or arriving after a timezone switch is stale")
+        expect(snapshot.planContext?.dayInterval == DateInterval(start: start, end: midnight),
+               "The homepage date and activity share the server-confirmed day boundaries")
+
     }
 
     private func rebaseSnapshot(ledger: MiniDailyLedger, record: MiniReviewRecord? = nil, revision: Int,
@@ -258,11 +472,13 @@ struct MiniStudyClientTests {
 
         let spellingRecord = MiniReviewRecord(session: MiniReviewSession(words: [word], startingWithSpelling: true), nextWordIndex: 0)
         var spelling = MiniStudyAction(type: .submitSpelling, target: .review, recordId: spellingRecord.id, word: word)
-        spelling.answer = "  aple  "
-        expect(MiniStudyClient.eligibleRebase(command: .init(expectedRevision: 8, action: spelling, occurredAt: at),
-                                            before: try rebaseSnapshot(ledger: ledger, record: spellingRecord, revision: 8),
-                                            after: try rebaseSnapshot(ledger: prepared, record: spellingRecord, revision: 9)),
-               "A raw first answer remains eligible when the complete spelling session is unchanged")
+        for answer in ["  aple  ", ""] {
+            spelling.answer = answer
+            expect(MiniStudyClient.eligibleRebase(command: .init(expectedRevision: 8, action: spelling, occurredAt: at),
+                                                before: try rebaseSnapshot(ledger: ledger, record: spellingRecord, revision: 8),
+                                                after: try rebaseSnapshot(ledger: prepared, record: spellingRecord, revision: 9)),
+                   "A raw first answer, including a blank, remains eligible when the spelling session is unchanged")
+        }
 
         var fullyPrepared = prepared
         expect(fullyPrepared.days[0].addSentences([second]), "The next fixture adds only the second word's example")
@@ -348,6 +564,27 @@ struct MiniStudyClientTests {
         expect(replayedImport.revision == snapshot.revision && replayedImport.reviewHistory.count == 1,
                "The real service imports legacy history exactly once")
         try client.recordImportReceipt(snapshot)
+
+        struct BrowseEvidence: Decodable, Sendable {
+            struct Scheduling: Decodable, Sendable {
+                struct View: Decodable, Sendable { let word: MiniWord; let at: Date }
+                let views: [View]
+            }
+            let scheduling: Scheduling
+        }
+        var viewport = MiniBrowseViewport()
+        let visible = [MiniWord(spelling: "bench", meaning: "长椅"), MiniWord(spelling: "desk", meaning: "书桌")]
+        let observed = Date(timeIntervalSinceReferenceDate: floor(Date.now.timeIntervalSinceReferenceDate) - 2)
+        let cardCount = snapshot.scheduling?.cards.count
+        let observation = viewport.update(visible, visible: true, revision: snapshot.revision, at: observed)[0]
+        snapshot = try await client.perform(observation)
+        let replay = try await client.perform(observation)
+        let evidence: BrowseEvidence = try await client.serviceRequest(path: "snapshot", body: nil)
+        expect(evidence.scheduling.views.filter { visible.contains($0.word) }.map(\.word) == visible &&
+               evidence.scheduling.views.filter { visible.contains($0.word) }.allSatisfy { $0.at == observed },
+               "Real HTTP history records each visible row precisely once at its original time")
+        expect(replay.revision == snapshot.revision && snapshot.ledger.days.isEmpty &&
+               snapshot.scheduling?.cards.count == cardCount, "Opening a viewport does not introduce or schedule extra words")
 
         func perform(_ action: MiniStudyAction) async throws -> MiniStudySnapshot {
             do { return try await client.perform(MiniStudyCommand(expectedRevision: snapshot.revision, action: action)) }
@@ -448,9 +685,15 @@ struct MiniStudyClientTests {
         snapshot = try await perform(MiniStudyAction(type: .continueToLearning, target: .review, recordId: concurrentRecord.id))
         snapshot = try await perform(MiniStudyAction(type: .markStudied, target: .daily, dayId: dayId, word: word))
         var spelling = MiniStudyAction(type: .submitSpelling, target: .daily, dayId: dayId, session: .learning, word: word)
-        spelling.answer = "aple"
-        snapshot = try await perform(spelling)
-        expect(snapshot.ledger.days.last?.learning?.spellingState == .correcting, "Real service preserves an incorrect first answer")
+        spelling.answer = ""
+        let blankSubmission = MiniStudyCommand(expectedRevision: snapshot.revision, action: spelling)
+        snapshot = try await client.perform(blankSubmission)
+        let spellingRetry = try await client.perform(blankSubmission)
+        let blankAttempt = spellingRetry.ledger.days.last?.learning?.lastSpellingAttempt
+        expect(spellingRetry.revision == snapshot.revision && spellingRetry.ledger.days.last?.learning?.spellingAttempts.count == 1
+               && blankAttempt?.answer == "" && blankAttempt?.correct == false && blankAttempt?.revealedAnswerAt != nil
+               && spellingRetry.ledger.days.last?.learning?.spellingState == .correcting,
+               "HTTP retry preserves one empty first answer, its reveal, and the correction state")
         spelling.answer = "apple"
         snapshot = try await perform(spelling)
         snapshot = try await perform(spelling)
@@ -491,6 +734,13 @@ struct MiniStudyClientTests {
             _ = try await client.perform(MiniStudyCommand(expectedRevision: 0, action: begin))
             preconditionFailure("A stale writer must not replace the current state")
         } catch MiniStudyClientError.conflict { }
+        let closed = MiniStudyAction(type: .recordCardView, target: .review, recordId: UUID(), word: word)
+        do {
+            _ = try await client.perform(MiniStudyCommand(expectedRevision: reconnected.revision, action: closed))
+            preconditionFailure("A view for a replaced review cannot be accepted")
+        } catch MiniStudyClientError.commandRejected { }
+        expect(try await client.snapshot().revision == reconnected.revision,
+               "A stale card is distinct from a stale revision and cannot create an exposure")
 
         let book = MiniWord(spelling: "book", meaning: "书")
         let water = MiniWord(spelling: "water", meaning: "水")
@@ -533,27 +783,35 @@ struct MiniStudyClientTests {
         expect(memorized.memory?.drafts.first?.text == "  book scratch  ", "Per-round memory keeps the original draft")
         expect(memorized.memory?.events.filter { $0.undoneAt == nil }.count == 9,
                "An undone memory event is retained without double-counting completion")
-        var answer = MiniStudyAction(type: .submitSpelling, target: .daily, dayId: newId, session: .learning, word: book)
-        answer.answer = "  BOOK  "
+        guard let initial = memorized.learning, let firstWord = initial.currentWord else {
+            preconditionFailure("Missing server-selected spelling queue")
+        }
+        let order = initial.progressDots.map(\.id)
+        expect(order.first == firstWord && Set(order) == Set([book, water, clean]),
+               "Progress follows the server's spelling order for this group")
+        let retryOnce = order[1]
+        let retryToLimit = order[2]
+        var answer = MiniStudyAction(type: .submitSpelling, target: .daily, dayId: newId, session: .learning, word: firstWord)
+        answer.answer = "  " + firstWord.spelling.uppercased() + "  "
         answer.advanceOnCorrect = false
         let correctRequest = MiniStudyCommand(expectedRevision: snapshot.revision, action: answer)
         snapshot = try await client.perform(correctRequest)
         expect(snapshot.ledger.days.last?.learning?.spellingState == .readyToAdvance
-               && snapshot.ledger.days.last?.learning?.currentWord == book,
+               && snapshot.ledger.days.last?.learning?.currentWord == firstWord,
                "A correct first Return stays on the green answer")
         let correctReplay = try await client.perform(correctRequest)
         expect(correctReplay.revision == snapshot.revision, "Retrying the answer does not advance")
-        snapshot = try await perform(.init(type: .advanceSpelling, target: .daily, dayId: newId, session: .learning, word: book))
-        expect(snapshot.ledger.days.last?.learning?.currentWord == water, "The next explicit Return advances exactly once")
+        snapshot = try await perform(.init(type: .advanceSpelling, target: .daily, dayId: newId, session: .learning, word: firstWord))
+        expect(snapshot.ledger.days.last?.learning?.currentWord == retryOnce, "The next explicit Return advances exactly once")
         while let session = snapshot.ledger.days.last?.learning, let current = session.currentWord {
-            expect(current != book, "A first-time correct word never returns to spelling")
+            expect(current != firstWord, "A first-time correct word never returns to spelling")
             var response = MiniStudyAction(type: .submitSpelling, target: .daily, dayId: newId, session: .learning, word: current)
             response.advanceOnCorrect = false
             let round = session.currentSpellingRound
-            response.answer = current == water && round > 1 ? water.spelling : "  miss-\(round)  "
+            response.answer = current == retryOnce && round > 1 ? retryOnce.spelling : "  miss-\(round)  "
             snapshot = try await perform(response)
-            if current == clean, round == 5 {
-                expect(snapshot.ledger.days.last?.learning?.currentWord != clean,
+            if current == retryToLimit, round == 5 {
+                expect(snapshot.ledger.days.last?.learning?.currentWord != retryToLimit,
                        "The fifth failed first answer skips immediately")
                 continue
             }
@@ -566,12 +824,12 @@ struct MiniStudyClientTests {
             snapshot = try await perform(.init(type: .advanceSpelling, target: .daily, dayId: newId, session: .learning, word: current))
         }
         guard let session = snapshot.ledger.days.last?.learning else { preconditionFailure("Missing spelling result") }
-        expect(session.phase == .finished && session.spellingSkips?.map(\.word) == [clean], "The bounded loop preserves the skipped word")
-        expect(session.spellingAttempts.filter { $0.word == book && $0.kind == .first }.count == 1
-               && session.spellingAttempts.filter { $0.word == water && $0.kind == .first }.count == 2
-               && session.spellingAttempts.filter { $0.word == clean && $0.kind == .first }.count == 5,
+        expect(session.phase == .finished && session.spellingSkips?.map(\.word) == [retryToLimit], "The bounded loop preserves the skipped word")
+        expect(session.spellingAttempts.filter { $0.word == firstWord && $0.kind == .first }.count == 1
+               && session.spellingAttempts.filter { $0.word == retryOnce && $0.kind == .first }.count == 2
+               && session.spellingAttempts.filter { $0.word == retryToLimit && $0.kind == .first }.count == 5,
                "Only first-answer failures repeat, bounded at five rounds")
-        let priority = snapshot.scheduling?.cards.first { $0.word == clean }
+        let priority = snapshot.scheduling?.cards.first { $0.word == retryToLimit }
         expect(priority?.practicePriority == 5 && priority?.fsrs == nil,
                "A capped word gains practice priority while retaining its independent memory state")
         snapshot = try await perform(.init(type: .completeLearning, target: .daily, dayId: newId))
@@ -579,7 +837,7 @@ struct MiniStudyClientTests {
         expect(restoredNewFlow.ledger == snapshot.ledger, "Three-round and bounded spelling facts survive reconnection")
     }
 
-    private func testLivePreservedGroups(baseURL: URL, tokenFile: URL) async throws {
+    private func testLiveDailyRestart(baseURL: URL, tokenFile: URL) async throws {
         let root = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: root) }
         let book = MiniWord(spelling: "book", meaning: "书")
@@ -620,7 +878,7 @@ struct MiniStudyClientTests {
         let client = MiniStudyClient(baseURL: baseURL, tokenFile: tokenFile, legacyDirectory: root)
         var snapshot = try await client.importLegacy(client.prepareLegacyImport())
         let original = snapshot.ledger.days.first { $0.id == pending.id }
-        expect(snapshot.planning.activeDayId == pending.id, "The service chooses the migrated unfinished group")
+        expect(original?.learning?.lastSpellingAttempt?.answer == "aple", "Migration keeps the original first answer")
         let draftKey = "daily/" + pending.id + "/learning/apple/苹果"
         try client.saveDrafts([draftKey: "appl"])
 
@@ -629,33 +887,41 @@ struct MiniStudyClientTests {
         }
         let preview = try await client.planPreview(deck: deck, timezone: timezone.identifier)
         guard let context = preview.planContext else { preconditionFailure("Missing multi-group plan context") }
-        expect(context.dueCount == 1 && context.recoverySuggested && context.pendingDayId == pending.id,
-               "Real old activity and due history produce a service-owned recovery recommendation")
+        expect(context.dueCount == 1 && context.recoverySuggested && context.pendingDayId == nil && context.pendingGroups.isEmpty && context.canStart,
+               "Old activity can suggest a lighter restart while historical groups are excluded from the new plan")
         var today = MiniStudyAction(type: .setTodayPlan, target: .daily)
         today.date = context.date
         today.timezone = context.timezone
-        today.mode = .reviewOnly
+        today.mode = .rest
         today.wordLimit = 5
         today.newWordLimit = 0
 
         snapshot = try await perform(today)
+        let rest = try await client.planPreview(deck: deck, timezone: timezone.identifier).planContext
+        expect(rest?.canStartReview == true && rest?.canStartLearning == false && rest?.canStartExtraGroup == true,
+               "The home preview offers due review and explicit extra practice separately on a rest day")
+        today.mode = .reviewOnly
+        snapshot = try await perform(today)
         let reviewPreview = try await client.planPreview(deck: deck, timezone: timezone.identifier)
         expect(reviewPreview.planContext?.canStart == true && reviewPreview.planContext?.pendingDayId == nil
-               && reviewPreview.planContext?.pendingGroups.first(where: { $0.dayId == pending.id })?.canContinue == false,
-               "Review-only can start a due group while keeping incompatible unfinished learning")
+               && reviewPreview.planContext?.pendingGroups.isEmpty == true,
+               "Review-only starts a fresh due group without resuming prior spelling")
         var begin = MiniStudyAction(type: .begin, target: .daily)
         begin.deck = deck
         begin.timezone = timezone.identifier
+        begin.intent = .review
+        begin.flowVersion = "sliding-window-v2"
         snapshot = try await perform(begin)
         guard let reviewID = snapshot.planning.activeDayId,
               let reviewDay = snapshot.ledger.days.first(where: { $0.id == reviewID }) else {
             preconditionFailure("Missing server-selected review side group")
         }
         expect(reviewID != pending.id && reviewDay.reviewWords == [book] && reviewDay.learningWords.isEmpty
-               && reviewDay.writingRequired == false && reviewDay.translationCount == 0,
+               && reviewDay.writingRequired == false && reviewDay.translationCount == 0
+               && snapshot.planning.currentSession?.intent == .review,
                "The service creates a distinct due-only group with no hidden writing requirement")
-        expect(snapshot.ledger.days.first(where: { $0.id == pending.id }) == original,
-               "Starting a review side group leaves the old answer, correction state and material unchanged")
+        expect(snapshot.ledger.days.first(where: { $0.id == pending.id })?.learning == original?.learning,
+               "Starting review preserves historical spelling evidence")
         var choose = MiniStudyAction(type: .chooseJudgment, target: .daily, dayId: reviewID, session: .review, word: book)
         choose.judgment = .clear
         snapshot = try await perform(choose)
@@ -664,24 +930,49 @@ struct MiniStudyClientTests {
         var answer = MiniStudyAction(type: .submitSpelling, target: .daily, dayId: reviewID, session: .review, word: book)
         answer.answer = book.spelling
         snapshot = try await perform(answer)
+        if snapshot.ledger.days.first(where: { $0.id == reviewID })?.review?.phase == .spelling {
+            snapshot = try await perform(MiniStudyAction(type: .advanceSpelling, target: .daily,
+                                                         dayId: reviewID, session: .review, word: book))
+        }
         snapshot = try await perform(MiniStudyAction(type: .completeReview, target: .daily, dayId: reviewID))
         let finishedReview = snapshot.ledger.days.first { $0.id == reviewID }
         expect(finishedReview?.phase == .finished && finishedReview?.translation.isEmpty == true
                && finishedReview?.translationCount == 0,
                "Review-only finishes from actual review facts without manufacturing translation answers")
+        let reviewOnlyFinished = try await client.planPreview(deck: deck, timezone: context.timezone)
+        expect(reviewOnlyFinished.planContext?.hasTaskAfterReview == false,
+               "Completing the only due group on a review-only day ends the task without entering new words")
         var clear = MiniStudyAction(type: .clearTodayPlan, target: .daily)
         clear.date = context.date
         clear.timezone = context.timezone
         snapshot = try await perform(clear)
-        begin.dayId = pending.id
+        let afterReview = try await client.planPreview(deck: deck, timezone: context.timezone).planContext
+        expect(afterReview?.canContinue == false && afterReview?.canStart == true && afterReview?.hasTaskAfterReview == true,
+               "After clearing reviews, the normal plan leads straight to a fresh word group")
+        begin.intent = .learn
         snapshot = try await perform(begin)
-        let resumed = snapshot.ledger.days.first { $0.id == pending.id }
-        expect(snapshot.planning.activeDayId == pending.id && resumed?.paused == false,
-               "An explicit stable group identity restores the original unfinished group")
-        expect(resumed?.learning == original?.learning && resumed?.studiedWords == original?.studiedWords
-               && resumed?.sentences == original?.sentences && resumed?.translation == original?.translation,
-               "Resumption preserves the first miss, correction state and all prior learning facts")
-        expect(try client.loadDrafts()[draftKey] == "appl", "Switching and resuming groups preserves unsubmitted local input")
+        guard let freshID = snapshot.planning.activeDayId,
+              let fresh = snapshot.ledger.days.first(where: { $0.id == freshID }),
+              let visit = fresh.memoryWindow?.visit else { preconditionFailure("Expected today's first full word card") }
+        expect(freshID != pending.id && fresh.phase == .learning && visit.word == word && visit.stage == 0
+               && fresh.flow?.window.events.isEmpty == true && fresh.learning?.spellingAttempts.isEmpty != false
+               && snapshot.planning.currentSession?.intent == .learn,
+               "Yesterday's spelling correction starts today at a full card with a new visit")
+        let historical = snapshot.ledger.days.first { $0.id == pending.id }
+        expect(historical?.archivedAt != nil && historical?.learning == original?.learning && historical?.sentences == original?.sentences,
+               "Archiving preserves the original spelling miss and prepared example")
+        var pause = MiniStudyAction(type: .pause, target: .daily, dayId: freshID)
+        pause.paused = true
+        snapshot = try await perform(pause)
+        let reconnected = MiniStudyClient(baseURL: baseURL, tokenFile: tokenFile, legacyDirectory: root)
+        let paused = try await reconnected.planPreview(deck: deck, timezone: context.timezone)
+        expect(paused.planContext?.pendingDayId == freshID && paused.planContext?.canContinue == true,
+               "Relaunching today can resume this specific new group")
+        snapshot = try await perform(begin)
+        expect(snapshot.planning.activeDayId == freshID && snapshot.ledger.days.first(where: { $0.id == freshID })?.memoryWindow?.visit?.id == visit.id,
+               "A same-day continue keeps the exact current visit")
+        expect(try client.loadDrafts()[draftKey] == "appl" && draftKey.contains(pending.id),
+               "An old local draft remains scoped to its original group")
         expect(try Data(contentsOf: root.appending(path: "DailyStudy/ledger.json")) == source,
                "The multi-group workflow never writes back into the migrated source ledger")
     }
@@ -731,6 +1022,67 @@ struct MiniStudyClientTests {
                "Audit preserves the submitted original and never manufactures a missing assessment")
         expect(detail.job.receipt?.scheduling.afterDueAt == Date(timeIntervalSinceReferenceDate: 812432078),
                "Audit dates use the same Swift epoch as authoritative learning schedules")
+    }
+
+    private func testDailyTranslationCommentary() throws {
+        let attempt = UUID(), failed = UUID(), job = UUID()
+        let word = ["spelling": "book", "meaning": "书", "phonetic": ""]
+        let entries: [[String: Any]] = [
+            ["attemptId": attempt.uuidString, "dayId": "earlier-run", "word": word, "direction": "chineseToEnglish",
+             "question": "她读书。", "answer": "  She read a book.  ", "submittedAt": 812345678, "status": "ready",
+             "commentary": ["summary": "动作表达清楚。", "strengths": ["a book 用得合适。"],
+                            "improvements": ["日常习惯用 reads。"], "keyPoints": ["第三人称单数"],
+                            "referenceTranslation": "She reads a book."], "retryJobId": NSNull()],
+            ["attemptId": failed.uuidString, "dayId": "later-run", "word": word, "direction": "englishToChinese",
+             "question": "I read a book.", "answer": "我看书。", "submittedAt": 812345600, "status": "failed",
+             "commentary": NSNull(), "retryJobId": job.uuidString]
+        ]
+        let json: [String: Any] = ["date": "2026-11-18", "timezone": "Asia/Shanghai", "entries": entries]
+        let review = try JSONDecoder().decode(MiniTranslationReview.self, from: JSONSerialization.data(withJSONObject: json))
+        expect(review.entries.map(\.id) == [attempt, failed] && review.entries[0].answer == "  She read a book.  ",
+               "Repeating a word across groups preserves two independent translations and the verbatim first answer")
+        expect(review.entries[0].commentary?.strengths.count == 1 && review.entries[0].commentary?.improvements.count == 1 &&
+               review.entries[1].commentary == nil && review.retryableJobs == [job],
+               "The review exposes saved strengths and rewrites and retries only failed jobs")
+        expect(review.entries[0].expressionGrade == nil && review.entries[0].canGradeExpression && !review.processing,
+               "Existing commentary remains available without an invented expression grade or endless polling")
+        let gradeRows = [("natural", ""), ("understandable", ""), ("off_meaning", ""), ("", "queued"), ("", "failed")].map { grade, state in
+            var row = entries[0]
+            row["attemptId"] = UUID().uuidString
+            if !grade.isEmpty { row["expressionGrade"] = grade }
+            if !state.isEmpty { row["expressionGradeStatus"] = state }
+            return row
+        }
+        var updated = json
+        updated["entries"] = gradeRows
+        let graded = try JSONDecoder().decode(MiniTranslationReview.self, from: JSONSerialization.data(withJSONObject: updated))
+        expect(graded.entries.compactMap(\.expressionGrade) == [.natural, .understandable, .offMeaning]
+               && graded.processing && graded.entries.filter(\.canGradeExpression).map(\.expressionGradeStatus) == [.failed]
+               && graded.retryableJobs.isEmpty && graded.entries.allSatisfy { $0.commentary != nil && $0.status == .ready },
+               "All expression grades and backfill states are independent of completed commentary and learning assessment retries")
+        updated["entries"] = gradeRows.map { row in
+            var chinese = row
+            chinese["direction"] = "englishToChinese"
+            chinese["answer"] = "再见爸爸，我今晚给你打电话。"
+            chinese["commentary"] = ["summary": "告别和通话时间都译对了。", "strengths": [], "improvements": [],
+                                     "keyPoints": [], "referenceTranslation": "再见，爸爸！我今晚给你打电话。"]
+            return chinese
+        }
+        let comprehension = try JSONDecoder().decode(MiniTranslationReview.self, from: JSONSerialization.data(withJSONObject: updated))
+        expect(comprehension.entries.map(\.verdict) == [.correct, nil, .offMeaning, nil, nil]
+               && graded.entries.compactMap(\.verdict) == [.natural, .understandable, .offMeaning],
+               "Chinese comprehension and English production use their own grade scales")
+        expect(comprehension.entries[0].alternativeChineseTranslation == nil
+               && comprehension.entries[1].canGradeExpression && comprehension.entries[1].visibleCommentary == nil
+               && comprehension.entries[3].needsMeaningGrade && !comprehension.entries[3].canGradeExpression,
+               "Punctuation-only references are hidden; unresolved old polish grades await meaning review without surfacing stale advice")
+        guard let shanghai = TimeZone(identifier: "Asia/Shanghai"), let utc = TimeZone(secondsFromGMT: 0),
+              let boundary = ISO8601DateFormatter().date(from: "2026-11-17T16:00:01Z") else {
+            preconditionFailure("Expected time zone fixtures")
+        }
+        expect(MiniTranslationReview.dateKey(boundary, timezone: shanghai) == "2026-11-18" &&
+               MiniTranslationReview.dateKey(boundary, timezone: utc) == "2026-11-17",
+               "The date picker queries the submission day in the learning time zone")
     }
 
     private func testAssessmentRebaseRequiresAnExactAppendOnlyChangeChain() throws {
@@ -797,7 +1149,23 @@ struct MiniStudyClientTests {
         expect(snapshot.ledger.days.isEmpty, "The v2 integration runs in a fresh isolated database")
         let deck = ["apple", "book", "cat", "dog", "egg", "fish", "green"].map { MiniWord(spelling: $0, meaning: "测试 " + $0) }
         func perform(_ action: MiniStudyAction) async throws -> MiniStudySnapshot {
-            do { return try await client.perform(.init(expectedRevision: snapshot.revision, action: action)) }
+            do {
+                if action.type == .windowAdvance || action.type == .windowFamiliar,
+                   var projected = snapshot.ledger.days.first(where: { $0.id == action.dayId }),
+                   let visit = projected.memoryWindow?.visit {
+                    guard let input = MiniReviewInput(action: action, visit: visit) else {
+                        preconditionFailure("Expected a valid window input for the displayed visit")
+                    }
+                    input.presentWindow(in: &projected)
+                    let received = try await client.perform(.init(requestId: input.id, expectedRevision: snapshot.revision,
+                                                                  action: action, occurredAt: input.occurredAt))
+                    let confirmed = received.ledger.days.first { $0.id == projected.id }
+                    expect(confirmed?.flow == projected.flow && confirmed?.learning == projected.learning,
+                           "Immediate window projection agrees with the committed visit, group and spelling order")
+                    return received
+                }
+                return try await client.perform(.init(expectedRevision: snapshot.revision, action: action))
+            }
             catch {
                 FileHandle.standardError.write(Data("V2 native action failed: \(action.type.rawValue), revision \(snapshot.revision)\n".utf8))
                 throw error
@@ -829,12 +1197,47 @@ struct MiniStudyClientTests {
         }
         var correctedOnce = false
         var scratchStages = Set<Int>()
-        for group in 1...2 {
+        for group in 1...4 {
+            if group == 1 {
+                guard let visit = current().memoryWindow?.visit, visit.stage == 0 else {
+                    preconditionFailure("Missing full new-word card")
+                }
+                let action = MiniStudyAction.window(.windowFamiliar, dayId: dayId, session: .learning,
+                                                   visit: visit, draft: "原草稿")
+                let command = MiniStudyCommand(expectedRevision: snapshot.revision, action: action)
+                snapshot = try await client.perform(command)
+                let replay = try await client.perform(command)
+                expect(snapshot.revision == replay.revision && current().flow?.window.events.count == 1,
+                       "Reopening the same familiar-word request preserves a single self-report")
+                let event = current().flow?.window.events.last
+                expect(event?.selfReportedFamiliar == true && event?.stage == 0 && event?.draft == "原草稿",
+                       "The actual initial visit and its draft survive without synthetic recall attempts")
+                expect(current().flow?.groupWords == [visit.word] && current().learning?.currentWord == visit.word
+                       && current().learning?.spellingAttempts.isEmpty == true && current().flow?.completed.isEmpty == true,
+                       "Marking a word familiar leaves grouped spelling and final translation to the learner")
+            }
+            if group > 2 {
+                let home = try await client.planPreview(deck: deck, timezone: "Asia/Shanghai")
+                guard let context = home.planContext else { preconditionFailure("Missing completed home plan") }
+                expect(context.todayCompleted == true && context.canStartExtraGroup == true
+                       && context.completedNewCount == group - 1 && context.effective.dailyNewGoal == 2,
+                       "A completed plan offers exactly one optional group without changing the daily target")
+                var extra = begin
+                extra.extraGroupForDate = context.date
+                let command = MiniStudyCommand(expectedRevision: snapshot.revision, action: extra)
+                snapshot = try await client.perform(command)
+                let replay = try await client.perform(command)
+                expect(replay.revision == snapshot.revision && replay.ledger == snapshot.ledger,
+                       "Replaying a bonus start cannot add a second group")
+                let resumed = try await client.planPreview(deck: deck, timezone: "Asia/Shanghai")
+                expect(resumed.planContext?.canContinue == true && resumed.planContext?.canStartExtraGroup == false,
+                       "An existing bonus group can be resumed from home")
+            }
             var visits = 0
             while let visit = current().memoryWindow?.visit {
                 visits += 1
                 expect(visits < 80, "The isolated window must make progress")
-                let action = MiniStudyAction.window(.windowAdvance, dayId: dayId, session: .learning,
+                var action = MiniStudyAction.window(.windowAdvance, dayId: dayId, session: .learning,
                                                    visit: visit, draft: visit.draft)
                 var choose = MiniStudyAction.window(.windowChoose, dayId: dayId, session: .learning,
                                                    visit: visit, draft: "window scratch input")
@@ -847,13 +1250,7 @@ struct MiniStudyClientTests {
                            && current().memoryWindow?.visit?.showsFullCard == true,
                            "Answer selection reveals without advancing or replacing the word")
                     if !correctedOnce {
-                        let correct = MiniStudyAction.window(.windowCorrect, dayId: dayId, session: .learning,
-                                                             visit: visit, draft: "window scratch input")
-                        snapshot = try await perform(correct)
-                        expect(current().memoryWindow?.visit?.id == visit.id && current().memoryWindow?.visit?.willRemember == false,
-                               "Marking a mistaken recall stays on the revealed card")
-                        expect(correct.draft == nil && current().memoryWindow?.visit?.completedStages == 0,
-                               "The UI correction payload is accepted and immediately clears all dots")
+                        action.markWrong = true
                         correctedOnce = true
                     }
                 }
@@ -880,11 +1277,17 @@ struct MiniStudyClientTests {
                     expect(snapshot.practice?.activeDictation == nil, "Exiting scratch spelling returns to the same word card")
                 }
                 snapshot = try await perform(action)
+                if action.markWrong == true {
+                    let corrected = current().flow?.window.events.last
+                    expect(corrected?.id == visit.id && corrected?.initial == true && corrected?.correctedAt != nil
+                           && corrected?.remembered == false && current().memoryWindow?.visit?.id != visit.id,
+                           "Correction is confirmed on the original visit while advancing immediately")
+                }
                 expect(snapshot.practice?.activeDictation == nil, "The next word starts with scratch spelling closed")
             }
             guard let word = current().learning?.currentWord else { preconditionFailure("Missing grouped spelling") }
             expect(current().flow?.groupWords.count == 1 && current().flow?.groupIndex == group,
-                   "Only a completed three-stage word enters this spelling group")
+                   "Each group includes exactly its admitted word for mandatory spelling")
             var spell = MiniStudyAction(type: .submitSpelling, target: .daily, dayId: dayId, session: .learning, word: word)
             spell.answer = "incorrect"
             spell.advanceOnCorrect = false
@@ -904,7 +1307,7 @@ struct MiniStudyClientTests {
             snapshot = try await perform(.init(type: .completeLearning, target: .daily, dayId: dayId))
             var writing = MiniStudyAction(type: .publishWriting, target: .daily, dayId: dayId)
             writing.prompts = [.init(id: UUID(), sentence: .init(word: word, english: "Please show me the \(word.spelling).", chinese: "请把它给我看看。"),
-                                     direction: group == 1 ? .englishToChinese : .chineseToEnglish, focusIds: [])]
+                                     direction: group.isMultiple(of: 2) ? .chineseToEnglish : .englishToChinese, focusIds: [])]
             snapshot = try await perform(writing)
             guard let task = current().currentTranslation else { preconditionFailure("Missing independent translation") }
             var submit = MiniStudyAction(type: .submitTranslation, target: .daily, dayId: dayId)
@@ -912,6 +1315,19 @@ struct MiniStudyClientTests {
             submit.answer = task.reference
             snapshot = try await perform(submit)
             expect(current().currentAttempt?.feedback == nil, "The answer is saved before any AI evaluation")
+            if group == 2, let original = current().currentAttempt {
+                var edit = MiniStudyAction(type: .reviseTranslation, target: .daily, dayId: dayId)
+                edit.attemptId = original.latestID
+                edit.taskId = task.id
+                edit.answer = original.answer + "!"
+                snapshot = try await perform(edit)
+                let revised = current().currentAttempt
+                expect(revised?.id == original.id && revised?.answer == original.answer
+                       && revised?.latestID != original.latestID && revised?.latestAnswer == edit.answer,
+                       "Revision changes the editable answer while preserving the independently submitted first answer")
+                expect(current().translationIndex == group - 1 && current().flow?.completed.count == group - 1,
+                       "Submitting a correction keeps the active question and completes no additional word")
+            }
             var advance = MiniStudyAction(type: .advanceTranslation, target: .daily, dayId: dayId)
             advance.taskId = task.id
             snapshot = try await perform(advance)
@@ -921,10 +1337,28 @@ struct MiniStudyClientTests {
         expect(current().flow?.goalReached == true && current().paused && current().flow?.window.members.isEmpty == false,
                "The final daily goal stops new learning while preserving unfinished window words")
         let preview = try await client.planPreview(deck: deck, timezone: "Asia/Shanghai")
-        expect(preview.planContext?.completedNewCount == 2 && preview.planContext?.remainingNewCount == 0,
-               "Homepage completion uses only final confirmed words from the authoritative projection")
+        expect(preview.planContext?.completedNewCount == 4 && preview.planContext?.remainingNewCount == 0
+               && preview.planContext?.effective.dailyNewGoal == 2 && preview.planContext?.canStartExtraGroup == true
+               && snapshot.planning.longTerm.dailyNewGoal == 2 && snapshot.planning.dailyOverrides.isEmpty,
+               "After two optional groups the homepage offers another and preserves the original plan")
+        let review = MiniAssessmentClient(study: client)
+        guard let timezone = TimeZone(identifier: "Asia/Shanghai") else { preconditionFailure("Missing test timezone") }
+        let days = Dictionary(grouping: current().translation) {
+            MiniTranslationReview.dateKey($0.submittedAt, timezone: timezone)
+        }
+        for (date, attempts) in days {
+            let history = try await review.translations(date: date, timezone: timezone.identifier)
+            expect(Set(history.entries.map(\.id)) == Set(attempts.map(\.id)), "Planned and optional groups are visible by submission date")
+            for attempt in attempts {
+                let row = history.entries.first { $0.id == attempt.id }
+                expect(row?.question == attempt.task.prompt && row?.direction == attempt.task.direction
+                       && row?.answer == attempt.latestAnswer && row?.status == .queued && row?.commentary == nil,
+                       "The stable review row pairs each question with its latest submitted translation while feedback is outstanding")
+            }
+        }
         let reopened = try await MiniStudyClient(baseURL: baseURL, tokenFile: tokenFile, legacyDirectory: root).snapshot()
-        expect(reopened.ledger == snapshot.ledger, "A new client restores the exact interleaved visits, spelling and original translations")
+        expect(reopened.ledger == snapshot.ledger && reopened.revision == snapshot.revision,
+               "Viewing translations preserves the interleaved visits, spelling, original translations and study revision")
     }
 
     private func expect(_ condition: Bool, _ message: String) {

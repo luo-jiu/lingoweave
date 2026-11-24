@@ -30,6 +30,18 @@ struct MiniChatRuntime: Decodable, Sendable {
     let authenticated: Bool
     let models: [MiniChatModel]
     let error: String?
+
+    func selectionIssue(_ selection: MiniAISelection) -> String? {
+        guard available, authenticated else { return error ?? "模型服务尚未就绪，请检查登录后刷新。" }
+        guard let selected = models.first(where: { $0.id == selection.model }) else {
+            return "当前模型列表中没有 \(selection.model)。"
+        }
+        guard selected.efforts.contains(selection.effort) else {
+            return selected.efforts.isEmpty ? "模型未提供可用的推理强度。"
+                : "该模型不支持 \(selection.effort)，请选择其他强度。"
+        }
+        return nil
+    }
 }
 
 /// Runtime discovery uses the same authenticated Node service as all AI jobs.

@@ -19,6 +19,9 @@ done
 script_dir="$(cd -- "$(dirname -- "$0")" && pwd -P)"
 project_dir="$(cd -- "$script_dir/../.." && pwd -P)"
 build_node="$(command -v node)"
+sdk_path="${SDKROOT:-$(xcrun --sdk macosx --show-sdk-path)}"
+sdk_version="$(xcrun --sdk "$sdk_path" --show-sdk-version)"
+minimum_macos="$(/usr/bin/plutil -extract LSMinimumSystemVersion raw -o - "$script_dir/Info.plist")"
 pnpm --dir "$project_dir" --filter @lingoweave/contracts build
 pnpm --dir "$project_dir" --filter @lingoweave/server build
 dist_dir="$script_dir/dist"
@@ -28,8 +31,14 @@ if [ "$configuration" = debug ]; then
 fi
 app_bundle="$dist_dir/$app_name.app"
 
-swift build --package-path "$script_dir" --configuration "$configuration"
-bin_dir="$(swift build --package-path "$script_dir" --configuration "$configuration" --show-bin-path)"
+# Swift Build can otherwise pass the deployment target as the linked SDK version.
+# AppKit uses that SDK version to select the native window controls.
+swift_build=(
+  swift build --package-path "$script_dir" --configuration "$configuration" --sdk "$sdk_path"
+  -Xlinker -platform_version -Xlinker macos -Xlinker "$minimum_macos" -Xlinker "$sdk_version"
+)
+"${swift_build[@]}"
+bin_dir="$("${swift_build[@]}" --show-bin-path)"
 
 mkdir -p "$dist_dir"
 staging_dir="$(mktemp -d "$dist_dir/.build-app.XXXXXX")"

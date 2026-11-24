@@ -74,6 +74,10 @@ export class MiniAiStore {
     const state = this.raw();
     return { ...state, messages: state.messages.slice(-200), jobs: state.jobs.slice(-50) };
   }
+  dataMetrics() {
+    const state = this.raw();
+    return { conversations: state.conversations.length, messages: state.messages.length };
+  }
   private mutate<T>(operation: (state: MiniAiSnapshot) => T): T {
     this.db.exec('BEGIN IMMEDIATE');
     try {
@@ -123,9 +127,14 @@ export class MiniAiStore {
     return this.raw().messages.find((message) => message.jobId === id && message.role === 'user');
   }
   messages(conversationId: string) {
-    return this.raw()
-      .messages.filter((message) => message.conversationId === conversationId)
-      .slice(-12);
+    const messages = this.raw().messages.filter(
+      (message) => message.conversationId === conversationId,
+    );
+    const opening = messages[0];
+    // Anchor a long scene without resending its entire transcript on every turn.
+    if (conversationId.startsWith('dialogue:') && messages.length > 12 && opening)
+      return [opening, ...messages.slice(-11)];
+    return messages.slice(-12);
   }
   discussionForAssessment(
     word: MiniWord,
@@ -163,26 +172,49 @@ export class MiniAiStore {
             ],
       );
   }
-  start(raw: MiniAiStart): { job: MiniAiJob; dispatch: boolean } {
+  start(raw: MiniAiStart, validate?: () => void): { job: MiniAiJob; dispatch: boolean } {
     const input = miniAiStartSchema.parse(raw);
     return this.mutate((state) => {
       const previous = this.previous(input.requestId, input);
       if (previous) return { job: this.job(previous), dispatch: false };
+      validate?.();
       if (!state.imported) throw new LearningError('AI_IMPORT_REQUIRED', '请先迁入原有聊天记录。');
       const shared = state.jobs.find(
         (job) =>
           running(job) &&
-          (input.kind === 'advisor'
+          (input.kind === 'advisor' || input.kind === 'dialogue'
             ? job.conversationId === input.conversationId
             : job.kind === input.kind &&
               job.dayId === input.dayId &&
               job.attemptId === input.attemptId),
       );
       if (shared) {
-        if (input.kind === 'advisor')
+        if (input.kind === 'advisor' || input.kind === 'dialogue')
           throw new LearningError('AI_BUSY', '这段对话仍在处理，请等待或停止后再发送。');
         this.receipt(input.requestId, input, shared.id);
         return { job: shared, dispatch: false };
+      }
+      if (input.kind === 'dialogue') {
+        const scene = state.jobs.filter((job) => job.conversationId === input.conversationId);
+        const latest = scene.at(-1);
+        if (!input.message && !input.dialogueStep) {
+          if (state.conversations.some((conv) => conv.id === input.conversationId))
+            throw new LearningError('DIALOGUE_EXISTS', '该场景已创建，请继续原对话或新建场景。');
+        } else if (
+          !latest ||
+          latest.kind !== 'dialogue' ||
+          latest.status !== 'completed' ||
+          latest.dialogueStep === 'reflect'
+        ) {
+          throw new LearningError('DIALOGUE_NOT_OPEN', '请先开始场景或重试上次对话。');
+        } else if (
+          input.dialogueStep === 'reflect' &&
+          !state.messages.some(
+            (message) => message.conversationId === input.conversationId && message.role === 'user',
+          )
+        ) {
+          throw new LearningError('DIALOGUE_NO_REPLY', '写过回复后才有可回顾的内容。');
+        }
       }
       const id = randomUUID(),
         time = swiftTime(this.now());
@@ -194,6 +226,7 @@ export class MiniAiStore {
         ...(input.dayId ? { dayId: input.dayId } : {}),
         ...(input.attemptId ? { attemptId: input.attemptId } : {}),
         conversationId: input.conversationId,
+        ...(input.dialogueStep ? { dialogueStep: input.dialogueStep } : {}),
         model: input.model,
         effort: input.effort,
         progress: '等待处理…',
@@ -208,10 +241,10 @@ export class MiniAiStore {
       if (!state.conversations.some((conv) => conv.id === input.conversationId))
         state.conversations.push({
           id: input.conversationId,
-          title: input.word?.spelling ?? '学习顾问',
+          title: input.kind === 'dialogue' ? '英文对话' : (input.word?.spelling ?? '学习顾问'),
           word: input.word ?? null,
         });
-      if (input.kind === 'advisor' && input.message)
+      if ((input.kind === 'advisor' || input.kind === 'dialogue') && input.message)
         state.messages.push({
           id: input.requestId,
           conversationId: input.conversationId,
@@ -242,7 +275,10 @@ export class MiniAiStore {
       job.error = error;
       job.updatedAt = swiftTime(this.now());
       job.progress = status === 'completed' ? '已完成' : (error ?? '已停止');
-      if (job.kind === 'advisor' && job.text.trim()) {
+      if (
+        (job.kind === 'advisor' || (job.kind === 'dialogue' && status === 'completed')) &&
+        job.text.trim()
+      ) {
         const existing = state.messages.find(
           (message) => message.jobId === id && message.role === 'assistant',
         );
@@ -262,7 +298,11 @@ export class MiniAiStore {
       return job;
     });
   }
-  control(raw: { requestId: string; jobId: string }, kind: 'cancel' | 'retry') {
+  control(
+    raw: { requestId: string; jobId: string },
+    kind: 'cancel' | 'retry',
+    validateRetry?: () => void,
+  ) {
     const input = miniAiControlSchema.parse(raw);
     return this.mutate((state) => {
       const value = { kind, ...input };
@@ -281,6 +321,7 @@ export class MiniAiStore {
         job.progress = '已停止，已保存内容保留。';
       }
       if (kind === 'retry' && !running(job) && job.status !== 'completed') {
+        validateRetry?.();
         job.status = 'queued';
         job.error = null;
         job.text = '';
@@ -303,7 +344,10 @@ export class MiniAiStore {
         throw new LearningError('AI_ALREADY_IMPORTED', '聊天已经迁入，不能覆盖现有记录。');
       const ids = new Set<string>();
       for (const conv of input.conversations) {
-        if (state.conversations.some((item) => item.id === conv.id))
+        if (
+          conv.id.startsWith('dialogue:') ||
+          state.conversations.some((item) => item.id === conv.id)
+        )
           throw new LearningError('AI_IMPORT_INVALID', '聊天分组身份重复。', 400);
         state.conversations.push({ id: conv.id, title: conv.title, word: conv.word });
         for (const message of conv.messages) {

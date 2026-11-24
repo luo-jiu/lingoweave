@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildApp } from '../apps/server/dist/app.js';
 import { MiniStore } from '../apps/server/dist/mini-store.js';
+import { unixDate } from '../apps/server/dist/mini-study.js';
 import { MiniAiStore } from '../apps/server/dist/mini-ai-store.js';
 import { MiniAiService } from '../apps/server/dist/mini-ai-service.js';
 import { MiniAudioStore } from '../apps/server/dist/mini-audio-store.js';
@@ -95,9 +96,22 @@ class NativeTestRuntime {
       return body;
     };
     const context = await call('context');
-    const kind = context.job.kind;
+    const kind = options.mcp.env.LINGOWEAVE_MINI_AI_KIND;
     options.onThread?.({ threadId: `native-test-${options.jobId}`, model: 'gpt-6.1-sol' });
     options.onProgress(`隔离测试：${kind}`);
+    if (kind === 'dialogue') {
+      assert.ok(context.practicedPatterns.length);
+      assert.deepEqual(context.allowedActions, []);
+      const line = {
+        open: 'Hi! What do you need?',
+        reply: 'Here you are. Anything else?',
+        reflect: 'You told me what you needed.',
+      }[context.mode];
+      assert.ok(line, 'The native client must send a supported scene step.');
+      options.onText(line);
+      return { threadId: `native-test-${options.jobId}`, model: 'gpt-6.1-sol' };
+    }
+    assert.equal(kind, context.job.kind);
     let action;
     if (kind === 'advisor') {
       action = {
@@ -154,6 +168,7 @@ class NativeTestRuntime {
           dayId,
           attemptId: context.day.attempt.id,
           feedback: {
+            expressionGrade: 'natural',
             comment: '主要意思和位置关系表达清楚。',
             tip: '可以换一个物品，再练习同一个位置表达。',
             usefulPhrase: 'on the table · 在桌上',
@@ -290,6 +305,29 @@ try {
   const committed = store.snapshot();
   const groupsCommitted = groupsStore.snapshot();
   const aiStudyCommitted = aiStudyStore.snapshot();
+  const graded = aiStudyCommitted.ledger.days
+    .flatMap((day) => day.translation)
+    .find((attempt) => attempt.feedback);
+  assert.ok(graded, 'The native AI flow saved qualitative feedback for its translation.');
+  const timezone = 'Asia/Shanghai';
+  const date = new Intl.DateTimeFormat('sv-SE', { timeZone: timezone }).format(
+    unixDate(graded.submittedAt),
+  );
+  const reviewUrl = new URL('/api/mini/translations/review', aiAddress);
+  reviewUrl.search = new URLSearchParams({ date, timezone }).toString();
+  const reviewResponse = await fetch(reviewUrl, {
+    headers: { authorization: `Bearer ${aiToken}` },
+  });
+  assert.equal(reviewResponse.status, 200);
+  const reviewed = (await reviewResponse.json()).entries.find(
+    (entry) => entry.attemptId === graded.id,
+  );
+  assert.equal(reviewed?.status, 'ready');
+  assert.equal(reviewed.answer, graded.answer);
+  assert.deepEqual(reviewed.commentary.strengths, graded.feedback.strengths);
+  assert.equal(reviewed.commentary.referenceTranslation, graded.feedback.referenceTranslation);
+  assert.equal(aiStudyStore.snapshot().revision, aiStudyCommitted.revision);
+  const patternsCommitted = aiStudyStore.patternContext();
   const aiCommitted = aiStore.snapshot();
   const audioStudyCommitted = audioStudyStore.snapshot();
   const audioCommitted = audioStore.snapshot();
@@ -318,8 +356,8 @@ try {
   );
   assert.deepEqual(
     new Set(aiCommitted.jobs.filter((job) => job.status === 'completed').map((job) => job.kind)),
-    new Set(['advisor', 'prepare', 'writing', 'feedback']),
-    'The third native flow must commit every supported AI task kind.',
+    new Set(['advisor', 'prepare', 'writing', 'feedback', 'dialogue']),
+    'The third native flow must complete teaching, advisor and read-only scene tasks.',
   );
   await Promise.all([
     app.close(),
@@ -338,6 +376,10 @@ try {
     const reopened = new MiniStore(filename);
     try {
       assert.deepEqual(reopened.snapshot(), expected);
+      if (filename === aiStudyDatabase) {
+        assert.ok(patternsCommitted.practiced.length);
+        assert.deepEqual(reopened.patternContext(), patternsCommitted);
+      }
     } finally {
       reopened.close();
     }

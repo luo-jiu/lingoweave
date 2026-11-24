@@ -6,6 +6,8 @@ import { z } from 'zod';
 import {
   miniAssessmentApplicationSchema,
   miniAssessmentDetailSchema,
+  miniAssessmentJobSchema,
+  miniAssessmentResultSchema,
   miniAssessmentRetrySchema,
   miniAssessmentSourceSchema,
   type MiniAssessmentApplication,
@@ -15,6 +17,8 @@ import {
   type MiniAssessmentSource,
 } from '@lingoweave/contracts';
 import { LearningError } from './learning-store.js';
+import { MiniExpressionGrades } from './mini-expression-grades.js';
+import type { PreparationRuntime } from './preparation-service.js';
 import { swiftTime } from './mini-study.js';
 
 const row = z.object({ body: z.string() });
@@ -36,6 +40,9 @@ export class MiniAssessmentStore {
       CREATE TABLE IF NOT EXISTS mini_assessment_jobs(id TEXT PRIMARY KEY,body TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS mini_assessment_requests(id TEXT PRIMARY KEY,hash TEXT NOT NULL,job_id TEXT NOT NULL);`);
     this.all();
+  }
+  expressionGrades(runtime: PreparationRuntime) {
+    return new MiniExpressionGrades(this.db, runtime);
   }
   private transaction<T>(operation: () => T): T {
     this.db.exec('BEGIN IMMEDIATE');
@@ -63,12 +70,39 @@ export class MiniAssessmentStore {
       .all()
       .map((value) => miniAssessmentDetailSchema.parse(JSON.parse(row.parse(value).body)));
   }
+  dataMetrics() {
+    return this.db
+      .prepare(
+        "SELECT json_extract(body,'$.job.sourceId') AS sourceId, json_extract(body,'$.job.status') AS status FROM mini_assessment_jobs",
+      )
+      .all()
+      .map((value) =>
+        z
+          .object({ sourceId: z.string(), status: miniAssessmentJobSchema.shape.status })
+          .parse(value),
+      );
+  }
   detail(id: string): MiniAssessmentDetail {
     const value = this.db
       .prepare('SELECT body FROM mini_assessment_jobs WHERE id=?')
       .get(id.toLowerCase());
     if (!value) throw new LearningError('ASSESSMENT_NOT_FOUND', '找不到这项学习评价。', 404);
     return miniAssessmentDetailSchema.parse(JSON.parse(row.parse(value).body));
+  }
+  translationReview(id: string) {
+    const row = this.db
+      .prepare(
+        "SELECT json_extract(body, '$.job.status') AS status, json_extract(body, '$.application.result') AS result FROM mini_assessment_jobs WHERE id=?",
+      )
+      .get(id.toLowerCase());
+    if (!row) return null;
+    return {
+      status: miniAssessmentJobSchema.shape.status.parse(row.status),
+      result:
+        row.result === null
+          ? null
+          : miniAssessmentResultSchema.parse(JSON.parse(z.string().parse(row.result))),
+    };
   }
   snapshot(): MiniAssessmentSnapshot {
     const all = this.all().map((detail) => detail.job);

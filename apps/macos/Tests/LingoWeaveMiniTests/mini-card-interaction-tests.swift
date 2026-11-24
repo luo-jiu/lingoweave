@@ -3,30 +3,28 @@ import SwiftUI
 
 @MainActor
 private final class ScratchState: ObservableObject {
-    @Published var draft = "where"
-    @Published var saving = false
-    var playedWords: [MiniWord] = []
+    @Published var draft = "whare"
+    @Published var storagePending = false
     @Published var practice = MiniDictation(id: UUID(), target: .daily, dayId: "isolated",
         recordId: nil, session: .learning, word: MiniWord(spelling: "where", meaning: "在哪里"),
         openedAt: .now, closedAt: nil, revealedAt: nil, attempts: [])
 
-    func answer(_ correct: Bool) {
+    func answer(_ answer: String) {
         let previous = practice
+        storagePending = true
         practice = MiniDictation(id: previous.id, target: previous.target, dayId: previous.dayId,
             recordId: nil, session: previous.session, word: previous.word, openedAt: previous.openedAt,
             closedAt: nil, revealedAt: .now,
-            attempts: previous.attempts + [MiniDictationAttempt(id: UUID(), answer: draft,
-                correct: correct, submittedAt: .now)])
-        saving = false
+            attempts: previous.attempts + [MiniDictationAttempt(id: UUID(), answer: answer,
+                correct: MiniReviewSession.matchesSpelling(answer, word: practice.word.spelling), submittedAt: .now)])
     }
 }
 
 private struct ScratchContent: View {
     @ObservedObject var state: ScratchState
     var body: some View {
-        MiniDictationPracticeView(practice: state.practice, draft: $state.draft, saving: state.saving,
-            submit: { _ in state.saving = true }, reveal: {}, close: {},
-            playWord: { state.playedWords.append($0) })
+        MiniDictationPracticeView(practice: state.practice, draft: $state.draft,
+            submit: state.answer, reveal: {}, close: {})
             .padding(14)
     }
 }
@@ -48,6 +46,8 @@ private struct FieldContent: View {
 @MainActor
 private final class SpellingState: ObservableObject {
     var playedWords: [MiniWord] = []
+    @Published var groupIndex: Int?
+    @Published var saving = false
     @Published var session = MiniReviewSession(words: [
         MiniWord(spelling: "where", meaning: "adv. 在哪里"),
         MiniWord(spelling: "bag", meaning: "n. 袋子"),
@@ -58,8 +58,8 @@ private final class SpellingState: ObservableObject {
 private struct SpellingContent: View {
     @ObservedObject var state: SpellingState
     var body: some View {
-        MiniReviewView(session: $state.session, onFinish: {},
-                       playSpellingResult: { state.playedWords.append($0) })
+        MiniReviewView(session: $state.session, onFinish: {}, groupIndex: state.groupIndex,
+                       playSpellingResult: { state.playedWords.append($0) }, saving: state.saving)
             .safeAreaInset(edge: .bottom, spacing: 2) {
                 MiniAudioFooter(notice: nil) {
                     Label("听词提示", systemImage: "speaker.wave.2").font(.caption)
@@ -115,34 +115,58 @@ private struct FooterContent: View {
 @MainActor
 private final class WindowState: ObservableObject {
     @Published var visit: MiniMemoryWindow.Visit
-    var advances: [Date] = []
-    var selectedAt: Date?
+    @Published var day: MiniDailyDay?
+    @Published var familiarMarks = 0
+    @Published var saving = false
+    var advances: [Bool?] = []
+    var corrections = 0
 
-    init(stage: Int, remembered: Bool? = nil) {
-        let now = Date.now
-        visit = MiniMemoryWindow.Visit(id: UUID(), word: MiniWord(spelling: "bag", meaning: "袋子"),
-            stage: stage, openedAt: now, initial: remembered, selectedAt: remembered == nil ? nil : now,
-            revealedAt: remembered == nil ? nil : now, correctedAt: nil, draft: "")
+    init(visit: MiniMemoryWindow.Visit) { self.visit = visit }
+
+    convenience init(day: MiniDailyDay) {
+        guard let visit = day.memoryWindow?.visit else { preconditionFailure("Missing window visit") }
+        self.init(visit: visit)
+        self.day = day
     }
 
-    func edit(choice: Bool? = nil, corrected: Bool = false) {
+    convenience init(stage: Int, remembered: Bool? = nil) {
+        let now = Date.now
+        self.init(visit: MiniMemoryWindow.Visit(id: UUID(), word: MiniWord(spelling: "bag", meaning: "袋子"),
+            stage: stage, openedAt: now, initial: remembered, selectedAt: remembered == nil ? nil : now,
+            revealedAt: remembered == nil ? nil : now, correctedAt: nil, draft: ""))
+    }
+
+    func advance(_ choice: Bool?) {
+        advances.append(choice)
+        if var projected = day, let current = projected.memoryWindow?.visit {
+            precondition(projected.advanceWindow(visitId: current.id, nextId: UUID(), remembered: choice,
+                                                 markWrong: false, familiar: false, draft: nil, at: .now))
+            day = projected
+        }
+    }
+
+    func choose(_ choice: Bool) {
         let previous = visit
-        selectedAt = .now
+        let now = Date.now
         visit = MiniMemoryWindow.Visit(id: previous.id, word: previous.word, stage: previous.stage,
-            openedAt: previous.openedAt, initial: choice ?? previous.initial,
-            selectedAt: choice == nil ? previous.selectedAt : selectedAt,
-            revealedAt: choice == nil ? previous.revealedAt : selectedAt,
-            correctedAt: corrected ? selectedAt : previous.correctedAt, draft: previous.draft)
+            openedAt: previous.openedAt, initial: choice, selectedAt: now, revealedAt: now,
+            correctedAt: nil, draft: previous.draft)
     }
 }
 
 private struct WindowContent: View {
     @ObservedObject var state: WindowState
+    var offersFamiliar = false
     var body: some View {
-        MiniWindowControls(visit: state.visit, saving: false,
-            commands: MiniWindowCommands(draft: .constant(""), choose: { state.edit(choice: $0) },
-                correct: { state.edit(corrected: true) }, advance: { _ in state.advances.append(.now) }, saveDraft: {}))
-            .background(LayoutMarker())
+        let commands = MiniWindowCommands(draft: .constant(""), choose: state.choose,
+            correct: { state.corrections += 1 }, advance: state.advance, saveDraft: {},
+            markFamiliar: offersFamiliar ? { state.familiarMarks += 1 } : nil)
+        if let day = Binding($state.day) {
+            MiniDailyView(day: day, preparing: false, grading: false, retryPreparation: {},
+                          gradeTranslation: {}, reviewGroupIndex: 1, saving: state.saving, previewWindow: commands)
+        } else {
+            MiniWindowControls(visit: state.visit, commands: commands).background(LayoutMarker())
+        }
     }
 }
 
@@ -166,35 +190,36 @@ struct MiniCardInteractionTests {
         precondition(window.firstResponder === editor)
         let frame = field.convert(field.bounds, to: nil)
         let coordinator = field.delegate as? ReviewAnswerField.Coordinator
-        _ = coordinator?.control(field, textView: editor, doCommandBy: #selector(NSResponder.insertNewline(_:)))
+        let returnKey = #selector(NSResponder.insertNewline(_:))
+        _ = coordinator?.control(field, textView: editor, doCommandBy: returnKey)
         pump()
-        precondition(state.saving && field.isEnabled && window.firstResponder === editor,
+        precondition(state.storagePending && field.isEnabled && window.firstResponder === editor,
                      "An in-flight scratch save must preserve the enabled input and its focus")
-        precondition(field.convert(field.bounds, to: nil) == frame,
-                     "Submitting must preserve the input position")
-        state.answer(false)
-        pump()
-        precondition(editor.textColor == NSColor.systemRed && state.playedWords.count == 1,
-                     "Each incorrect result turns the submitted answer red and pronounces the word once")
-        state.saving = false
-        pump()
-        precondition(state.playedWords.count == 1, "An unchanged result must not repeat its pronunciation")
+        precondition(editor.textColor == NSColor.systemRed && state.practice.attempts.count == 1,
+                     "An incorrect answer turns red before the save returns")
         precondition(field.convert(field.bounds, to: nil) == frame,
                      "Showing a wrong-answer reference must preserve the input position")
-        state.answer(true)
+        state.draft = "where"
         pump()
-        precondition(editor.textColor == NSColor.systemGreen)
-        precondition(state.playedWords.count == 2, "A correct result also pronounces the word once")
+        _ = coordinator?.control(field, textView: editor, doCommandBy: returnKey)
+        pump()
+        precondition(state.storagePending && editor.textColor == NSColor.systemGreen && state.practice.attempts.count == 2,
+                     "A correction turns green while previous saves are pending")
         precondition(field.convert(field.bounds, to: nil) == frame,
                      "Showing accepted spelling must preserve the input position")
         window.makeFirstResponder(nil)
-        _ = coordinator?.control(field, textView: editor, doCommandBy: #selector(NSResponder.insertNewline(_:)))
+        _ = coordinator?.control(field, textView: editor, doCommandBy: returnKey)
         window.makeKeyAndOrderFront(nil)
         app.activate(ignoringOtherApps: true)
         pump()
         precondition(state.draft.isEmpty && field.currentEditor() != nil,
                      "Repeat spelling must clear the draft and explicitly restore input focus")
-        precondition(state.playedWords.count == 2, "Starting another spelling attempt does not read the answer")
+        precondition(state.storagePending && state.practice.attempts.count == 2,
+                     "Starting another attempt only clears the draft while saves are pending")
+        state.storagePending = false
+        pump()
+        precondition(editor.textColor == NSColor.labelColor && state.draft.isEmpty,
+                     "Save completion must not bring back the previous answer or its color")
         let repeatedFrame = field.convert(field.bounds, to: nil)
         precondition(abs(repeatedFrame.midX - frame.midX) < 0.5 && abs(repeatedFrame.midY - frame.midY) < 0.5,
                      "Repeat changed the input frame from \(frame) to \(repeatedFrame)")
@@ -240,36 +265,36 @@ struct MiniCardInteractionTests {
                      "Audio controls disappearing during a card refresh must preserve button positions")
         footerWindow.orderOut(nil)
 
-        for stage in [0, 2] {
-            let transition = WindowState(stage: stage, remembered: stage == 0 ? nil : true)
+        for stage in [1, 2] {
+            let transition = WindowState(stage: stage)
             let transitionWindow = makeWindow()
             transitionWindow.contentView = NSHostingView(rootView: WindowContent(state: transition))
             transitionWindow.makeKeyAndOrderFront(nil)
             pump()
-            clickWindowControl(in: transitionWindow, firstOfTwo: stage != 0)
+            clickWindowControl(in: transitionWindow, relativeX: 0.75)
             pump()
-            precondition(transition.visit.completedStages == (stage == 0 ? 1 : 0),
-                         "Clicking the actual button immediately updates the current word's dots")
-            precondition(transition.advances.isEmpty, "The green/reset feedback stays visible for 0.3 seconds")
-            pump(for: 0.3)
-            precondition(transition.advances.count == 1)
-            precondition(transition.advances[0].timeIntervalSince(transition.selectedAt ?? .distantPast) >= 0.3)
-            pump(for: 0.35)
-            precondition(transition.advances.count == 1, "Ordinary redraws cannot advance a second word")
+            precondition(transition.visit.initial == true && transition.visit.showsFullCard && transition.advances.isEmpty,
+                         "Recall reveals the card for checking before moving on")
+            let corrects = stage == 2
+            clickWindowControl(in: transitionWindow, relativeX: corrects ? 0.25 : 0.75)
+            pump(for: 0.03)
+            precondition(corrects ? transition.corrections == 1 && transition.advances.isEmpty : transition.advances == [nil],
+                         "Confirm or correct dispatches its single action immediately")
             transitionWindow.orderOut(nil)
         }
 
-        let cancelled = WindowState(stage: 0)
-        let cancelledWindow = makeWindow()
-        cancelledWindow.contentView = NSHostingView(rootView: WindowContent(state: cancelled))
-        cancelledWindow.makeKeyAndOrderFront(nil)
+        let familiar = WindowState(stage: 0)
+        let familiarWindow = makeWindow()
+        familiarWindow.contentView = NSHostingView(rootView: WindowContent(state: familiar, offersFamiliar: true))
+        familiarWindow.makeKeyAndOrderFront(nil)
         pump()
-        clickWindowControl(in: cancelledWindow, firstOfTwo: false)
-        pump(for: 0.05)
-        cancelledWindow.contentView = nil
-        pump(for: 0.4)
-        precondition(cancelled.advances.isEmpty, "Leaving the card cancels its pending automatic advance")
-        cancelledWindow.orderOut(nil)
+        clickWindowControl(in: familiarWindow, relativeX: 0.25)
+        pump()
+        familiar.objectWillChange.send()
+        pump()
+        precondition(familiar.familiarMarks == 1 && familiar.visit.initial == nil && familiar.advances.isEmpty,
+                     "The familiar button dispatches once without also submitting a normal recall or advance")
+        familiarWindow.orderOut(nil)
 
         for size in [NSSize(width: 360, height: 234), NSSize(width: 600, height: 440)] {
             let spelling = SpellingState()
@@ -279,9 +304,18 @@ struct MiniCardInteractionTests {
             spellingWindow.makeKeyAndOrderFront(nil)
             pump()
             let initialFrame = spellingFrame(in: spellingWindow)
+            precondition(abs(initialFrame.midY - size.height / 2) < 14,
+                         "The typing row stays near the center of the card at compact and expanded sizes")
             precondition(spelling.playedWords.isEmpty, "Opening a spelling prompt must keep its pronunciation concealed")
+            spelling.saving = true
+            pump()
+            guard let input = answerField(in: spellingWindow.contentView) else { preconditionFailure() }
+            precondition(input.isEnabled && input.currentEditor() != nil,
+                         "A background write must keep the spelling field enabled and focused")
             precondition(spelling.session.submitSpelling("where"))
             pump()
+            precondition(input.isEnabled && input.textColor == .systemGreen,
+                         "A correct spelling stays green while a save is pending")
             precondition(spelling.playedWords.map(\.spelling) == ["where"], "A correct result reads its word once")
             precondition(spellingFrame(in: spellingWindow) == initialFrame,
                          "Showing the green answer and Next button must preserve the input and underline position")
@@ -291,27 +325,50 @@ struct MiniCardInteractionTests {
             precondition(spellingFrame(in: spellingWindow) == initialFrame,
                          "Removing the Next button for the following word must preserve the spelling position")
             let emptyFeedback = spellingFeedbackPixels(in: spellingWindow)
-            precondition(spelling.session.submitSpelling("incorrect"))
+            guard let field = answerField(in: spellingWindow.contentView),
+                  let editor = field.currentEditor() as? NSTextView,
+                  let coordinator = field.delegate as? ReviewAnswerField.Coordinator else {
+                preconditionFailure("The grouped spelling input must have keyboard focus")
+            }
+            let returnKey = #selector(NSResponder.insertNewline(_:))
+            precondition(editor.string.isEmpty && coordinator.control(field, textView: editor, doCommandBy: returnKey))
             pump()
-            precondition(spelling.playedWords.map(\.spelling) == ["where", "bag"], "An incorrect result also reads its word once")
+            precondition(spelling.session.spellingState == .correcting && spelling.session.lastSpellingAttempt?.answer == "",
+                         "Return on a blank field saves an incorrect original answer")
+            precondition(spelling.playedWords.map(\.spelling) == ["where", "bag"], "A blank answer also reads its word once")
             precondition(spellingFeedbackPixels(in: spellingWindow) != emptyFeedback,
-                         "A wrong submission shows its reference spelling before correction starts")
+                         "A blank submission shows its reference spelling before correction starts")
             precondition(spellingFrame(in: spellingWindow) == initialFrame,
                          "Showing the reference spelling must preserve the input and underline position")
             spelling.session.spellingDraft = "b"
             pump()
             precondition(spellingFeedbackPixels(in: spellingWindow) == emptyFeedback,
                          "Starting a correction removes the visible reference spelling")
-            spelling.session.spellingDraft = "incorrect"
+            spelling.session.spellingDraft = ""
             pump()
             precondition(spellingFeedbackPixels(in: spellingWindow) == emptyFeedback,
-                         "Typing the old wrong answer again must not restore the hidden reference")
+                         "Clearing the correction must not restore the hint until Return is pressed")
+            precondition(coordinator.control(field, textView: editor, doCommandBy: returnKey))
+            pump()
+            precondition(spellingFeedbackPixels(in: spellingWindow) != emptyFeedback && spelling.session.spellingAttempts.count == 2,
+                         "Return restores the same blank-answer hint without counting it again")
             precondition(spelling.playedWords.count == 2 && spellingFrame(in: spellingWindow) == initialFrame,
                          "Editing a correction preserves the input position and does not play audio")
             precondition(spelling.session.submitSpelling("still incorrect"))
             pump()
+            precondition(field.isEnabled && field.textColor == .systemRed && editor.textColor == .systemRed,
+                         "A submitted wrong correction appears red in the active editor")
             precondition(spellingFeedbackPixels(in: spellingWindow) != emptyFeedback,
                          "Another submitted wrong answer shows fresh feedback")
+            spelling.session.spellingDraft = "s"
+            pump()
+            spelling.session.spellingDraft = "still incorrect"
+            pump()
+            precondition(spellingFeedbackPixels(in: spellingWindow) == emptyFeedback)
+            precondition(coordinator.control(field, textView: editor, doCommandBy: returnKey))
+            pump()
+            precondition(field.textColor == .systemRed && spelling.session.spellingAttempts.count == 3,
+                         "Resubmitting the same incorrect text restores red feedback without duplicating the answer")
             precondition(spelling.session.submitSpelling("bag"))
             pump()
             precondition(spelling.playedWords.map(\.spelling) == ["where", "bag", "bag", "bag"], "Each submitted correction reads its word once")
@@ -337,7 +394,153 @@ struct MiniCardInteractionTests {
                          "The deferred-word notice must use reserved space while spelling continues")
             spellingWindow.orderOut(nil)
         }
-        print("9 native card focus, spelling layout, audio layout and delayed window transition tests passed.")
+        testWindowCardWhileSaving()
+        testResumingAnOldWindowChoice()
+        testWrappedSpellingPrompt()
+        testLongReviewFitsPanel()
+        print("Native card focus, spelling layout, compact review progress, audio layout and window transition tests passed.")
+    }
+
+    @MainActor
+    private static func testWindowCardWhileSaving() {
+        let newWords = MiniDevPreview.make(.learning).day
+        var relearning = MiniDevPreview.make(.reviewJudgment).day
+        relearning.flow = newWords.flow
+        relearning.review?.relearning = newWords.memoryWindow
+        relearning.review?.relearningWords = newWords.preparationWords
+        for day in [newWords, relearning] {
+            guard let confirmed = day.memoryWindow?.visit else { preconditionFailure("Missing memory visit") }
+            let state = WindowState(day: day)
+            let window = makeWindow()
+            let hasFamiliar = day.phase == .learning
+            let host = NSHostingView(rootView: WindowContent(state: state, offersFamiliar: hasFamiliar))
+            window.contentView = host
+            window.makeKeyAndOrderFront(nil)
+            defer { window.orderOut(nil) }
+            pump()
+            let buttonStrip = NSRect(x: host.bounds.midX - 85, y: 0, width: 170, height: 26)
+            let wordCard = NSRect(x: 0, y: 30, width: host.bounds.width, height: host.bounds.height - 60)
+            let ready = pixels(in: host, windowRect: buttonStrip)
+            let original = pixels(in: host, windowRect: wordCard)
+            state.saving = true
+            pump()
+            precondition(pixels(in: host, windowRect: buttonStrip) == ready,
+                         "An in-flight write must not dim either kind of memory card")
+            click(in: window, at: NSPoint(x: host.bounds.midX + (hasFamiliar ? 32 : 0), y: 12))
+            pump(for: 0.03)
+            precondition(state.advances == [true] && state.day?.memoryWindow?.visit?.word != confirmed.word,
+                         "Remember advances in one action even while saving")
+            precondition(pixels(in: host, windowRect: wordCard) != original,
+                         "The next word appears before the original server visit changes")
+            state.saving = false
+            pump(for: 0.08)
+            state.saving = true
+            pump(for: 0.2)
+            precondition(state.advances == [true], "Background writes cannot advance another word")
+        }
+    }
+
+    @MainActor
+    private static func testResumingAnOldWindowChoice() {
+        for stage in [MiniDevStage.learning, .learningMeaning] {
+            var day = MiniDevPreview.make(stage).day
+            precondition(MiniDevPreview.editVisit(&day, choice: true))
+            if stage == .learningMeaning { precondition(MiniDevPreview.editVisit(&day, corrected: true)) }
+            let state = WindowState(day: day)
+            let window = makeWindow()
+            window.contentView = NSHostingView(rootView: WindowContent(state: state))
+            window.makeKeyAndOrderFront(nil)
+            defer { window.orderOut(nil) }
+            pump()
+            precondition(state.advances == [nil], "A saved choice left by older releases advances without a held frame")
+            state.saving = true
+            pump()
+            precondition(state.advances == [nil], "A redraw must not consume a second choice")
+        }
+    }
+
+    @MainActor
+    private static func testWrappedSpellingPrompt() {
+        let word = MiniWord(spelling: "local", meaning: "a. 地方性的, 当地的, 局部的, 乡土的, 本地的")
+        let state = SpellingState()
+        state.session = MiniReviewSession(words: [word], startingWithSpelling: true)
+        let window = makeWindow()
+        window.setContentSize(NSSize(width: 300, height: 218))
+        window.contentView = NSHostingView(rootView: SpellingContent(state: state))
+        window.makeKeyAndOrderFront(nil)
+        defer { window.orderOut(nil) }
+        pump()
+        let line = spellingFrame(in: window)
+        for answer in ["loacl", "local"] {
+            precondition(state.session.submitSpelling(answer))
+            pump()
+            precondition(spellingFrame(in: window) == line,
+                         "A wrapped definition keeps its height and the typing row stays put across feedback")
+        }
+    }
+
+    @MainActor
+    private static func testLongReviewFitsPanel() {
+        let words = (1...300).map { MiniWord(spelling: "word\($0)", meaning: "词\($0)") }
+        let state = SpellingState()
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 360, height: 300),
+                            styleMask: [.titled, .resizable], backing: .buffered, defer: false)
+        panel.isReleasedWhenClosed = false
+        let host = NSHostingView(rootView: SpellingContent(state: state))
+        panel.contentView = host
+        panel.orderFront(nil)
+        defer { panel.orderOut(nil) }
+        for width: CGFloat in [360, 300, 600] {
+            panel.setContentSize(NSSize(width: width, height: 300))
+            state.session = MiniReviewSession(words: words)
+            pump()
+            func assertWidth() {
+                precondition(abs(host.bounds.width - width) < 1 && host.fittingSize.width <= width,
+                             "The 300-word progress row must fit the panel at its chosen width (\(width))")
+            }
+            assertWidth()
+            state.session.chooseJudgment(.clear)
+            pump()
+            assertWidth()
+            state.session = MiniReviewSession(words: words, startingWithSpelling: true)
+            pump()
+            assertWidth()
+            state.session = MiniReviewSession(words: Array(words.prefix(10)))
+            pump()
+            assertWidth()
+            for spelling in [false, true] {
+                state.groupIndex = nil
+                state.session = MiniReviewSession(words: Array(words.prefix(10)), startingWithSpelling: spelling)
+                pump()
+                let centered = markerPixels(in: host)
+                state.groupIndex = 12
+                pump()
+                precondition(markerPixels(in: host) == centered,
+                             "The left group label must leave the centered ten-word indicator in place at \(width) pt")
+                if spelling {
+                    precondition(state.session.submitSpelling("word1") && state.session.advanceSpelling())
+                } else {
+                    precondition(state.session.chooseJudgment(.clear) && state.session.advanceJudgment())
+                }
+                pump()
+                precondition(markerPixels(in: host) != centered, "Advancing must change the captured progress markers")
+            }
+        }
+    }
+
+    @MainActor
+    private static func markerPixels(in host: NSView) -> Data {
+        let frame = host.convert(host.bounds, to: nil)
+        return pixels(in: host, windowRect: NSRect(x: frame.midX - 87, y: frame.maxY - 32, width: 174, height: 20))
+    }
+
+    @MainActor
+    private static func pixels(in host: NSView, windowRect: NSRect) -> Data {
+        let strip = host.convert(windowRect, from: nil)
+        guard let image = host.bitmapImageRepForCachingDisplay(in: strip) else { preconditionFailure() }
+        host.cacheDisplay(in: strip, to: image)
+        guard let pixels = image.representation(using: .png, properties: [:]) else { preconditionFailure() }
+        return pixels
     }
 
     @MainActor
@@ -387,12 +590,16 @@ struct MiniCardInteractionTests {
     }
 
     @MainActor
-    private static func clickWindowControl(in window: NSWindow, firstOfTwo: Bool) {
+    private static func clickWindowControl(in window: NSWindow, relativeX: CGFloat) {
         guard let marker = layoutMarker(in: window.contentView) else {
             preconditionFailure("Missing window control geometry")
         }
         let frame = marker.convert(marker.bounds, to: nil)
-        let point = NSPoint(x: firstOfTwo ? frame.minX + frame.width / 4 : frame.midX, y: frame.midY)
+        click(in: window, at: NSPoint(x: frame.minX + frame.width * relativeX, y: frame.midY))
+    }
+
+    @MainActor
+    private static func click(in window: NSWindow, at point: NSPoint) {
         for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
             guard let event = NSEvent.mouseEvent(with: type, location: point, modifierFlags: [],
                 timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,

@@ -8,8 +8,9 @@ struct MiniMemoryClientTests {
         tests.panAndFocusKeepTheZoomedRange()
         try tests.queryUsesSwiftDatesWithoutCommands()
         try tests.missingAbilitiesRemainMissing()
+        tests.wordListPagesPreserveAllSenses()
         try tests.curveSegmentsAndEventTimesRemainDistinct()
-        print("5 mini memory viewport and read-model tests passed.")
+        print("6 mini memory viewport, pagination and read-model tests passed.")
         let env = ProcessInfo.processInfo.environment
         if let address = env["MINI_TEST_FLOW_SERVICE_URL"], let url = URL(string: address), let token = env["MINI_TEST_FLOW_TOKEN_PATH"] {
             try await tests.readLiveFlow(baseURL: url, tokenFile: URL(fileURLWithPath: token))
@@ -22,6 +23,9 @@ struct MiniMemoryClientTests {
     private func rangeIsBoundedAndIncludesRecentHistory() {
         var viewport = MiniMemoryViewport(anchor: anchor)
         precondition(viewport.spanDays == 90)
+        let calendar = Calendar.current
+        precondition(viewport.calendarRange.lowerBound == calendar.startOfDay(for: viewport.range.lowerBound))
+        precondition(viewport.calendarRange.upperBound == calendar.dateInterval(of: .day, for: viewport.range.upperBound)?.end)
         precondition(viewport.range.lowerBound == anchor.addingTimeInterval(-30 * 86400))
         precondition(viewport.range.upperBound == anchor.addingTimeInterval(60 * 86400))
         viewport.preset = .overview
@@ -58,18 +62,19 @@ struct MiniMemoryClientTests {
     }
 
     private var wordJSON: String {
-        #"{"senseId":"sense-apple","word":{"spelling":"apple","meaning":"苹果","phonetic":""},"source":"flow","status":"learning","dueAt":816086400,"idealDueAt":816086400,"firstSeenAt":816000000,"lastReviewAt":null,"reviewCount":0,"meaning":null,"spelling":null}"#
+        #"{"senseId":"sense-apple","word":{"spelling":"apple","meaning":"苹果","phonetic":""},"source":"flow","status":"due","inCurrentReview":true,"dueAt":816086400,"idealDueAt":816086400,"firstSeenAt":816000000,"lastReviewAt":null,"reviewCount":0,"meaning":null,"spelling":null}"#
     }
     private var responseHeader: String {
         #""schemaVersion":1,"revision":7,"asOf":816000000,"timezone":"Asia/Shanghai","from":813408000,"to":821184000,"notices":[]"#
     }
 
     private func missingAbilitiesRemainMissing() throws {
-        let json = "{" + responseHeader + #", "summary":{"wordCount":1,"completedWordCount":1,"measuredWordCount":0,"dueCount":0,"scheduledCount":1,"learningCount":1,"excludedLegacyCount":0},"words":["# + wordJSON + #"],"load":[{"day":"2026-11-10","at":816086400,"count":1}]}"#
+        let json = "{" + responseHeader + #", "summary":{"wordCount":1,"completedWordCount":1,"measuredWordCount":0,"dueCount":1,"overdueCount":0,"scheduledCount":0,"learningCount":0,"excludedLegacyCount":0},"words":["# + wordJSON + #"],"load":[{"day":"2026-11-10","at":816086400,"count":1}]}"#
         let overview = try JSONDecoder().decode(MiniMemoryOverview.self, from: Data(json.utf8))
         precondition(overview.words[0].meaning == nil && overview.words[0].spelling == nil)
         precondition(overview.words[0].dueAt == Date(timeIntervalSinceReferenceDate: 816086400))
         precondition(overview.summary.completedWordCount == 1 && overview.summary.measuredWordCount == 0)
+        precondition(overview.words[0].inCurrentReview == true && overview.summary.overdueCount == 0)
     }
 
     private func curveSegmentsAndEventTimesRemainDistinct() throws {
@@ -79,6 +84,28 @@ struct MiniMemoryClientTests {
         precondition(!detail.points[0].projected && detail.points[1].projected)
         precondition(detail.points[0].value(.spelling) == nil)
         precondition(detail.events[0].recordedAt > detail.events[0].occurredAt && detail.events[0].evidence == "model")
+    }
+
+    private func wordListPagesPreserveAllSenses() {
+        let words = (0..<3003).map { i in
+            MiniMemoryWord(senseId: "sense-\(i)", word: MiniWord(spelling: "word", meaning: "义项 \(i)"),
+                           source: "flow", status: .learning, dueAt: nil, idealDueAt: nil,
+                           firstSeenAt: nil, lastReviewAt: nil, reviewCount: 0, meaning: nil, spelling: nil)
+        }
+        let first = MiniMemoryWordPage(words: words, number: 1)
+        precondition(first.count == 151 && first.rows.count == 20)
+        let allIDs = (1...first.count).flatMap { number in
+            let page = MiniMemoryWordPage(words: words, number: number)
+            precondition(MiniMemoryWordPage.number(containing: page.rows.startIndex) == number)
+            return page.rows.map(\.id)
+        }
+        precondition(allIDs == words.map(\.id), "Every sense must appear on exactly one page in overview order")
+        let last = MiniMemoryWordPage(words: words, number: .max)
+        precondition(last.number == 151 && last.rows.count == 3)
+        let reduced = MiniMemoryWordPage(words: Array(words.prefix(40)), number: last.number)
+        precondition(reduced.number == 2 && reduced.rows.count == 20)
+        let empty = MiniMemoryWordPage(words: [], number: last.number)
+        precondition(empty.rows.isEmpty && empty.count == 0 && empty.number == 1)
     }
 
     private func readLiveFlow(baseURL: URL, tokenFile: URL) async throws {

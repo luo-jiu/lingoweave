@@ -144,8 +144,11 @@ try {
       sentence: {
         word,
         english:
-          word.spelling === 'apple' ? 'Please put the apple on the table.' : 'My bag is blue.',
-        chinese: word.spelling === 'apple' ? '请把苹果放在桌上。' : '我的包是蓝色的。',
+          word.spelling === 'apple'
+            ? "Thanks, Dad! I'll bring the apple tonight."
+            : 'My bag is blue.',
+        chinese:
+          word.spelling === 'apple' ? '谢谢，爸爸！我今晚会把苹果带来。' : '我的包是蓝色的。',
       },
       direction: day().directions[index],
       focusIds: [],
@@ -156,7 +159,7 @@ try {
     const task = currentTranslation(day());
     assert.ok(task);
     const answer =
-      task.direction === 'englishToChinese' ? task.sentence.chinese : 'My bga is blue.';
+      task.direction === 'englishToChinese' ? '谢啦爸，今晚我把苹果带过来' : 'My bga is blue.';
     act({ ...target, type: 'submit_translation', taskId: task.id, answer });
     act({ ...target, type: 'advance_translation', taskId: task.id });
   }
@@ -224,6 +227,11 @@ try {
   );
   const saved = study.snapshot(),
     details = final.jobs.map((job) => assessment.detail(job.id));
+  const comprehension = details.find(
+    (detail) => detail.source.question.direction === 'englishToChinese',
+  );
+  assert.equal(comprehension?.application?.result.expressionGrade, 'natural');
+  assert.deepEqual(comprehension.application.result.improvements, []);
   assert.ok(
     ['adopted', 'partially_adopted'].includes(spelling.job.receipt.disposition),
     'A definite target-spelling error must have an adopted or partially adopted receipt',

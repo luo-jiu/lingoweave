@@ -14,6 +14,10 @@ struct MiniPlanView: View {
     let startCourse: () -> Void
 
     private enum Section: String, CaseIterable { case longTerm = "长期", today = "今日", vocabulary = "词书" }
+    @Environment(\.colorScheme) private var colorScheme
+    private var accent: Color {
+        colorScheme == .dark ? Color(red: 0.42, green: 0.79, blue: 0.75) : Color(red: 0.12, green: 0.43, blue: 0.41)
+    }
     @State private var section: Section = .today
     @State private var longTerm: MiniLongTermPlan
     @State private var todayMode: MiniPlanMode
@@ -39,7 +43,7 @@ struct MiniPlanView: View {
         self.startCourse = startCourse
         _longTerm = State(initialValue: planning.longTerm)
         _todayMode = State(initialValue: context.todayOverride?.mode ?? context.effective.mode)
-        _todayBudget = State(initialValue: context.todayOverride?.budget ?? context.effective.budget)
+        _todayBudget = State(initialValue: context.todayBudgetForEditing)
     }
 
     var body: some View {
@@ -48,6 +52,7 @@ struct MiniPlanView: View {
                 ForEach(Section.allCases, id: \.self) { Text($0.rawValue).tag($0) }
             }
             .pickerStyle(.segmented)
+            .labelsHidden()
             .accessibilityIdentifier("planScope")
 
             ScrollView {
@@ -66,24 +71,39 @@ struct MiniPlanView: View {
                 .padding(.bottom, 3)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
-            if section == .vocabulary, vocabulary != nil {
-                Button("开始学习", action: startCourse)
-                    .buttonStyle(.borderedProminent)
-                    .accessibilityIdentifier("startVocabularyCourse")
+            HStack(spacing: 10) {
+                if section == .today, context.todayOverride != nil {
+                    Button("恢复长期安排", action: clearToday)
+                        .buttonStyle(.borderless)
+                }
+                Spacer(minLength: 0)
+                switch section {
+                case .longTerm:
+                    Button("保存长期计划") { saveLongTerm(longTerm) }
+                        .accessibilityIdentifier("saveLongTermPlan")
+                case .today:
+                    Button("保存今日安排") { saveToday(todayMode, todayBudget) }
+                        .accessibilityIdentifier("saveTodayPlan")
+                case .vocabulary:
+                    Button(context.learningButtonTitle, action: startCourse)
+                        .disabled(vocabulary == nil || (!context.learningAvailable && context.canStartExtraGroup != true))
+                        .accessibilityIdentifier("startVocabularyCourse")
+                }
             }
+            .buttonStyle(.borderedProminent)
         }
         .disabled(saving)
         .onChange(of: planning.longTerm) { _, updated in
             longTerm = updated
-            if context.todayOverride == nil { todayBudget = context.effective.budget }
         }
+        .onChange(of: context.todayBudgetForEditing) { _, updated in todayBudget = updated }
         .onChange(of: context.todayOverride) { _, updated in
             todayMode = updated?.mode ?? context.effective.mode
-            todayBudget = updated?.budget ?? context.effective.budget
+            todayBudget = context.todayBudgetForEditing
         }
         .onChange(of: context.date) { _, _ in
             todayMode = context.todayOverride?.mode ?? context.effective.mode
-            todayBudget = context.todayOverride?.budget ?? context.effective.budget
+            todayBudget = context.todayBudgetForEditing
         }
         .accessibilityIdentifier("miniLearningPlan")
     }
@@ -162,7 +182,7 @@ struct MiniPlanView: View {
             VStack(alignment: .leading, spacing: 5) {
                 ZStack(alignment: .leading) {
                     RoundedRectangle(cornerRadius: 6)
-                        .fill(selected ? Color.accentColor.opacity(0.18) : Color.secondary.opacity(0.09))
+                        .fill(selected ? accent.opacity(0.11) : Color.secondary.opacity(0.09))
                     Rectangle().fill(Color.primary.opacity(0.07))
                         .frame(width: 6).padding(.vertical, 6)
                     Text(name)
@@ -175,12 +195,12 @@ struct MiniPlanView: View {
                 .frame(width: 94, height: 112)
                 .overlay {
                     RoundedRectangle(cornerRadius: 6)
-                        .strokeBorder(selected ? Color.accentColor : Color.primary.opacity(0.12), lineWidth: selected ? 2 : 1)
+                        .strokeBorder(selected ? accent : Color.primary.opacity(0.12), lineWidth: selected ? 2 : 1)
                 }
                 .overlay(alignment: .bottomTrailing) {
                     if selected {
                         Image(systemName: "checkmark.circle.fill")
-                            .foregroundStyle(Color.accentColor)
+                            .foregroundStyle(accent)
                             .padding(7)
                     }
                 }
@@ -198,9 +218,9 @@ struct MiniPlanView: View {
 
     private var longTermSection: some View {
         VStack(alignment: .leading, spacing: 9) {
-            Text("平时怎么学").font(.headline)
+            Label("长期安排", systemImage: "calendar").font(.headline)
             HStack(spacing: 5) {
-                Text("每周").font(.caption).foregroundStyle(.secondary)
+                Text("新词日").font(.caption).foregroundStyle(.secondary)
                 ForEach(1...7, id: \.self) { weekday in
                     let selected = longTerm.weekdays.contains(weekday)
                     Button {
@@ -211,12 +231,12 @@ struct MiniPlanView: View {
                         Text(["一", "二", "三", "四", "五", "六", "日"][weekday - 1])
                             .font(.system(size: 10, weight: selected ? .semibold : .regular))
                             .frame(maxWidth: .infinity, minHeight: 22)
-                            .background(selected ? Color.accentColor.opacity(0.2) : Color.primary.opacity(0.05),
+                            .background(selected ? accent.opacity(0.16) : Color.primary.opacity(0.05),
                                         in: RoundedRectangle(cornerRadius: 4))
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel("周" + ["一", "二", "三", "四", "五", "六", "日"][weekday - 1])
-                    .accessibilityValue(selected ? "学习日" : "休息日")
+                    .accessibilityValue(selected ? "新词学习日" : "新词休息日")
                 }
             }
             budgetControls(Binding(get: { longTerm.budget }, set: { value in
@@ -225,76 +245,70 @@ struct MiniPlanView: View {
                 longTerm.dailyNewGoal = value.dailyNewGoal
                 longTerm.groupSize = value.groupSize
             }))
-            Text("休息日可按自己的状态临时开启学习，不补学欠账。")
+            Text("每天都可以复习到期词。新词休息日可自行加练一组。")
                 .font(.caption).foregroundStyle(.secondary)
-            Button("保存长期计划") { saveLongTerm(longTerm) }
-                .buttonStyle(.borderedProminent)
-                .accessibilityIdentifier("saveLongTermPlan")
         }
     }
 
     private var todaySection: some View {
         VStack(alignment: .leading, spacing: 9) {
             HStack {
-                Text("今天怎么学").font(.headline)
+                Label("今日安排", systemImage: "calendar.badge.clock").font(.headline)
                 Spacer(minLength: 2)
                 Text(context.date).font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
             }
             Picker("今日安排", selection: $todayMode) {
                 ForEach(MiniPlanMode.allCases, id: \.self) { Text($0.label).tag($0) }
             }
+            .pickerStyle(.segmented)
             .labelsHidden()
             .accessibilityIdentifier("todayPlanMode")
             if todayMode != .rest {
-                budgetControls($todayBudget, reviewOnly: todayMode == .reviewOnly)
+                budgetControls($todayBudget, showNewGoal: todayMode == .normal)
+            }
+            if todayMode == .normal {
                 Button("今天少学一点") {
                     todayBudget = .init(wordLimit: min(todayBudget.wordLimit, planning.longTerm.wordLimit, 3),
                                         newWordLimit: min(todayBudget.newWordLimit, planning.longTerm.newWordLimit, 1),
                                         dailyNewGoal: min(todayBudget.effectiveDailyGoal, 3),
                                         groupSize: todayBudget.effectiveGroupSize)
                 }
-                .font(.caption)
+                .buttonStyle(.borderless).font(.caption)
             }
-            Text(todayMode == .rest ? "今天暂停学习，未完成的位置与输入会保留。明天恢复长期计划。"
-                 : "只对今天生效，不改变长期设置，也不把剩余内容加到明天。")
+            Text(todayMode == .rest ? "今天仍可复习到期词，也可加练一组新词。" :
+                    (todayMode == .reviewOnly ? "今天只安排到期复习。" : "仅今天生效，明天恢复长期安排。"))
                 .font(.caption).foregroundStyle(.secondary)
-            HStack(spacing: 7) {
-                Button(todayMode == .rest ? "今天不学了" : "保存今日安排") { saveToday(todayMode, todayBudget) }
-                    .buttonStyle(.borderedProminent)
-                    .accessibilityIdentifier("saveTodayPlan")
-                Button("恢复默认", action: clearToday)
-                    .disabled(context.todayOverride == nil)
-            }
         }
     }
 
-    private func budgetControls(_ budget: Binding<MiniPlanBudget>, reviewOnly: Bool = false) -> some View {
-        Grid(alignment: .leading, horizontalSpacing: 8, verticalSpacing: 6) {
-            if !reviewOnly {
-                GridRow {
-                    Text("每日新词")
-                    Text("\(budget.wrappedValue.effectiveDailyGoal)").monospacedDigit().gridColumnAlignment(.trailing)
-                    Text("词").foregroundStyle(.secondary)
-                    Stepper("每日新词完成目标", value: Binding(
-                        get: { budget.wrappedValue.effectiveDailyGoal },
-                        set: { budget.wrappedValue.dailyNewGoal = $0 }
-                    ), in: 0...200)
-                        .labelsHidden()
-                }
-                GridRow {
-                    Text("每组数量")
-                    Text("\(budget.wrappedValue.effectiveGroupSize)").monospacedDigit()
-                    Text("词").foregroundStyle(.secondary)
-                    Stepper("每组新词数量", value: Binding(
-                        get: { budget.wrappedValue.effectiveGroupSize },
-                        set: { budget.wrappedValue.groupSize = $0 }
-                    ), in: 1...50)
-                        .labelsHidden()
-                }
+    private func budgetControls(_ budget: Binding<MiniPlanBudget>, showNewGoal: Bool = true) -> some View {
+        VStack(spacing: 0) {
+            if showNewGoal {
+                budgetRow("每日新词", value: Binding(
+                    get: { budget.wrappedValue.effectiveDailyGoal },
+                    set: { budget.wrappedValue.dailyNewGoal = $0 }
+                ), range: 0...200)
+                Divider()
             }
+            budgetRow("每组数量", value: Binding(
+                get: { budget.wrappedValue.effectiveGroupSize },
+                set: { budget.wrappedValue.groupSize = $0 }
+            ), range: 1...50)
+        }
+        .padding(.horizontal, 9)
+        .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 7))
+    }
 
+    private func budgetRow(_ title: String, value: Binding<Int>, range: ClosedRange<Int>) -> some View {
+        HStack(spacing: 7) {
+            Text(title)
+            Spacer()
+            Text("\(value.wrappedValue) 词").monospacedDigit().fontWeight(.medium)
+            Stepper(title, value: value, in: range)
+                .labelsHidden().controlSize(.small)
+                .accessibilityValue("\(value.wrappedValue) 词")
         }
         .font(.callout)
-        .controlSize(.small)
+        .padding(.vertical, 5)
     }
 }

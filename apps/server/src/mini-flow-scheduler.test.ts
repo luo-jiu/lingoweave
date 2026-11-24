@@ -11,10 +11,11 @@ import {
   applyFlowAssessment,
   flowMemory,
   nextFlowDay,
+  rebuildMiniFlowDueSchedules,
   recordFlowSchedule,
   validateMiniFlowScheduling,
 } from './mini-flow-scheduler.js';
-import { localDay, swiftTime } from './mini-study.js';
+import { localDay, outstandingReviews, swiftTime } from './mini-study.js';
 
 const word: MiniWord = { spelling: 'bag', meaning: '包', phonetic: '' };
 const at = swiftTime(new Date('2026-11-17T02:00:00Z'));
@@ -385,4 +386,278 @@ test('a later severe review creates a fresh bounded ceiling instead of being cle
     }),
   );
   assert.ok((flowMemory(snapshot, word)?.dueAt ?? 0) > nextFlowDay(following, timezone));
+});
+
+test('a supported spelling preserves the adjusted date assigned to the meaning review, including across a database upgrade', () => {
+  const snapshot = state();
+  let adjusted: MiniWord | undefined;
+  for (let index = 0; index < 3; index++) {
+    const target = { ...word, spelling: `balanced-${index}` };
+    for (const [round, elapsed] of [0, 3].entries()) {
+      const time = at + elapsed * 86400;
+      recordFlowSchedule(
+        snapshot,
+        event({
+          word: target,
+          kind: 'review',
+          sourceId: `group-${round}`,
+          occurredAt: time,
+          recordedAt: time,
+          meaning: 'Good',
+          nextDay: false,
+        }),
+      );
+    }
+    const judgment = flowMemory(snapshot, target);
+    assert.ok(judgment);
+    const time = at + 3 * 86400 + 30;
+    recordFlowSchedule(
+      snapshot,
+      event({
+        word: target,
+        kind: 'review',
+        sourceId: 'group-1',
+        occurredAt: time,
+        recordedAt: time,
+        nextDay: false,
+        meaning: null,
+        spelling: null,
+      }),
+    );
+    const combined = flowMemory(snapshot, target);
+    assert.equal(combined?.dueAt, judgment.dueAt);
+    assert.deepEqual(combined?.meaning, judgment.meaning);
+    assert.equal(combined?.spelling, null);
+    if (localDay(date(judgment.dueAt), timezone) !== localDay(date(judgment.idealDueAt), timezone))
+      adjusted = target;
+  }
+  assert.ok(adjusted, 'a cohort must actually receive an off-ideal calendar day');
+  const card = flowMemory(snapshot, adjusted);
+  assert.ok(card);
+  const original = structuredClone(card);
+  const audit = snapshot.scheduling.flow.changes
+    .filter((change) => change.after.senseId === card.senseId)
+    .at(-1);
+  assert.ok(audit);
+  card.dueAt = card.idealDueAt;
+  audit.after = structuredClone(card);
+  assert.throws(() => validateMiniFlowScheduling(snapshot), /不一致/);
+  validateMiniFlowScheduling(snapshot, undefined, { allowArchivedDueDates: true });
+  const raw = structuredClone(snapshot.scheduling.flow.events);
+  const oldAudit = structuredClone(snapshot.scheduling.flow.changes);
+  const damaged = structuredClone(snapshot);
+  const bad = flowMemory(damaged, adjusted);
+  assert.ok(bad);
+  bad.dueAt++;
+  assert.throws(() => rebuildMiniFlowDueSchedules(damaged, at), /审计不一致/);
+  assert.throws(
+    () => validateMiniFlowScheduling(damaged, undefined, { allowArchivedDueDates: true }),
+    /不一致/,
+  );
+  assert.equal(rebuildMiniFlowDueSchedules(snapshot, at + 50 * 86400), true);
+  assert.deepEqual(flowMemory(snapshot, adjusted), original);
+  assert.deepEqual(snapshot.scheduling.flow.events, raw);
+  assert.deepEqual(snapshot.scheduling.flow.changes.slice(0, -1), oldAudit);
+  validateMiniFlowScheduling(snapshot);
+  assert.equal(rebuildMiniFlowDueSchedules(snapshot, at + 51 * 86400), false);
+});
+
+test('next-day failure, overdue review and first-review ceiling survive an independent spelling probe', () => {
+  const snapshot = state();
+  const put = (kind: 'review' | 'probe', time: number, values: Partial<MiniFlowScheduleEvent>) =>
+    recordFlowSchedule(
+      snapshot,
+      event({
+        kind,
+        occurredAt: time,
+        recordedAt: time,
+        sourceId: randomUUID(),
+        nextDay: false,
+        ...values,
+      }),
+    );
+  put('review', at, { meaning: 'Good', nextDay: true, reviewCeilingDays: 2 });
+  const tomorrow = nextFlowDay(at, timezone);
+  put('probe', at + 300, { spelling: 'Good' });
+  assert.equal(flowMemory(snapshot, word)?.dueAt, tomorrow);
+  put('probe', tomorrow + 5 * 86400, { spelling: 'Good' });
+  assert.equal(flowMemory(snapshot, word)?.dueAt, tomorrow);
+  const first = tomorrow + 6 * 86400 + 3600;
+  put('review', first, { meaning: 'Good' });
+  const capped = flowMemory(snapshot, word)?.dueAt;
+  assert.equal(capped, nextFlowDay(nextFlowDay(first, timezone), timezone));
+  put('probe', first + 86400, { spelling: 'Good' });
+  assert.equal(
+    flowMemory(snapshot, word)?.dueAt,
+    capped,
+    'cap anchored to the review, not the later probe',
+  );
+  put('review', capped + 60, { meaning: 'Good' });
+  const mature = flowMemory(snapshot, word);
+  assert.ok(mature && mature.dueAt > capped + 2 * 86400);
+  put('probe', mature.dueAt + 86400, { spelling: 'Good' });
+  assert.equal(
+    flowMemory(snapshot, word)?.dueAt,
+    mature.dueAt,
+    'overdue meaning remains in the combined queue',
+  );
+});
+
+test('after a three-round failure, a later milder difficulty gets its own ceiling', () => {
+  const snapshot = state();
+  const group = (sourceId: string, time: number, failure?: 1 | 2) => {
+    recordFlowSchedule(
+      snapshot,
+      event({
+        kind: 'review',
+        sourceId,
+        occurredAt: time,
+        recordedAt: time,
+        meaning: 'Good',
+        nextDay: false,
+      }),
+    );
+    if (failure)
+      recordFlowSchedule(
+        snapshot,
+        event({
+          kind: 'review',
+          sourceId,
+          occurredAt: time + 30,
+          recordedAt: time + 30,
+          nextDay: true,
+          reviewCeilingDays: failure,
+        }),
+      );
+  };
+  group('severe', at, 1);
+  group('milder', at + 86400, 2);
+  const recovered = at + 2 * 86400;
+  group('recovered', recovered);
+  assert.equal(
+    flowMemory(snapshot, word)?.dueAt,
+    nextFlowDay(nextFlowDay(recovered, timezone), timezone),
+  );
+});
+
+test('equal load keeps the model’s local calendar date for an evening review across both DST transitions', () => {
+  const zone = 'America/New_York';
+  for (const start of ['2026-03-05T03:00:00Z', '2026-10-29T02:00:00Z']) {
+    const snapshot = state();
+    const time = swiftTime(new Date(start));
+    for (const elapsed of [0, 2]) {
+      recordFlowSchedule(
+        snapshot,
+        event({
+          timezone: zone,
+          kind: 'review',
+          sourceId: `review-${elapsed}`,
+          occurredAt: time + elapsed * 86400,
+          recordedAt: time + elapsed * 86400,
+          meaning: 'Good',
+          nextDay: false,
+        }),
+      );
+    }
+    const card = flowMemory(snapshot, word);
+    assert.ok(card?.meaning && card.meaning.scheduled_days >= 3);
+    assert.equal(localDay(date(card.dueAt), zone), localDay(date(card.idealDueAt), zone));
+    assert.equal(
+      new Intl.DateTimeFormat('en-GB', {
+        timeZone: zone,
+        hour: '2-digit',
+        minute: '2-digit',
+      }).format(date(card.dueAt)),
+      '00:00',
+    );
+  }
+});
+
+test('short-interval balancing uses the three local days boundary across DST', () => {
+  const zone = 'America/New_York';
+  const put = (snapshot: ReturnType<typeof state>, time: string, meaning: 'Hard' | 'Good') => {
+    const when = swiftTime(new Date(time));
+    recordFlowSchedule(
+      snapshot,
+      event({
+        kind: 'review',
+        sourceId: time,
+        timezone: zone,
+        occurredAt: when,
+        recordedAt: when,
+        meaning,
+        nextDay: false,
+      }),
+    );
+    const card = flowMemory(snapshot, word);
+    assert.ok(card);
+    return card;
+  };
+  const fall = state();
+  put(fall, '2026-10-30T04:15:00Z', 'Hard');
+  const short = put(fall, '2026-10-31T04:15:00Z', 'Hard');
+  // 72 hours, but October 31 at 00:15 to November 2 at 23:15 is only two calendar days.
+  assert.equal(short.meaning?.scheduled_days, 3);
+  assert.equal(localDay(date(short.idealDueAt), zone), '2026-11-02');
+  assert.equal(date(short.dueAt).toISOString(), '2026-11-02T05:00:00.000Z');
+  assert.equal(short.idealDueAt, short.meaning.due);
+  const spring = state();
+  const eligible = put(spring, '2026-03-08T04:15:00Z', 'Good');
+  // 48 hours from Saturday March 7 at 23:15 now reaches Tuesday March 10 at 00:15.
+  assert.equal(eligible.meaning?.scheduled_days, 2);
+  assert.equal(localDay(date(eligible.idealDueAt), zone), '2026-03-10');
+  assert.equal(date(eligible.dueAt).toISOString(), '2026-03-10T04:00:00.000Z');
+});
+
+test('every due word opens at the start of the chosen local day, with the raw FSRS instant preserved in the model and migration audit', () => {
+  for (const [zone, started, opens] of [
+    ['Asia/Shanghai', '2026-11-19T08:15:00Z', '2026-11-20T16:00:00Z'],
+    ['America/New_York', '2026-03-07T15:30:00Z', '2026-03-09T04:00:00Z'],
+    // Chile moves straight from 23:59:59 to 01:00 on this date.
+    ['America/Santiago', '2026-09-04T14:30:00Z', '2026-09-06T04:00:00Z'],
+  ] as const) {
+    const snapshot = state();
+    const start = swiftTime(new Date(started));
+    const midnight = swiftTime(new Date(opens));
+    recordFlowSchedule(
+      snapshot,
+      event({
+        kind: 'review',
+        timezone: zone,
+        sourceId: 'graded',
+        occurredAt: start,
+        recordedAt: start + 120,
+        meaning: 'Good',
+        spelling: 'Good',
+        nextDay: false,
+      }),
+    );
+    const card = flowMemory(snapshot, word);
+    assert.ok(card?.meaning && card.spelling);
+    assert.equal(card.dueAt, midnight);
+    assert.equal(card.meaning.due, start + 2 * 86400);
+    assert.equal(card.spelling.due, card.meaning.due);
+    assert.equal(card.idealDueAt, card.meaning.due);
+    for (const [clock, count] of [
+      [midnight - 1, 0],
+      [midnight, 1],
+      [midnight + 8 * 3600, 1],
+      [midnight + 20 * 3600, 1],
+    ] as const)
+      assert.equal(
+        outstandingReviews(snapshot, clock, localDay(date(clock), zone), [word]).size,
+        count,
+      );
+
+    const audit = snapshot.scheduling.flow.changes.at(-1);
+    assert.ok(audit);
+    card.dueAt = card.idealDueAt;
+    audit.after = structuredClone(card);
+    const old = structuredClone(card);
+    assert.equal(rebuildMiniFlowDueSchedules(snapshot, midnight + 3600), true);
+    const migrated = flowMemory(snapshot, word);
+    assert.deepEqual(migrated, { ...old, dueAt: midnight });
+    assert.deepEqual(snapshot.scheduling.flow.changes.at(-1)?.before, old);
+    assert.equal(rebuildMiniFlowDueSchedules(snapshot, midnight + 7200), false);
+  }
 });

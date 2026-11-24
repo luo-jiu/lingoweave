@@ -65,43 +65,45 @@ server.registerTool(
   },
   () => call('context'),
 );
-server.registerTool(
-  'learning_get_history',
-  {
-    description:
-      'Read paginated actual history, including imported records, first answers, corrections, support exposures and plan changes. Missing records mean unknown, not failure.',
-    inputSchema: miniHistoryInputSchema.shape,
-    annotations: { readOnlyHint: true, openWorldHint: false },
-  },
-  (input) => call('history', input),
-);
-server.registerTool(
-  'learning_get_word',
-  {
-    description:
-      'Read a known word sense, stable senseId, existing focus items, recent original evidence and focus capacity. Prefer reusing an existing focus.',
-    inputSchema: miniWordContextInputSchema.shape,
-    annotations: { readOnlyHint: true, openWorldHint: false },
-  },
-  (input) => call('word', input),
-);
-server.registerTool(
-  'learning_commit',
-  {
-    description:
-      'Commit only an action in the current context allowedActions. Never submit user answers, self-ratings, mastery or scheduling. Use a UUID requestId and the context revision. Keep identical request identity/content on uncertain retries; re-read context after revision conflicts. Memory must cite sourceMessageId from the saved user message.',
-    inputSchema: miniCommandSchema.extend({
-      action: z.union(miniAiActionOptions(env.LINGOWEAVE_MINI_AI_KIND)),
-    }).shape,
-    annotations: {
-      readOnlyHint: false,
-      destructiveHint: false,
-      idempotentHint: true,
-      openWorldHint: false,
+if (env.LINGOWEAVE_MINI_AI_KIND !== 'dialogue') {
+  server.registerTool(
+    'learning_get_history',
+    {
+      description:
+        'Read paginated actual history, including imported records, first answers, corrections, support exposures and plan changes. Missing records mean unknown, not failure.',
+      inputSchema: miniHistoryInputSchema.shape,
+      annotations: { readOnlyHint: true, openWorldHint: false },
     },
-  },
-  (input) => call('commit', input),
-);
+    (input) => call('history', input),
+  );
+  server.registerTool(
+    'learning_get_word',
+    {
+      description:
+        'Read a known word sense, stable senseId, existing focus items, recent original evidence and focus capacity. Prefer reusing an existing focus.',
+      inputSchema: miniWordContextInputSchema.shape,
+      annotations: { readOnlyHint: true, openWorldHint: false },
+    },
+    (input) => call('word', input),
+  );
+  server.registerTool(
+    'learning_commit',
+    {
+      description:
+        'Commit only an action in the current context allowedActions. Never submit user answers, self-ratings, mastery or scheduling. Use a UUID requestId and the context revision. Keep identical request identity/content on uncertain retries; re-read context after revision conflicts. Memory must cite sourceMessageId from the saved user message.',
+      inputSchema: miniCommandSchema.extend({
+        action: z.union(miniAiActionOptions(env.LINGOWEAVE_MINI_AI_KIND)),
+      }).shape,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    (input) => call('commit', input),
+  );
+}
 if (env.LINGOWEAVE_MINI_AI_KIND === 'advisor' && env.LINGOWEAVE_MINI_AI_AUDIO === '1') {
   server.registerTool(
     'learning_get_audio',

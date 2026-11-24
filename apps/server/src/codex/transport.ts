@@ -14,6 +14,7 @@ export class CodexError extends Error {
   constructor(
     public readonly code: string,
     message: string,
+    public readonly rpcCode?: number,
   ) {
     super(message);
     this.name = 'CodexError';
@@ -25,6 +26,7 @@ export function cancelledError() {
 }
 
 type PendingRequest = {
+  method: string;
   resolve: (result: unknown) => void;
   reject: (error: Error) => void;
   timer: NodeJS.Timeout;
@@ -94,9 +96,16 @@ export class CodexTransport {
     const id = ++this.sequence;
     return new Promise<unknown>((resolve, reject) => {
       const timer = setTimeout(() => {
-        this.fail(new CodexError('CODEX_TIMEOUT', 'Codex 响应超时，请检查连接后重试。'));
+        const error = new CodexError('CODEX_TIMEOUT', 'Codex 响应超时，请检查连接后重试。');
+        if (method === 'account/read') {
+          // A late read-only reply is ignored by its original request ID.
+          this.pending.delete(id);
+          reject(error);
+        } else {
+          this.fail(error);
+        }
       }, timeoutMs);
-      this.pending.set(id, { resolve, reject, timer });
+      this.pending.set(id, { method, resolve, reject, timer });
       this.write({ id, method, params });
     });
   }
@@ -213,7 +222,11 @@ export class CodexTransport {
       this.pending.delete(message.id);
       if (message.error) {
         pending.reject(
-          new CodexError('CODEX_REQUEST_FAILED', 'Codex 拒绝了请求，请检查登录、模型与运行配置。'),
+          new CodexError(
+            'CODEX_REQUEST_FAILED',
+            `Codex 拒绝了 ${pending.method} 请求（RPC ${message.error.code}）。`,
+            message.error.code,
+          ),
         );
       } else if ('result' in message) {
         pending.resolve(message.result);

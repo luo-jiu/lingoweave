@@ -12,8 +12,9 @@ audio_binary="$temporary_dir/mini-audio-client-tests"
 practice_binary="$temporary_dir/mini-practice-client-tests"
 memory_binary="$temporary_dir/mini-memory-client-tests"
 interaction_binary="$temporary_dir/mini-card-interaction-tests"
+browser_binary="$temporary_dir/mini-word-browser-tests"
 cleanup() {
-  /bin/rm -f -- "$binary" "$daily_binary" "$dev_binary" "$client_binary" "$ai_binary" "$audio_binary" "$practice_binary" "$memory_binary" "$interaction_binary"
+  /bin/rm -f -- "$binary" "$daily_binary" "$dev_binary" "$client_binary" "$ai_binary" "$audio_binary" "$practice_binary" "$memory_binary" "$interaction_binary" "$browser_binary"
   /bin/rmdir -- "$temporary_dir"
 }
 trap cleanup EXIT
@@ -72,6 +73,7 @@ swiftc -swift-version 6 \
   "$script_dir/Sources/LingoWeaveMini/MiniChatStorage.swift" \
   "$script_dir/Sources/LingoWeaveMini/MiniDailyAI.swift" \
   "$script_dir/Sources/LingoWeaveMini/mini-ai-client.swift" \
+  "$script_dir/Sources/LingoWeaveMini/mini-pattern-client.swift" \
   "$script_dir/Tests/LingoWeaveMiniTests/mini-ai-client-tests.swift" \
   -o "$ai_binary"
 "$ai_binary"
@@ -86,7 +88,9 @@ swiftc -swift-version 6 \
   "$script_dir/Sources/LingoWeaveMini/mini-practice.swift" \
   "$script_dir/Sources/LingoWeaveMini/mini-study-client.swift" \
   "$script_dir/Sources/LingoWeaveMini/mini-audio-client.swift" \
+  "$script_dir/Sources/LingoWeaveMini/mini-audio-player.swift" \
   "$script_dir/Sources/LingoWeaveMini/mini-audio-controller.swift" \
+  "$script_dir/Sources/LingoWeaveMini/mini-lesson-preparation.swift" \
   "$script_dir/Tests/LingoWeaveMiniTests/mini-audio-client-tests.swift" \
   -o "$audio_binary"
 "$audio_binary"
@@ -119,7 +123,7 @@ swiftc -swift-version 6 \
   -o "$memory_binary"
 "$memory_binary"
 
-swiftc -swift-version 6 \
+swiftc -swift-version 6 -D DEBUG \
   "$script_dir/Sources/LingoWeaveMini/MiniWord.swift" \
   "$script_dir/Sources/LingoWeaveMini/MiniReview.swift" \
   "$script_dir/Sources/LingoWeaveMini/mini-flow.swift" \
@@ -128,10 +132,25 @@ swiftc -swift-version 6 \
   "$script_dir/Sources/LingoWeaveMini/mini-plan.swift" \
   "$script_dir/Sources/LingoWeaveMini/mini-practice.swift" \
   "$script_dir/Sources/LingoWeaveMini/mini-study-client.swift" \
+  "$script_dir/Sources/LingoWeaveMini/mini-card-typography.swift" \
+  "$script_dir/Sources/LingoWeaveMini/mini-study-appearance.swift" \
   "$script_dir/Sources/LingoWeaveMini/MiniReviewView.swift" \
+  "$script_dir/Sources/LingoWeaveMini/MiniDailyView.swift" \
+  "$script_dir/Sources/LingoWeaveMini/MiniDevPreview.swift" \
+  "$script_dir/Sources/LingoWeaveMini/mini-audio-client.swift" \
+  "$script_dir/Sources/LingoWeaveMini/mini-audio-player.swift" \
+  "$script_dir/Sources/LingoWeaveMini/mini-audio-controller.swift" \
+  "$script_dir/Sources/LingoWeaveMini/mini-lesson-preparation.swift" \
   "$script_dir/Sources/LingoWeaveMini/mini-practice-view.swift" \
   "$script_dir/Sources/LingoWeaveMini/mini-audio-footer.swift" \
   "$script_dir/Sources/LingoWeaveMini/mini-window-controls.swift" \
   "$script_dir/Tests/LingoWeaveMiniTests/mini-card-interaction-tests.swift" \
   -o "$interaction_binary"
 "$interaction_binary"
+
+swiftc -swift-version 6 \
+  "$script_dir/Sources/LingoWeaveMini/MiniWord.swift" \
+  "$script_dir/Sources/LingoWeaveMini/mini-word-browser.swift" \
+  "$script_dir/Tests/LingoWeaveMiniTests/mini-word-browser-tests.swift" \
+  -o "$browser_binary"
+"$browser_binary"

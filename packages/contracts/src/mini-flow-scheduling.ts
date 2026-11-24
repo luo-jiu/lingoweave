@@ -64,13 +64,14 @@ export const miniFlowSchedulingSchema = z
           before: miniFlowScheduleCardSchema.nullable(),
           after: miniFlowScheduleCardSchema,
           reason: z.string(),
+          replacedReviewEvents: z.array(miniFlowScheduleEventSchema).optional(),
           parameters: z
             .object({
               retention: z.literal(0.9),
               weights: z.array(z.number()).length(21),
               learningSteps: z.array(z.string()),
               relearningSteps: z.array(z.string()),
-              fuzzPolicy: z.literal('bounded-load-v1'),
+              fuzzPolicy: z.enum(['bounded-load-v1', 'bounded-load-v2']),
             })
             .strict(),
         })

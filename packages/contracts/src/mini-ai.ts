@@ -1,17 +1,12 @@
 import { z } from 'zod';
 import { miniTimezoneSchema, miniWordSchema } from './mini.js';
+import {
+  defaultMiniAiSelection,
+  miniAiEffortSchema,
+  miniAiSelectionSchema,
+} from './mini-ai-selection.js';
 
-export const miniAiKindSchema = z.enum(['prepare', 'writing', 'feedback', 'advisor']);
-export const miniAiEffortSchema = z.enum([
-  'none',
-  'minimal',
-  'low',
-  'medium',
-  'high',
-  'xhigh',
-  'max',
-  'ultra',
-]);
+export const miniAiKindSchema = z.enum(['prepare', 'writing', 'feedback', 'advisor', 'dialogue']);
 const at = z.number().finite();
 const uuid = z.uuid().toLowerCase();
 export const miniAiStartSchema = z
@@ -23,13 +18,26 @@ export const miniAiStartSchema = z
     attemptId: uuid.optional(),
     word: miniWordSchema.optional(),
     conversationId: z.string().min(1).max(200).default('advisor'),
+    dialogueStep: z.literal('reflect').optional(),
     message: z.string().trim().min(1).max(8000).optional(),
-    model: z.string().min(1).max(200).default('gpt-6.1-sol'),
-    effort: miniAiEffortSchema.default('xhigh'),
+    model: miniAiSelectionSchema.shape.model.default(defaultMiniAiSelection.model),
+    effort: miniAiEffortSchema.default(defaultMiniAiSelection.effort),
   })
   .strict()
   .superRefine((input, ctx) => {
-    if (input.kind !== 'advisor' && !input.dayId)
+    if (input.kind === 'dialogue') {
+      if (
+        !input.conversationId.startsWith('dialogue:') ||
+        !uuid.safeParse(input.conversationId.slice('dialogue:'.length)).success ||
+        input.conversationId !== input.conversationId.toLowerCase()
+      )
+        ctx.addIssue({ code: 'custom', message: 'Expected a dedicated dialogue conversation' });
+      if (input.word || input.dayId || input.attemptId || (input.dialogueStep && input.message))
+        ctx.addIssue({ code: 'custom', message: 'Invalid dialogue target' });
+    } else if (input.conversationId.startsWith('dialogue:') || input.dialogueStep) {
+      ctx.addIssue({ code: 'custom', message: 'Reserved for English dialogue' });
+    }
+    if (input.kind !== 'advisor' && input.kind !== 'dialogue' && !input.dayId)
       ctx.addIssue({ code: 'custom', message: 'dayId is required' });
     if (input.kind === 'feedback' && !input.attemptId)
       ctx.addIssue({ code: 'custom', message: 'attemptId is required' });
@@ -54,6 +62,7 @@ export const miniAiJobSchema = z
     dayId: z.string().optional(),
     attemptId: uuid.optional(),
     conversationId: z.string(),
+    dialogueStep: z.literal('reflect').optional(),
     model: z.string(),
     effort: miniAiEffortSchema,
     progress: z.string(),

@@ -9,13 +9,15 @@ struct MiniReviewCommands {
     var advanceSpelling: (() -> Void)? = nil
     var openDictation: (() -> Void)? = nil
     var clearJudgment: (() -> Void)? = nil
+    var presentedSession: MiniReviewSession? = nil
 }
 
 struct MiniReviewView: View {
     @Binding var session: MiniReviewSession
     var onFinish: () -> Void
-    var finishTitle = "复习完成"
-    var finishLabel = "开始学习"
+    var finishTitle = "Review complete"
+    var finishLabel = "Start study"
+    var groupIndex: Int? = nil
     var sentenceForWord: (MiniWord) -> MiniStudySentence? = { _ in nil }
     var playWord: (MiniWord) -> Void = { _ in }
     var playSentence: (MiniStudySentence) -> Void = { _ in }
@@ -24,68 +26,102 @@ struct MiniReviewView: View {
     var saving = false
     @State private var hiddenSpellingReferenceAt: Int?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.miniCardTextSize) private var cardTextSize
+    @Environment(\.miniStudyAppearance) private var appearance
+
+    private var displayed: MiniReviewSession { commands?.presentedSession ?? session }
 
     var body: some View {
         VStack(spacing: 8) {
-            if session.totalCount > 0 { progressDots }
-            if session.phase != .judgment {
-                let skippedCount = session.spellingSkips?.count ?? 0
-                Text("\(skippedCount) 词已暂缓，将优先复练")
-                    .font(.caption2).foregroundStyle(.secondary)
-                    .lineLimit(1).frame(height: 14)
-                    .opacity(skippedCount == 0 ? 0 : 1)
-                    .accessibilityHidden(skippedCount == 0)
-                    .accessibilityIdentifier("spellingSkipNotice")
-            }
+            if displayed.totalCount > 0 { progressDots }
 
             GeometryReader { area in
                 ScrollView {
-                    content
+                    content(viewportHeight: area.size.height)
                         .multilineTextAlignment(.center)
                         .padding(.horizontal, 4)
                         .padding(.vertical, 8)
-                        .frame(maxWidth: .infinity, minHeight: area.size.height)
+                        .frame(maxWidth: .infinity, minHeight: area.size.height,
+                               alignment: displayed.phase == .spelling ? .top : .center)
                 }
             }
         }
-        .disabled(saving)
-        .onChange(of: session.spellingAttempts.count) { previous, current in
-            if current > previous, let attempt = session.spellingAttempts.last {
+        .onChange(of: displayed.spellingAttempts.count) { previous, current in
+            if commands?.presentedSession == nil, current > previous, let attempt = displayed.spellingAttempts.last {
                 playSpellingResult(attempt.word)
             }
         }
     }
 
     private var progressDots: some View {
-        let dots = session.progressDots
-        return HStack(spacing: 7) {
-            ForEach(dots.indices, id: \.self) { index in
-                let state = dots[index].state
-                progressMarker(state)
-                    .accessibilityElement(children: .ignore)
-                    .accessibilityLabel("第 \(index + 1) 个词")
-                    .accessibilityValue(progressLabel(state))
-            }
+        let total = displayed.totalCount
+        let markerWidth: CGFloat = displayed.phase == .judgment ? 9 : 11
+        let markersWidth = CGFloat(total) * markerWidth + CGFloat(total - 1) * 7
+        let groupLabel = groupIndex.map {
+            Text("\($0)")
+                .font(.caption2.monospacedDigit()).foregroundStyle(.secondary).fixedSize()
+                .help("第 \($0) 组")
+                .accessibilityLabel("第 \($0) 组")
         }
-        .padding(.top, 2)
+        return HStack(spacing: 8) {
+            groupLabel
+            GeometryReader { area in
+                if markersWidth <= area.size.width {
+                    let dots = displayed.progressDots
+                    HStack(spacing: 7) {
+                        ForEach(dots.indices, id: \.self) { index in
+                            let state = dots[index].state
+                            progressMarker(state)
+                                .accessibilityElement(children: .ignore)
+                                .accessibilityLabel("第 \(index + 1) 个词")
+                                .accessibilityValue(progressLabel(state))
+                        }
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    let done = total - displayed.remainingCount
+                    HStack(spacing: 8) {
+                        ProgressView(value: Double(done), total: Double(total))
+                            .progressViewStyle(.linear).tint(.secondary)
+                        Text("\(done) / \(total)").font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary).fixedSize()
+                    }
+                    .frame(maxHeight: .infinity)
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel("本轮进度")
+                    .accessibilityValue("已完成 \(done) 个，共 \(total) 个词")
+                }
+            }
+            .frame(height: 16)
+            // Matching side widths keep the markers centered on the card at every group number.
+            groupLabel?.hidden().accessibilityHidden(true)
+        }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("本组进度")
     }
 
     @ViewBuilder
     private func progressMarker(_ state: MiniReviewProgressDot.State) -> some View {
-        if session.phase != .judgment {
+        if displayed.phase != .judgment {
             let shape = SpellingProgressShape(triangleAmount: state == .current ? 1 : 0)
-            shape.fill(.primary)
+            let passedColor = appearance.isSimple ? Color.primary : .green
+            let strokeColor = switch state {
+            case .passed: passedColor
+            case .current: Color.primary
+            case .repeatNext: appearance.isSimple ? Color.primary.opacity(0.55) : .red
+            case .pending, .capped: Color.primary.opacity(0.55)
+            }
+            shape.fill(passedColor)
                 .opacity(state == .passed ? 1 : 0)
                 .overlay {
                     shape.stroke(
-                        Color.primary.opacity(state == .current || state == .passed ? 1 : 0.55),
-                        style: StrokeStyle(lineWidth: 1.25, lineJoin: .round)
+                        strokeColor,
+                        style: StrokeStyle(lineWidth: 1.25, lineJoin: .round,
+                                           dash: appearance.isSimple && state == .repeatNext ? [2, 1.5] : [])
                     )
                 }
                 .frame(width: 11, height: 11)
-                .animation(reduceMotion ? nil : .easeInOut(duration: 0.16), value: state)
+                .animation(reduceMotion || appearance.isSimple ? nil : .easeInOut(duration: 0.16), value: state)
         } else {
             judgmentDot(state).frame(width: 9, height: 9)
         }
@@ -97,9 +133,18 @@ struct MiniReviewView: View {
         case .current:
             Circle().fill(.primary)
         case .passed:
-            Circle().strokeBorder(.green, lineWidth: 1.5)
+            if appearance.isSimple {
+                Image(systemName: "checkmark")
+                    .font(.system(size: 8, weight: .semibold)).foregroundStyle(.primary)
+            } else {
+                Circle().strokeBorder(.green, lineWidth: 1.5)
+            }
         case .repeatNext:
-            Circle().strokeBorder(.red, lineWidth: 1.5)
+            if appearance.isSimple {
+                Circle().strokeBorder(.secondary, style: StrokeStyle(lineWidth: 1.25, dash: [2, 1.5]))
+            } else {
+                Circle().strokeBorder(.red, lineWidth: 1.5)
+            }
         case .pending, .capped:
             Circle().strokeBorder(.secondary, lineWidth: 1.5)
         }
@@ -111,21 +156,22 @@ struct MiniReviewView: View {
         case .passed: "已通过"
         case .repeatNext: "下一轮继续"
         case .pending: "未轮到"
-        case .capped: session.phase == .judgment ? "已达到判断次数上限" : "已暂缓，将优先复练"
+        case .capped: displayed.phase == .judgment ? "已达到判断次数上限" : "本轮已跳过"
         }
     }
 
     @ViewBuilder
-    private var content: some View {
-        switch session.phase {
+    private func content(viewportHeight: CGFloat) -> some View {
+        switch displayed.phase {
         case .judgment:
-            if let word = session.currentWord { judgment(for: word) }
+            if let word = displayed.currentWord { judgment(for: word) }
         case .spelling:
-            if let word = session.currentWord { spelling(for: word) }
+            if let word = displayed.currentWord { spelling(for: word, viewportHeight: viewportHeight) }
         case .finished:
             VStack(spacing: 12) {
-                Text(session.spellingSkips?.isEmpty == false ? "本轮拼写结束" : finishTitle).font(.headline)
+                Text(displayed.spellingSkips?.isEmpty == false ? "Round complete" : finishTitle).font(.headline)
                 Button(finishLabel, action: onFinish)
+                    .miniStudyButton(prominent: true).disabled(saving)
             }
         }
     }
@@ -133,24 +179,29 @@ struct MiniReviewView: View {
     private func judgment(for word: MiniWord) -> some View {
         VStack(spacing: 12) {
             Text(word.spelling)
-                .font(.system(size: 35, weight: .semibold, design: .serif))
+                .font(cardTextSize.font(mediumSize: 35))
                 .accessibilityIdentifier("reviewEnglish")
                 .onTapGesture { playWord(word) }
                 .accessibilityAddTraits(.isButton)
 
-            if session.currentJudgment != nil {
-                Text(word.meaning.isEmpty ? "暂无中文释义" : word.meaning)
+            if displayed.currentJudgment != nil {
+                Text(word.meaning.isEmpty ? "No definition" : word.meaning)
+                    .miniTranslationPrivacy()
                     .accessibilityIdentifier("reviewMeaning")
                 example(for: word)
                 HStack(spacing: 8) {
-                    Button("记错了") { advanceJudgment(markWrong: true) }
-                    Button("下一个") { advanceJudgment(markWrong: false) }
+                    MiniStudyIconButton(title: "记错了", systemImage: "arrow.uturn.backward") {
+                        advanceJudgment(markWrong: true)
+                    }
+                    MiniStudyIconButton(title: "下一个", systemImage: "arrow.right", prominent: true) {
+                        advanceJudgment(markWrong: false)
+                    }
                 }
             } else {
                 HStack(spacing: 8) {
-                    Button("遗忘") { chooseJudgment(.forgotten) }
-                    Button("模糊") { chooseJudgment(.fuzzy) }
-                    Button("清晰") { chooseJudgment(.clear) }
+                    MiniStudyIconButton(title: "遗忘", systemImage: "xmark") { chooseJudgment(.forgotten) }
+                    MiniStudyIconButton(title: "模糊", systemImage: "questionmark") { chooseJudgment(.fuzzy) }
+                    MiniStudyIconButton(title: "清晰", systemImage: "checkmark") { chooseJudgment(.clear) }
                 }
             }
         }
@@ -160,82 +211,103 @@ struct MiniReviewView: View {
     private func example(for word: MiniWord) -> some View {
         if let sentence = sentenceForWord(word) {
             VStack(spacing: 3) {
-                Text(sentence.english).font(.callout)
+                Text(sentence.attributedEnglish(appearance: appearance)).font(.callout)
                     .onTapGesture { playSentence(sentence) }
                     .accessibilityAddTraits(.isButton)
                 Text(sentence.attributedTranslation).font(.caption).foregroundStyle(.secondary)
+                    .miniTranslationPrivacy()
             }
             .textSelection(.enabled)
             .accessibilityIdentifier("studyExample")
         }
     }
 
-    private func spelling(for word: MiniWord) -> some View {
-        let correcting = session.spellingState == .correcting
-        let accepted = session.spellingState == .readyToAdvance
-        let skipped = session.spellingState == .skipped
+    private func spelling(for word: MiniWord, viewportHeight: CGFloat) -> some View {
+        let correcting = displayed.spellingState == .correcting
+        let accepted = displayed.spellingState == .readyToAdvance
+        let skipped = displayed.spellingState == .skipped
         let draft = commands?.draft ?? $session.spellingDraft
         let showingReference = skipped || (correcting
-            && hiddenSpellingReferenceAt != session.spellingAttempts.count
-            && session.lastSpellingAttempt?.answer == draft.wrappedValue)
+            && hiddenSpellingReferenceAt != displayed.spellingAttempts.count
+            && displayed.lastSpellingAttempt?.answer == draft.wrappedValue)
+        let fieldHeight: CGFloat = 30
 
         return VStack(spacing: 9) {
-            Text(word.meaning)
-                .font(.title3)
-                .accessibilityIdentifier("reviewSpellingPrompt")
+            VStack(spacing: 9) {
+                Text(word.meaning)
+                    .font(.title3)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("reviewSpellingPrompt")
 
-            VStack(spacing: 2) {
-                ReviewAnswerField(
-                    text: draft,
-                    selectOnFocus: correcting && showingReference,
-                    onSubmit: submitSpelling,
-                    accepted: accepted
-                )
-                .frame(height: 30)
-                Divider()
-            }
-            .frame(width: 206)
-
-            ZStack(alignment: .top) {
-                Color.clear
-                VStack(spacing: 6) {
-                    if accepted || skipped {
-                        Button("下一词", action: advanceSpelling).keyboardShortcut(.defaultAction)
-                            .font(.caption)
-                            .accessibilityIdentifier("advanceCorrectSpelling")
-                    }
-                    if skipped {
-                        Text("已暂缓，将优先复练").font(.caption).foregroundStyle(.secondary)
-                    }
-                    if showingReference {
-                        Text(word.spelling)
-                            .font(.callout).foregroundStyle(.secondary)
-                            .lineLimit(1).minimumScaleFactor(0.65)
-                            .accessibilityLabel("正确拼写 \(word.spelling)")
-                            .accessibilityIdentifier("reviewExpectedSpelling")
+                VStack(spacing: 2) {
+                    ReviewAnswerField(
+                        text: draft,
+                        selectOnFocus: correcting && showingReference,
+                        onSubmit: submitSpelling,
+                        accepted: accepted,
+                        incorrect: showingReference,
+                        inputLocked: skipped
+                    )
+                    .frame(height: fieldHeight)
+                    Divider().overlay {
+                        if !appearance.isSimple, showingReference,
+                           displayed.lastSpellingAttempt?.answer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == true {
+                            Color.red
+                        }
                     }
                 }
-            }.frame(height: 68)
+                .frame(width: 206)
+            }
+            // Anchor the typing row within the available space. Feedback grows below it.
+            .frame(minHeight: (viewportHeight + fieldHeight) / 2, alignment: .bottom)
+
+            VStack(spacing: 6) {
+                if accepted || skipped {
+                    MiniStudyIconButton(title: "下一词", systemImage: "arrow.right", prominent: true, action: advanceSpelling)
+                        .keyboardShortcut(.defaultAction)
+                        .font(.caption)
+                        .accessibilityIdentifier("advanceCorrectSpelling")
+                }
+                if showingReference {
+                    HStack(spacing: 4) {
+                        if appearance.isSimple {
+                            Image(systemName: "exclamationmark.circle").font(.caption).accessibilityHidden(true)
+                        }
+                        Text(word.spelling)
+                            .lineLimit(1).minimumScaleFactor(0.65)
+                    }
+                    .font(.callout).foregroundStyle(.secondary)
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel("正确拼写 \(word.spelling)")
+                    .accessibilityIdentifier("reviewExpectedSpelling")
+                }
+            }
+            // Keep the scrollable extent stable even when both a button and a reference appear.
+            .frame(height: 46, alignment: .top)
         }
         .onChange(of: draft.wrappedValue) { _, current in
-            if correcting, current != session.lastSpellingAttempt?.answer {
-                hiddenSpellingReferenceAt = session.spellingAttempts.count
+            if correcting, current != displayed.lastSpellingAttempt?.answer {
+                hiddenSpellingReferenceAt = displayed.spellingAttempts.count
             }
         }
     }
 
     /// Returns true when the rejected answer should stay selected for editing.
     private func submitSpelling(_ answer: String) -> Bool {
-        if session.spellingState == .readyToAdvance || session.spellingState == .skipped {
+        if displayed.spellingState == .readyToAdvance || displayed.spellingState == .skipped {
             advanceSpelling()
             return false
+        }
+        if displayed.spellingState == .correcting, answer == displayed.lastSpellingAttempt?.answer {
+            hiddenSpellingReferenceAt = nil
+            return !answer.isEmpty
         }
         if let commands {
             commands.submitSpelling(answer)
             return false
         }
         var updated = session
-        guard updated.submitSpelling(answer) else { return false }
+        guard updated.submitSpelling(answer, advanceOnCorrect: appearance.isSimple) else { return false }
         let shouldSelectAnswer = updated.spellingState == .correcting
         session = updated
         return shouldSelectAnswer
@@ -298,7 +370,12 @@ struct ReviewAnswerField: NSViewRepresentable {
     var inputLocked = false
     var focusRequest = 0
     @Environment(\.isEnabled) private var isEnabled
-    private var answerColor: NSColor { accepted ? .systemGreen : (incorrect ? .systemRed : .labelColor) }
+    @Environment(\.miniStudyAppearance) private var appearance
+    private var answerColor: NSColor {
+        if appearance.isSimple { return .labelColor }
+        if accepted { return .systemGreen }
+        return incorrect ? .systemRed : .labelColor
+    }
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
@@ -331,9 +408,9 @@ struct ReviewAnswerField: NSViewRepresentable {
     func updateNSView(_ field: AnswerTextField, context: Context) {
         context.coordinator.owner = self
         let becameEnabled = isEnabled && !field.answerWasEnabled
-        field.isEnabled = isEnabled
         field.answerWasEnabled = isEnabled
-        field.textColor = answerColor
+        if field.isEnabled != isEnabled { field.isEnabled = isEnabled }
+        if field.textColor != answerColor { field.textColor = answerColor }
         let shouldSelect = selectOnFocus && !field.selectOnFocus
         field.selectOnFocus = selectOnFocus
         if becameEnabled || field.focusRequest != focusRequest {
@@ -342,8 +419,11 @@ struct ReviewAnswerField: NSViewRepresentable {
         }
         if let editor = field.currentEditor() as? NSTextView {
             guard !editor.hasMarkedText() else { return }
-            editor.textColor = answerColor
-            editor.selectedTextAttributes[.foregroundColor] = accepted || incorrect ? answerColor : NSColor.selectedTextColor
+            if editor.textColor != answerColor { editor.textColor = answerColor }
+            let selectionColor = !appearance.isSimple && (accepted || incorrect) ? answerColor : NSColor.selectedTextColor
+            if editor.selectedTextAttributes[.foregroundColor] as? NSColor != selectionColor {
+                editor.selectedTextAttributes[.foregroundColor] = selectionColor
+            }
             if shouldSelect, editor.string == text {
                 editor.setSelectedRange(NSRange(location: 0, length: text.utf16.count))
                 return

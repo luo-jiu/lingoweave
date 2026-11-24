@@ -9,6 +9,13 @@ struct MiniMemoryCommands {
     let undo: () -> Void
 }
 
+struct MiniTranslationNavigation {
+    let index: Int
+    let select: (Int) -> Void
+    let revise: (String) -> Void
+    let pendingEdit: Int?
+}
+
 struct MiniDailyCommands {
     let review: MiniReviewCommands
     let learning: MiniReviewCommands
@@ -19,6 +26,7 @@ struct MiniDailyCommands {
     let completeLearning: () -> Void
     let submitTranslation: (String) -> Void
     let advanceTranslation: () -> Void
+    var translationNavigation: MiniTranslationNavigation? = nil
     var memory: MiniMemoryCommands? = nil
     var window: MiniWindowCommands? = nil
     var openDictation: ((MiniWord) -> Void)? = nil
@@ -28,6 +36,8 @@ struct MiniDailyCommands {
 
 struct MiniDailyView: View {
     @Binding var day: MiniDailyDay
+    @Environment(\.miniCardTextSize) private var cardTextSize
+    @Environment(\.miniStudyAppearance) private var appearance
     var preparing: Bool
     var preparationError: String?
     var grading: Bool
@@ -35,18 +45,17 @@ struct MiniDailyView: View {
     var retryPreparation: () -> Void
     var gradeTranslation: () -> Void
     var continueToday: (() -> Void)?
+    var reviewGroupIndex: Int? = nil
+    var hasNextReviewGroup = false
     var commands: MiniDailyCommands? = nil
     var saving = false
     var pauseMessage: String? = nil
-    var resumeLabel = "继续任务"
     var canResume = true
     var openPlan: (() -> Void)? = nil
-    var aiProgress: String? = nil
-    var aiReceipt: String? = nil
     var cancelAI: (() -> Void)? = nil
     var lessonPreparation: MiniLessonPreparation? = nil
     var retryLessonPreparation: (() -> Void)? = nil
-    var continueWithText: (() -> Void)? = nil
+    var openTranslationReview: ((Date) -> Void)? = nil
     var playWord: (MiniWord) -> Void = { _ in }
     var playSentence: (MiniStudySentence) -> Void = { _ in }
     var playSpellingResult: (MiniWord) -> Void = { _ in }
@@ -54,53 +63,55 @@ struct MiniDailyView: View {
     var previewWindow: MiniWindowCommands? = nil
     var previewLearningSpelling: MiniReviewCommands? = nil
     var previewAdvanceTranslation: (() -> Void)? = nil
+    var previewTranslationNavigation: MiniTranslationNavigation? = nil
+    var previewTranslationDraft: Binding<String>? = nil
+    @FocusState private var translationFocused: Bool
 
     private var windowCommands: MiniWindowCommands? { commands?.window ?? previewWindow }
 
-    private var translationDraft: Binding<String> { commands?.translationDraft ?? $day.translationDraft }
-    private var showingLessonPreparation: Bool {
-        day.phase == .learning && !day.paused && day.nextUnstudiedWord != nil
-            && lessonPreparation?.isReady == false
-    }
+    private var translationDraft: Binding<String> { commands?.translationDraft ?? previewTranslationDraft ?? $day.translationDraft }
+
+    private var completedDotColor: Color { appearance.isSimple ? .primary : .green }
 
     var body: some View {
         Group {
             if day.phase == .finished {
-                summary
+                summary.disabled(saving)
             } else if day.paused {
                 VStack(spacing: 9) {
-                    Text(day.flow?.goalReached == true ? "今日新词目标已完成" : "学习已暂停").font(.headline)
+                    Text(day.flow?.goalReached == true ? "Done for today" : "Paused").font(.headline)
                     if let pauseMessage {
                         Text(pauseMessage).font(.caption).foregroundStyle(.secondary)
                             .multilineTextAlignment(.center)
                     }
                     if canResume {
-                        Button(resumeLabel) {
+                        Button("Resume") {
                             if let commands { commands.resume(); return }
                             var next = day
                             if next.setPaused(false) { day = next }
                         }
+                        .miniStudyButton()
                     } else if let openPlan {
-                        Button("调整学习计划", action: openPlan)
+                        MiniStudyIconButton(title: "调整学习计划", systemImage: "slider.horizontal.3", action: openPlan)
                     }
                 }
+                .disabled(saving)
             } else {
                 switch day.phase {
                 case .review: review
                 case .learning: learning
-                case .translation: translation
-                case .finished: summary
+                case .translation: translation.disabled(saving)
+                case .finished: summary.disabled(saving)
                 }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .disabled(saving)
     }
 
     @ViewBuilder
     private var review: some View {
         if let window = day.memoryWindow, let visit = window.visit {
-            windowCard(visit, sentence: sentence(for: visit.word))
+            windowCard(visit)
         } else if let session = day.review {
             MiniReviewView(
                 session: Binding(
@@ -108,7 +119,9 @@ struct MiniDailyView: View {
                     set: { day.review = $0 }
                 ),
                 onFinish: { completeReview() },
-                finishLabel: day.writingRequired == false ? "完成复习" : (day.learningWords.isEmpty ? "开始写句子" : "开始学习"),
+                finishTitle: "Review complete",
+                finishLabel: reviewFinishLabel,
+                groupIndex: reviewGroupIndex,
                 sentenceForWord: { word in
                     guard let sentence = sentence(for: word) else { return nil }
                     return sentence
@@ -122,19 +135,28 @@ struct MiniDailyView: View {
         }
     }
 
+    private var reviewFinishLabel: String {
+        if hasNextReviewGroup { return "Next group" }
+        if day.flow != nil || day.writingRequired == false { return "Finish review" }
+        return day.learningWords.isEmpty ? "Start writing" : "Start study"
+    }
+
     @ViewBuilder
     private var learning: some View {
         if let word = day.retainedLearningWord ?? day.nextUnstudiedWord {
-            if let lessonPreparation, !lessonPreparation.isReady {
-                MiniLessonPreparationView(preparation: lessonPreparation,
-                                          retry: retryLessonPreparation,
-                                          continueWithText: continueWithText)
+            if let lessonPreparation, !lessonPreparation.readyToStudy {
+                MiniLessonPreparationView(preparation: lessonPreparation, retry: retryLessonPreparation)
+                    .disabled(saving)
             } else if let sentence = sentence(for: word) {
-                if let visit = day.memoryWindow?.visit { windowCard(visit, sentence: sentence) }
-                else if let memory = day.memory { memoryCard(word, sentence: sentence, memory: memory) }
-                else { wordStudy(word, sentence: sentence) }
+                if let visit = day.memoryWindow?.visit {
+                    windowCard(visit)
+                } else if let memory = day.memory {
+                    memoryCard(word, sentence: sentence, memory: memory).disabled(saving)
+                } else {
+                    wordStudy(word, sentence: sentence).disabled(saving)
+                }
             } else {
-                preparationStatus("正在准备新词例句…", idleTitle: "新词例句待准备")
+                preparationStatus("Loading examples…", idleTitle: "Examples pending").disabled(saving)
             }
         } else if let session = day.learning {
             MiniReviewView(
@@ -143,8 +165,8 @@ struct MiniDailyView: View {
                     set: { day.learning = $0 }
                 ),
                 onFinish: { completeLearning() },
-                finishTitle: "新词拼写完成",
-                finishLabel: "开始写句子",
+                finishTitle: "Spelling complete",
+                finishLabel: "Start writing",
                 playWord: playWord,
                 playSentence: playSentence,
                 playSpellingResult: playSpellingResult,
@@ -167,19 +189,20 @@ struct MiniDailyView: View {
                 ScrollView {
                     VStack(spacing: 5) {
                         Text(word.spelling)
-                            .font(.system(size: 34, weight: .semibold, design: .serif))
+                            .font(cardTextSize.font(mediumSize: 34))
                             .accessibilityIdentifier("learningEnglish")
                             .onTapGesture { playWord(word) }
                             .accessibilityAddTraits(.isButton)
                         if !word.phonetic.isEmpty {
                             Text(word.phonetic).font(.caption).foregroundStyle(.secondary)
                         }
-                        Text(word.meaning)
+                        Text(word.meaning).miniTranslationPrivacy()
                         VStack(spacing: 3) {
-                            Text(sentence.english).font(.callout)
+                            Text(sentence.attributedEnglish(appearance: appearance)).font(.callout)
                                 .onTapGesture { playSentence(sentence) }
                                 .accessibilityAddTraits(.isButton)
                             Text(sentence.attributedTranslation).font(.caption).foregroundStyle(.secondary)
+                                .miniTranslationPrivacy()
 
                         }
                         .padding(.top, 4)
@@ -194,12 +217,16 @@ struct MiniDailyView: View {
 
             if day.retainedLearningWord == word {
                 HStack(spacing: 8) {
-                    if let unmark = commands?.unmarkStudied { Button("撤销记住") { unmark(word) } }
-                    if let advance = commands?.advanceLearningCard { Button("下一个") { advance(word) } }
+                    if let unmark = commands?.unmarkStudied {
+                        MiniStudyIconButton(title: "撤销记住", systemImage: "arrow.uturn.backward") { unmark(word) }
+                    }
+                    if let advance = commands?.advanceLearningCard {
+                        MiniStudyIconButton(title: "下一个", systemImage: "arrow.right", prominent: true) { advance(word) }
+                    }
                 }
                 .font(.caption)
             } else {
-                Button("记住了") {
+                MiniStudyIconButton(title: "记住了", systemImage: "checkmark", prominent: true) {
                     if let commands { commands.markStudied(word); return }
                     var next = day
                     if next.markStudied(word) { day = next }
@@ -214,8 +241,8 @@ struct MiniDailyView: View {
             HStack(spacing: 7) {
                 ForEach(1...3, id: \.self) { round in
                     Circle()
-                        .fill(round <= memory.completedRounds(for: word) ? Color.green : Color.clear)
-                        .overlay { Circle().stroke(round <= memory.completedRounds(for: word) ? Color.green : Color.secondary, lineWidth: 1.4) }
+                        .fill(round <= memory.completedRounds(for: word) ? completedDotColor : Color.clear)
+                        .overlay { Circle().stroke(round <= memory.completedRounds(for: word) ? completedDotColor : Color.secondary, lineWidth: 1.4) }
                         .frame(width: 9, height: 9)
                         .accessibilityLabel(["初见记忆", "语境回忆", "词义回忆"][round - 1])
                         .accessibilityValue(round <= memory.completedRounds(for: word) ? "已完成" : (round == memory.round ? "当前轮" : "待完成"))
@@ -227,14 +254,15 @@ struct MiniDailyView: View {
                     VStack(spacing: 7) {
                         if memory.round != 2 || memory.revealed {
                             Text(word.spelling)
-                                .font(.system(size: 34, weight: .semibold, design: .serif))
+                                .font(cardTextSize.font(mediumSize: 34))
                                 .accessibilityIdentifier("learningEnglish")
                                 .onTapGesture { playWord(word) }
                                 .accessibilityAddTraits(.isButton)
                         }
                         if memory.round == 1 || memory.revealed {
                             if !word.phonetic.isEmpty { Text(word.phonetic).font(.caption).foregroundStyle(.secondary) }
-                            Text(word.meaning).accessibilityIdentifier("memoryMeaning")
+                            Text(word.meaning).miniTranslationPrivacy()
+                                .accessibilityIdentifier("memoryMeaning")
                         }
                         if memory.round < 3 || memory.revealed {
                             memoryExample(sentence)
@@ -242,6 +270,7 @@ struct MiniDailyView: View {
                         }
                         if memory.round == 1 || memory.revealed {
                             Text(sentence.attributedTranslation).font(.caption).foregroundStyle(.secondary)
+                                .miniTranslationPrivacy()
                         }
                     }
                     .multilineTextAlignment(.center)
@@ -251,32 +280,48 @@ struct MiniDailyView: View {
             }
             HStack(spacing: 10) {
                 if memory.round == 1 {
-                    Button("记住了") { advanceMemory(true) }
+                    MiniStudyIconButton(title: "记住了", systemImage: "checkmark", prominent: true) { advanceMemory(true) }
                 } else {
-                    if !memory.revealed { Button("展开") { revealMemory() } }
-                    else { Button("再看一次") { advanceMemory(false) } }
-                    Button(memory.round == 3 ? "待拼写" : "想起来了") { advanceMemory(true) }
+                    if !memory.revealed {
+                        MiniStudyIconButton(title: "展开", systemImage: "eye") { revealMemory() }
+                    } else {
+                        MiniStudyIconButton(title: "再看一次", systemImage: "arrow.counterclockwise") { advanceMemory(false) }
+                    }
+                    MiniStudyIconButton(title: memory.round == 3 ? "待拼写" : "想起来了",
+                                        systemImage: memory.round == 3 ? "text.cursor" : "lightbulb",
+                                        prominent: true) { advanceMemory(true) }
                 }
             }
         }
         .accessibilityIdentifier("memoryRoundCard")
     }
 
-    private func windowCard(_ visit: MiniMemoryWindow.Visit, sentence: MiniStudySentence?) -> some View {
-        VStack(spacing: 8) {
+    private func windowCard(_ visit: MiniMemoryWindow.Visit) -> some View {
+        let controls = windowCommands
+        let sentence = sentence(for: visit.word)
+        let filledDots = visit.completedStages
+        return VStack(spacing: 8) {
             HStack(spacing: 7) {
                 ForEach(0..<3, id: \.self) { stage in
                     Circle()
-                        .fill(stage < visit.completedStages ? Color.green : Color.clear)
-                        .overlay { Circle().stroke(stage < visit.completedStages ? Color.green : Color.secondary, lineWidth: 1.4) }
+                        .fill(stage < filledDots ? completedDotColor : Color.clear)
+                        .overlay { Circle().stroke(stage < filledDots ? completedDotColor : Color.secondary, lineWidth: 1.4) }
                         .frame(width: 9, height: 9)
                         .accessibilityLabel(["初见记忆", "语境回忆", "词义回忆"][stage])
-                        .accessibilityValue(stage < visit.completedStages ? "已完成" : (stage == visit.stage && visit.initial == nil ? "当前阶段" : "待完成"))
+                        .accessibilityValue(stage < filledDots ? "已完成" : (stage == visit.stage && visit.initial == nil ? "当前阶段" : "待完成"))
                 }
                 if day.phase == .learning, let flow = day.flow {
                     Spacer(minLength: 4)
-                    Text("第 \(flow.groupIndex) 组 · \(flow.groupWords.count)/\(flow.groupTarget)")
+                    Text("\(flow.groupIndex) · \(flow.groupWords.count)/\(flow.groupTarget)")
                         .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+                        .accessibilityLabel("第 \(flow.groupIndex) 组，已通过 \(flow.groupWords.count) 词，共 \(flow.groupTarget) 词")
+                } else if day.phase == .review, let reviewGroupIndex, let review = day.review, let window = review.relearning {
+                    let done = window.events.count { $0.stage == 2 && $0.remembered }
+                    let total = review.relearningWords?.count ?? 0
+                    Spacer(minLength: 4)
+                    Text("\(reviewGroupIndex) · \(done)/\(total)")
+                        .font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+                        .accessibilityLabel("第 \(reviewGroupIndex) 组重学，已通过 \(done) 词，共 \(total) 词")
                 }
             }
             .accessibilityIdentifier("memoryRoundDots")
@@ -285,7 +330,7 @@ struct MiniDailyView: View {
                     VStack(spacing: 7) {
                         if visit.stage != 1 || visit.showsFullCard {
                             Text(visit.word.spelling)
-                                .font(.system(size: 34, weight: .semibold, design: .serif))
+                                .font(cardTextSize.font(mediumSize: 34))
                                 .accessibilityIdentifier("learningEnglish")
                                 .onTapGesture { playWord(visit.word) }
                                 .accessibilityAddTraits(.isButton)
@@ -294,16 +339,18 @@ struct MiniDailyView: View {
                             if !visit.word.phonetic.isEmpty {
                                 Text(visit.word.phonetic).font(.caption).foregroundStyle(.secondary)
                             }
-                            Text(visit.word.meaning).accessibilityIdentifier("memoryMeaning")
+                            Text(visit.word.meaning).miniTranslationPrivacy()
+                                .accessibilityIdentifier("memoryMeaning")
                         }
                         if visit.stage == 1, !visit.showsFullCard, sentence == nil {
-                            Text(visit.word.meaning).font(.headline)
-                            Text("词义提示回忆（暂无例句）").font(.caption2).foregroundStyle(.secondary)
+                            Text(visit.word.meaning).font(.headline).miniTranslationPrivacy()
+                                .help("词义提示回忆（暂无例句）")
                         }
                         if visit.stage != 2 || visit.showsFullCard, let sentence {
                             memoryExample(sentence).accessibilityIdentifier("memoryExample")
                             if visit.showsFullCard {
                                 Text(sentence.attributedTranslation).font(.caption).foregroundStyle(.secondary)
+                                    .miniTranslationPrivacy()
                             }
                         }
                     }
@@ -312,24 +359,17 @@ struct MiniDailyView: View {
                     .padding(.horizontal, 4)
                 }
             }
-            MiniWindowControls(visit: visit, saving: saving, commands: windowCommands)
+            MiniWindowControls(visit: visit, commands: controls)
         }
         .accessibilityIdentifier("memoryWindowCard")
+        .task(id: visit.advancesAutomatically ? visit.id : nil) {
+            // Older versions could stop between recording a choice and advancing its card.
+            if visit.advancesAutomatically { controls?.advance(nil) }
+        }
     }
 
     private func memoryExample(_ sentence: MiniStudySentence) -> some View {
-        var attributed = AttributedString(sentence.english)
-        attributed.link = URL(string: "lingoweave-sentence://play")
-        attributed.foregroundColor = .primary
-        for target in sentence.highlightedRanges {
-            guard let start = AttributedString.Index(target.lowerBound, within: attributed),
-                  let end = AttributedString.Index(target.upperBound, within: attributed) else { continue }
-            let range = start..<end
-            attributed[range].link = URL(string: "lingoweave-word://play")
-            attributed[range].foregroundColor = .accentColor
-            attributed[range].font = .callout.bold()
-        }
-        return Text(attributed).font(.callout)
+        Text(sentence.attributedEnglish(appearance: appearance, includesAudioLinks: true)).font(.callout)
             .environment(\.openURL, OpenURLAction { url in
                 if url.scheme == "lingoweave-word" { playWord(sentence.word) }
                 else { playSentence(sentence) }
@@ -350,55 +390,91 @@ struct MiniDailyView: View {
 
     @ViewBuilder
     private var translation: some View {
-        if let task = day.currentTranslation {
-            let attempt = day.currentAttempt
+        let navigation = commands?.translationNavigation ?? previewTranslationNavigation
+        let index = navigation?.index ?? day.translationIndex
+        if let task = day.translationTask(at: index) {
+            let attempt = day.translation.last { $0.taskID == task.id }
             VStack(alignment: .leading, spacing: 8) {
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 7) {
-                        translationPrompt(task)
-                        if let attempt {
+                    VStack(alignment: .leading, spacing: 10) {
+                        translationPrompt(task, index: index)
+                        if let attempt, navigation == nil {
                             translationResult(task, attempt: attempt)
                         } else {
-                            TextEditor(text: translationDraft)
-                                .font(.body)
-                                .scrollContentBackground(.hidden)
-                                .frame(height: 66)
-                                .padding(3)
-                                .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 5))
-                                .overlay {
-                                    RoundedRectangle(cornerRadius: 5)
-                                        .strokeBorder(Color(nsColor: .separatorColor))
-                                        .allowsHitTesting(false)
-                                }
-                                .accessibilityLabel("输入译文")
-                                .accessibilityIdentifier("dailyTranslationDraft")
+                            translationEditor
+                            if let attempt, attempt.revisions?.isEmpty != false, attempt.feedback != nil {
+                                translationFeedback(task, attempt: attempt)
+                            }
                         }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
 
-                translationControls(attempt)
-                    .frame(maxWidth: .infinity, alignment: .trailing)
+                if let navigation {
+                    translationNavigationControls(navigation, attempt: attempt)
+                } else {
+                    translationControls(attempt)
+                        .frame(maxWidth: .infinity, alignment: .trailing)
+                }
             }
             .padding(.vertical, 2)
             .id(task.id)
         } else {
-            preparationStatus("正在准备翻译练习…", idleTitle: "翻译题待准备")
+            preparationStatus("Loading prompts…", idleTitle: "Prompts pending")
         }
     }
 
-    private func translationPrompt(_ task: MiniTranslationTask) -> some View {
-        let direction = task.direction == .englishToChinese ? "英译中" : "中译英"
-        let completedGroups = day.flow?.groups.reduce(0) { $0 + $1.words.count } ?? 0
-        let index = day.translationIndex - completedGroups + 1
+    private var translationEditor: some View {
+        TextEditor(text: translationDraft)
+            .font(.body)
+            .focused($translationFocused)
+            .scrollContentBackground(.hidden)
+            .frame(height: 66)
+            .miniTranslationPrivacy()
+            .padding(5)
+            .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
+            .overlay(alignment: .topLeading) {
+                if translationDraft.wrappedValue.isEmpty {
+                    Text("Type here…")
+                        .font(.body).foregroundStyle(.secondary)
+                        .padding(.horizontal, 10).padding(.top, 5)
+                        .allowsHitTesting(false).accessibilityHidden(true)
+                }
+            }
+            .overlay {
+                RoundedRectangle(cornerRadius: 8)
+                    .strokeBorder(Color(nsColor: .separatorColor), lineWidth: 0.7).allowsHitTesting(false)
+            }
+            .onAppear { translationFocused = true }
+            .accessibilityLabel("输入译文")
+            .accessibilityIdentifier("dailyTranslationDraft")
+    }
+
+    private func translationPrompt(_ task: MiniTranslationTask, index: Int) -> some View {
+        let direction = task.direction == .englishToChinese ? "EN → ZH" : "ZH → EN"
+        let number = index - day.translationGroupStart + 1
         let total = day.flow?.groupWords.count ?? day.translationCount
-        let group = day.flow.map { "第 \($0.groupIndex) 组 · " } ?? ""
-        return VStack(alignment: .leading, spacing: 4) {
-            Text(group + "第 \(index) / \(total) 题 · \(direction)")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+        let group = day.flow.map { "\($0.groupIndex) · " } ?? ""
+        return VStack(alignment: .leading, spacing: 7) {
+            HStack {
+                Text(direction)
+                    .font(.caption.weight(.semibold))
+                    .accessibilityLabel(task.direction == .englishToChinese ? "英译中" : "中译英")
+                if commands?.translationNavigation != nil, let openTranslationReview,
+                   let attempt = day.translation.last(where: { $0.taskID == task.id }) {
+                    MiniStudyIconButton(title: "当天点评", systemImage: "text.bubble") {
+                        openTranslationReview(attempt.submittedAt)
+                    }
+                    .font(.caption)
+                    .accessibilityIdentifier("openTranslationReview")
+                }
+                Spacer(minLength: 4)
+                Text(group + "\(number)/\(total)").font(.caption.monospacedDigit())
+            }
+            .foregroundStyle(.secondary)
             Text(task.prompt)
-                .font(.headline)
+                .font(.system(size: 16, weight: .semibold))
+                .fixedSize(horizontal: false, vertical: true)
                 .textSelection(.enabled)
                 .accessibilityIdentifier("dailyTranslationPrompt")
         }
@@ -406,66 +482,152 @@ struct MiniDailyView: View {
 
     private func translationResult(_ task: MiniTranslationTask, attempt: MiniTranslationAttempt) -> some View {
         VStack(alignment: .leading, spacing: 5) {
-            labeledText("你的译文", attempt.answer)
-            if let feedback = attempt.feedback {
-                labeledText("AI 反馈", feedback.comment)
+            labeledText("Your answer", attempt.answer, protectsTranslation: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 10).padding(.vertical, 7)
+                .background(.quaternary.opacity(0.55), in: RoundedRectangle(cornerRadius: 8))
+            translationFeedback(task, attempt: attempt)
+        }
+        .textSelection(.enabled)
+    }
+
+    private func translationFeedback(_ task: MiniTranslationTask, attempt: MiniTranslationAttempt) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            // The review page applies the current meaning rubric to older Chinese translations.
+            if let feedback = attempt.feedback, task.direction != .englishToChinese || openTranslationReview == nil {
+                labeledText("Feedback", feedback.comment)
                 if let strengths = feedback.strengths, !strengths.isEmpty {
-                    labeledText("做得好的地方", strengths.joined(separator: "\n"))
+                    labeledText("Strengths", strengths.joined(separator: "\n"))
                 }
                 if let improvements = feedback.improvements, !improvements.isEmpty {
-                    labeledText("可以改进", improvements.joined(separator: "\n"))
+                    labeledText("Improvements", improvements.joined(separator: "\n"))
                 }
                 if let keyPoints = feedback.keyPoints, !keyPoints.isEmpty {
-                    labeledText("重点", keyPoints.joined(separator: "\n"))
+                    labeledText("Key points", keyPoints.joined(separator: "\n"))
                 }
-                labeledText("参考译文", feedback.referenceTranslation ?? task.reference)
-                if !feedback.tip.isEmpty { labeledText("用法提示", feedback.tip) }
-                if !feedback.usefulPhrase.isEmpty { labeledText("可复用短语", feedback.usefulPhrase) }
-            } else if day.flow == nil, let gradingError {
+                labeledText("Reference", feedback.referenceTranslation ?? task.reference, protectsTranslation: true)
+                if !feedback.tip.isEmpty { labeledText("Tip", feedback.tip) }
+                if !feedback.usefulPhrase.isEmpty { labeledText("Useful phrase", feedback.usefulPhrase) }
+            } else if attempt.feedback == nil, day.flow == nil, let gradingError {
                 Text(gradingError).font(.caption).foregroundStyle(.secondary)
             }
         }
         .textSelection(.enabled)
     }
 
+    private func translationNavigationControls(_ navigation: MiniTranslationNavigation, attempt: MiniTranslationAttempt?) -> some View {
+        let index = navigation.index
+        let text = translationDraft.wrappedValue
+        let valid = !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && text.count <= 4_000
+        let changed = attempt.map { $0.latestAnswer != text } ?? false
+        let last = index + 1 == day.translationCount
+        return HStack(spacing: 7) {
+            MiniStudyIconButton(title: "上一题", systemImage: "arrow.left") { navigation.select(index - 1) }
+                .disabled(index <= day.translationGroupStart)
+                .accessibilityIdentifier("previousTranslation")
+            Spacer(minLength: 0)
+            if changed, let attempt {
+                MiniStudyIconButton(title: "还原", systemImage: "arrow.uturn.backward") {
+                    translationDraft.wrappedValue = attempt.latestAnswer
+                }
+                MiniStudyIconButton(title: "提交修改", systemImage: "square.and.arrow.up") { navigation.revise(text) }
+                    .disabled(!valid)
+                    .accessibilityIdentifier("reviseTranslation")
+            }
+            if index < day.translationIndex {
+                MiniStudyIconButton(title: "下一题", systemImage: "arrow.right") { navigation.select(index + 1) }
+                    .accessibilityIdentifier("nextTranslation")
+            } else if attempt == nil {
+                MiniStudyIconButton(title: "提交译文", systemImage: "arrow.up", prominent: true, action: submitTranslation)
+                    .disabled(!valid)
+                    .accessibilityIdentifier("submitTranslation")
+            } else if day.flow == nil, previewAdvanceTranslation == nil, attempt?.feedback == nil {
+                if grading {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Button(gradingError == nil ? "Check" : "Retry", action: gradeTranslation)
+                        .miniStudyButton()
+                }
+            } else if last, let pending = navigation.pendingEdit, pending != index {
+                let question = pending - day.translationGroupStart + 1
+                Button("Edit \(question)") { navigation.select(pending) }
+                    .miniStudyButton()
+                    .help("查看第 \(question) 题修改")
+                    .accessibilityLabel("查看第 \(question) 题修改")
+                    .accessibilityIdentifier("pendingTranslationEdit")
+            } else {
+                confirmTranslationButton(last: last) {
+                    if let commands { commands.advanceTranslation() } else { previewAdvanceTranslation?() }
+                }
+                .disabled(changed)
+                .accessibilityIdentifier("confirmTranslation")
+            }
+        }
+        .controlSize(.small)
+    }
+
     @ViewBuilder
     private func translationControls(_ attempt: MiniTranslationAttempt?) -> some View {
-        if day.flow != nil || previewAdvanceTranslation != nil, attempt != nil {
-            Button(day.translationIndex + 1 < day.translationCount ? "下一词" : "完成本组") {
-                if let commands { commands.advanceTranslation() }
-                else { previewAdvanceTranslation?() }
+        if day.flow != nil || previewAdvanceTranslation != nil, let attempt {
+            HStack {
+                if let openTranslationReview {
+                    MiniStudyIconButton(title: "当天点评", systemImage: "text.bubble") {
+                        openTranslationReview(attempt.submittedAt)
+                    }
+                    .font(.caption)
+                    .accessibilityIdentifier("openTranslationReview")
+                }
+                Spacer()
+                confirmTranslationButton(last: day.translationIndex + 1 >= day.translationCount) {
+                    if let commands { commands.advanceTranslation() }
+                    else { previewAdvanceTranslation?() }
+                }
+                .accessibilityIdentifier("confirmTranslation")
             }
-            .accessibilityIdentifier("confirmTranslation")
         } else if attempt?.feedback != nil {
-            Button("继续") {
+            MiniStudyIconButton(title: "继续", systemImage: "arrow.right", prominent: true) {
                 if let commands { commands.advanceTranslation(); return }
                 var next = day
                 if next.advanceTranslation() { day = next }
             }
         } else if grading {
             VStack(alignment: .trailing, spacing: 4) {
-                ProgressView(aiProgress ?? "正在准备反馈…").controlSize(.small)
-                if let cancelAI { Button("停止", action: cancelAI) }
+                ProgressView("Loading feedback…").controlSize(.small)
+                if let cancelAI { MiniStudyIconButton(title: "停止", systemImage: "stop", action: cancelAI) }
             }
         } else if attempt != nil {
-            Button(gradingError == nil ? "批改译文" : "重试批改", action: gradeTranslation)
+            Button(gradingError == nil ? "Check" : "Retry", action: gradeTranslation)
+                .miniStudyButton()
         } else {
-            Button("提交译文", action: submitTranslation)
+            MiniStudyIconButton(title: "提交译文", systemImage: "arrow.up", prominent: true, action: submitTranslation)
                 .disabled(translationDraft.wrappedValue.count > 4_000
                           || translationDraft.wrappedValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        }
+    }
+
+    @ViewBuilder
+    private func confirmTranslationButton(last: Bool, action: @escaping () -> Void) -> some View {
+        if last {
+            Button("Finish group", action: action)
+                .miniStudyButton(prominent: true)
+                .help("完成本组")
+                .accessibilityLabel("完成本组")
+        } else {
+            MiniStudyIconButton(title: "下一题", systemImage: "arrow.right", prominent: true, action: action)
         }
     }
 
     private func preparationStatus(_ pendingTitle: String, idleTitle: String) -> some View {
         VStack(spacing: 8) {
             if preparing {
-                ProgressView(aiProgress ?? pendingTitle).controlSize(.small)
-                if let cancelAI { Button("停止", action: cancelAI).font(.caption) }
+                ProgressView(pendingTitle).controlSize(.small)
+                if let cancelAI { MiniStudyIconButton(title: "停止", systemImage: "stop", action: cancelAI).font(.caption) }
             } else {
                 Text(preparationError ?? idleTitle)
                     .font(.callout)
                     .multilineTextAlignment(.center)
-                Button(preparationError == nil ? "准备材料" : "重新准备", action: retryPreparation)
+                Button(preparationError == nil ? "Load" : "Retry", action: retryPreparation)
+                    .miniStudyButton()
             }
         }
         .padding(8)
@@ -474,22 +636,43 @@ struct MiniDailyView: View {
     private var summary: some View {
         VStack(spacing: 8) {
             if day.reviewWords.isEmpty && day.learningWords.isEmpty {
-                Text("今天没有待学或待复习的词").font(.headline)
+                Text("All clear").font(.headline)
             } else {
-                Text(continueToday == nil ? "今日任务已完成" : "\(day.id) 的任务已完成").font(.headline)
-                Text("复习 \(day.reviewWords.count) 词 · 学习 \(day.learningWords.count) 词 · 翻译 \(day.translation.count) 题")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
+                Text(continueToday == nil ? "Done" : "Group complete").font(.headline)
+                HStack(spacing: 12) {
+                    summaryCount(day.reviewWords.count, systemImage: "arrow.clockwise", label: "复习")
+                    summaryCount(day.learningWords.count, systemImage: "book.closed", label: "学习")
+                    summaryCount(day.translation.count, systemImage: "text.bubble", label: "翻译")
+                }
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
             }
-            if let continueToday { Button("开始今天的任务", action: continueToday) }
+            if let continueToday {
+                Button("Continue", action: continueToday)
+                    .miniStudyButton(prominent: true)
+                    .help("继续今日学习")
+                    .accessibilityLabel("继续今日学习")
+            }
+            if let openTranslationReview, let date = day.translation.last?.submittedAt {
+                MiniStudyIconButton(title: "查看翻译点评", systemImage: "text.bubble") { openTranslationReview(date) }
+            }
         }
     }
 
-    private func labeledText(_ label: String, _ value: String) -> some View {
+    private func summaryCount(_ count: Int, systemImage: String, label: String) -> some View {
+        Label("\(count)", systemImage: systemImage)
+            .help(label)
+            .accessibilityLabel("\(label) \(count)")
+    }
+
+    private func labeledText(_ label: String, _ value: String, protectsTranslation: Bool = false) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             Text(label).font(.caption2.weight(.semibold)).foregroundStyle(.secondary)
-            Text(value).font(.callout)
+            if protectsTranslation {
+                Text(value).font(.callout).miniTranslationPrivacy()
+            } else {
+                Text(value).font(.callout)
+            }
         }
     }
 
@@ -512,16 +695,35 @@ struct MiniDailyView: View {
     private func submitTranslation() {
         if let commands { commands.submitTranslation(translationDraft.wrappedValue); return }
         var next = day
-        guard next.submitTranslation(next.translationDraft) != nil else { return }
+        guard next.submitTranslation(translationDraft.wrappedValue) != nil else { return }
         day = next
         if previewAdvanceTranslation == nil { gradeTranslation() }
+    }
+}
+
+extension MiniStudySentence {
+    func attributedEnglish(appearance: MiniStudyAppearance, includesAudioLinks: Bool = false) -> AttributedString {
+        var attributed = AttributedString(english)
+        attributed.foregroundColor = .primary
+        if includesAudioLinks { attributed.link = URL(string: "lingoweave-sentence://play") }
+        for target in highlightedRanges {
+            guard let start = AttributedString.Index(target.lowerBound, within: attributed),
+                  let end = AttributedString.Index(target.upperBound, within: attributed) else { continue }
+            let range = start..<end
+            if includesAudioLinks { attributed[range].link = URL(string: "lingoweave-word://play") }
+            attributed[range].foregroundColor = appearance.isSimple ? .primary : .accentColor
+            attributed[range].font = .callout.bold()
+        }
+        return attributed
     }
 }
 
 private struct MiniLessonPreparationView: View {
     let preparation: MiniLessonPreparation
     let retry: (() -> Void)?
-    let continueWithText: (() -> Void)?
+    @Environment(\.miniStudyAppearance) private var appearance
+
+    private var completedColor: Color { appearance.isSimple ? .secondary : .green }
 
     private var failureDetail: String? {
         preparation.steps.first { $0.status == .failed && $0.detail?.isEmpty == false }?.detail
@@ -539,14 +741,16 @@ private struct MiniLessonPreparationView: View {
     private var content: some View {
         VStack(alignment: .leading, spacing: 9) {
             HStack(alignment: .firstTextBaseline) {
-                Text("准备学习内容").font(.headline)
+                Text("Getting ready").font(.headline)
                 Spacer(minLength: 8)
-                Text("\(preparation.completedCount) / \(preparation.totalCount)")
-                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-                    .accessibilityLabel("已准备 \(preparation.completedCount) 项，共 \(preparation.totalCount) 项")
+                if let target = preparation.groupTarget {
+                    Text("\(target)")
+                        .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                        .accessibilityLabel("本组目标 \(target) 词")
+                }
             }
             ProgressView(value: preparation.progress)
-                .tint(.green)
+                .tint(completedColor)
                 .accessibilityLabel("学习内容准备进度")
                 .accessibilityIdentifier("lessonPreparationProgress")
 
@@ -560,12 +764,12 @@ private struct MiniLessonPreparationView: View {
                 Text(failureDetail).font(.caption2).foregroundStyle(.secondary).lineLimit(2)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            if preparation.hasFailure || !preparation.isRunning {
-                HStack(spacing: 12) {
-                    if let retry { Button("重新准备", action: retry) }
-                    if let continueWithText { Button("先学文字", action: continueWithText) }
-                }
-                .font(.caption)
+            if let retry, preparation.hasFailure || !preparation.isRunning {
+                Button("Retry", action: retry)
+                    .miniStudyButton()
+                    .font(.caption)
+                    .help("重新准备")
+                    .accessibilityLabel("重新准备")
             }
         }
         .padding(.horizontal, 6)
@@ -579,15 +783,15 @@ private struct MiniLessonPreparationView: View {
                     .frame(width: 20, height: 20)
                 if !isLast {
                     Rectangle()
-                        .fill(step.status == .complete ? Color.green.opacity(0.65) : Color.secondary.opacity(0.25))
+                        .fill(step.status == .complete ? completedColor.opacity(0.65) : Color.secondary.opacity(0.25))
                         .frame(width: 1, height: 15)
                 }
             }
             HStack(spacing: 8) {
-                Text(step.title).font(.callout)
+                Text(stepTitle(step.id)).font(.callout)
                     .foregroundStyle(step.status == .waiting ? .secondary : .primary)
                 Spacer(minLength: 4)
-                Text("\(step.completed) / \(step.total)")
+                Text("\(step.completed)/\(step.total)")
                     .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                 if step.status == .running {
                     ProgressView().controlSize(.mini).frame(width: 13, height: 13)
@@ -597,19 +801,29 @@ private struct MiniLessonPreparationView: View {
         }
         .frame(minHeight: isLast ? 20 : 35, alignment: .top)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("\(step.title)，\(statusLabel(step.status))，\(step.completed) / \(step.total)")
+        .accessibilityLabel("\(step.title)，\(statusLabel(step.status))，\(step.completed) / \(step.total) \(step.unit)")
         .accessibilityIdentifier("lessonPreparation-" + step.id.rawValue)
+    }
+
+    private func stepTitle(_ id: MiniLessonPreparation.Step.ID) -> String {
+        switch id {
+        case .words: "Words"
+        case .examples: "Examples"
+        case .wordAudio: "Word audio"
+        case .sentenceAudio: "Example audio"
+        }
     }
 
     @ViewBuilder
     private func stepIndicator(_ status: MiniLessonPreparation.Step.Status) -> some View {
         switch status {
         case .complete:
-            Image(systemName: "checkmark.circle.fill").font(.system(size: 19)).foregroundStyle(.green)
+            Image(systemName: "checkmark.circle.fill").font(.system(size: 19)).foregroundStyle(completedColor)
         case .failed:
-            Image(systemName: "exclamationmark.circle").font(.system(size: 19)).foregroundStyle(.orange)
+            Image(systemName: "exclamationmark.circle").font(.system(size: 19))
+                .foregroundStyle(appearance.isSimple ? Color.secondary : Color.orange)
         case .running:
-            Circle().strokeBorder(Color.accentColor, lineWidth: 2)
+            Circle().strokeBorder(appearance.isSimple ? Color.secondary : Color.accentColor, lineWidth: 2)
         case .waiting:
             Circle().strokeBorder(Color.secondary.opacity(0.4), lineWidth: 1.5)
         }

@@ -59,10 +59,14 @@ struct MiniVocabularyCatalog: Decodable, Sendable {
             book.id == activeDeckId || book.levels.contains { $0.deckId == activeDeckId }
         }
     }
+    var activeSelectionDetail: String? {
+        guard activeBook != nil else { return nil }
+        return (activeDeck?.level ?? "全部") + " · " + activeOrder.label
+    }
+
     var activeSelectionName: String? {
-        guard let activeBook else { return activeDeck?.name }
-        let level = activeDeck?.level ?? "全部"
-        return activeBook.name + " · " + level + " · " + activeOrder.label
+        guard let book = activeBook, let detail = activeSelectionDetail else { return activeDeck?.name }
+        return book.name + " · " + detail
     }
 
     func orderedCustomWords(_ words: [MiniWord]) -> [MiniWord] {

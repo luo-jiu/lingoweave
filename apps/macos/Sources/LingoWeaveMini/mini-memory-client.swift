@@ -20,6 +20,11 @@ struct MiniMemoryViewport: Equatable, Sendable {
         return start...start.addingTimeInterval(spanDays * 86400)
     }
     var key: String { "\(range.lowerBound.timeIntervalSinceReferenceDate)/\(range.upperBound.timeIntervalSinceReferenceDate)" }
+    var calendarRange: ClosedRange<Date> {
+        let calendar = Calendar.current
+        let start = calendar.startOfDay(for: range.lowerBound)
+        return start...(calendar.dateInterval(of: .day, for: range.upperBound)?.end ?? range.upperBound)
+    }
     mutating func pan(_ fraction: Double) { offsetDays += spanDays * fraction }
     mutating func reset(at: Date = .now) { anchor = at; zoom = 1; offsetDays = 0 }
     mutating func focus(_ date: Date) {
@@ -31,6 +36,22 @@ struct MiniMemoryViewport: Equatable, Sendable {
 enum MiniMemoryDimension: String, CaseIterable, Identifiable, Sendable {
     case meaning = "词义", spelling = "拼写"
     var id: String { rawValue }
+}
+
+struct MiniMemoryWordPage {
+    static let size = 20
+    let number: Int
+    let count: Int
+    let rows: ArraySlice<MiniMemoryWord>
+
+    init(words: [MiniMemoryWord], number: Int) {
+        count = words.isEmpty ? 0 : Self.number(containing: words.count - 1)
+        self.number = min(max(1, number), max(1, count))
+        let start = (self.number - 1) * Self.size
+        rows = words[start..<min(start + Self.size, words.count)]
+    }
+
+    static func number(containing index: Int) -> Int { index / size + 1 }
 }
 
 struct MiniMemoryWord: Decodable, Sendable, Identifiable {
@@ -45,13 +66,14 @@ struct MiniMemoryWord: Decodable, Sendable, Identifiable {
     enum Status: String, Decodable, Sendable {
         case learning, due, scheduled, unmeasured
         var label: String {
-            switch self { case .learning, .unmeasured: "积累中"; case .due: "已到期"; case .scheduled: "已安排" }
+            switch self { case .learning: "学习中"; case .unmeasured: "未排期"; case .due: "待复习"; case .scheduled: "已安排" }
         }
     }
     let senseId: String
     let word: MiniWord
     let source: String
     let status: Status
+    var inCurrentReview: Bool? = nil
     let dueAt: Date?
     let idealDueAt: Date?
     let firstSeenAt: Date?
@@ -69,6 +91,7 @@ struct MiniMemoryOverview: Decodable, Sendable {
         let completedWordCount: Int
         let measuredWordCount: Int
         let dueCount: Int
+        let overdueCount: Int?
         let scheduledCount: Int
         let learningCount: Int
         let excludedLegacyCount: Int

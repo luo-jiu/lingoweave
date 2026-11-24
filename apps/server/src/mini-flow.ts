@@ -9,6 +9,7 @@ import type {
   MiniWord,
 } from '@lingoweave/contracts';
 import { LearningError } from './learning-store.js';
+import { startSpellingRound } from './mini-spelling.js';
 
 function key(word: MiniWord) {
   return JSON.stringify([word.spelling.trim().toLowerCase(), word.meaning.trim()]);
@@ -34,6 +35,7 @@ export interface MiniFlowOptions {
   dailyNewGoal: number;
   groupSize: number;
   completedToday?: number;
+  extraGroupTarget?: number;
 }
 
 export function makeMiniWindow(words: MiniWord[], at: number): MiniWindow {
@@ -52,7 +54,12 @@ export function makeMiniWindow(words: MiniWord[], at: number): MiniWindow {
 }
 
 /** The sequence is based on completed visits, never on rendering or audio refreshes. */
-export function selectMiniWindowVisit(window: MiniWindow, at: number, preferred?: MiniWord) {
+export function selectMiniWindowVisit(
+  window: MiniWindow,
+  at: number,
+  preferred?: MiniWord,
+  nextId?: string,
+) {
   if (window.visit) return;
   const unseen = window.members.find((item) => item.lastVisit === null);
   const eligible = window.members
@@ -78,7 +85,7 @@ export function selectMiniWindowVisit(window: MiniWindow, at: number, preferred?
   // One early revisit is allowed before the remaining unseen member gets its turn.
   window.forceUnseen = member.lastVisit !== null && unseen !== undefined;
   window.visit = {
-    id: randomUUID(),
+    id: nextId?.toLowerCase() ?? randomUUID(),
     word: member.word,
     stage: member.stage,
     openedAt: at,
@@ -86,8 +93,8 @@ export function selectMiniWindowVisit(window: MiniWindow, at: number, preferred?
   };
 }
 
-export function makeMiniFlowSpelling(words: MiniWord[]): MiniReviewSession {
-  return {
+export function makeMiniFlowSpelling(words: MiniWord[], seed?: string): MiniReviewSession {
+  const session: MiniReviewSession = {
     words: [...words],
     queue: [...words],
     fullBatchSpelling: true,
@@ -99,6 +106,8 @@ export function makeMiniFlowSpelling(words: MiniWord[]): MiniReviewSession {
     spellingState: 'awaitingFirst',
     spellingDraft: '',
   };
+  startSpellingRound(session, words, 1, undefined, seed);
+  return session;
 }
 
 export function makeMiniFlow(
@@ -107,11 +116,17 @@ export function makeMiniFlow(
   at: number,
   timezone: string,
 ): MiniFlow {
-  const remaining = Math.max(0, options.dailyNewGoal - (options.completedToday ?? 0));
+  const remaining = Math.max(
+    0,
+    (options.extraGroupTarget ?? options.dailyNewGoal) - (options.completedToday ?? 0),
+  );
   return {
     version: 'sliding-window-v2',
     targetDate: dateAt(at, timezone),
     dailyNewGoal: options.dailyNewGoal,
+    ...(options.extraGroupTarget === undefined
+      ? {}
+      : { extraGroupTarget: options.extraGroupTarget }),
     completedBeforeRun: options.completedToday ?? 0,
     groupSize: options.groupSize,
     candidates: candidates.slice(0, remaining + 5),
@@ -137,7 +152,7 @@ export function miniFlowCompletedToday(flow: MiniFlow, at: number, timezone: str
 function remainingFlow(flow: MiniFlow) {
   return Math.max(
     0,
-    flow.dailyNewGoal -
+    (flow.extraGroupTarget ?? flow.dailyNewGoal) -
       flow.completedBeforeRun -
       flow.completed.filter((item) => item.date === flow.targetDate).length,
   );
@@ -200,7 +215,10 @@ export function resumeMiniFlow(
 ) {
   const flow = day.flow;
   requireFlow(flow);
-  flow.targetDate = dateAt(at, timezone);
+  const date = dateAt(at, timezone);
+  if (day.archivedAt !== undefined || flow.targetDate !== date)
+    throw new LearningError('MINI_PLAN_CONFLICT', '已进入新的一天，请开始今天的学习。');
+  if (options.extraGroupTarget !== undefined) flow.extraGroupTarget = options.extraGroupTarget;
   flow.dailyNewGoal = options.dailyNewGoal;
   flow.groupSize = options.groupSize;
   flow.completedBeforeRun = Math.max(
@@ -230,14 +248,17 @@ export function resumeMiniFlow(
     }
   }
   if (flow.goalReached) {
-    day.paused = true;
+    if (day.phase !== 'review') day.paused = true;
     return;
   }
-  if (day.phase === 'learning' && !day.learning) {
+  if (day.phase === 'review' || (day.phase === 'learning' && !day.learning)) {
     flow.groupTarget = Math.max(
       flow.groupWords.length,
-      Math.min(flow.groupSize, remainingFlow(flow)),
+      flow.extraGroupTarget === undefined
+        ? Math.min(flow.groupSize, remainingFlow(flow))
+        : remainingFlow(flow),
     );
+    if (day.phase === 'review') return;
     if (
       flow.groupWords.length >= flow.groupTarget &&
       flow.groupWords.length > 0 &&
@@ -248,11 +269,11 @@ export function resumeMiniFlow(
   }
 }
 
-function freezeMiniFlowGroup(day: MiniDay, at: number) {
+function freezeMiniFlowGroup(day: MiniDay, at: number, seed?: string) {
   const flow = day.flow;
   requireFlow(flow && flow.groupWords.length > 0);
   flow.window.visit = null;
-  day.learning = makeMiniFlowSpelling(flow.groupWords);
+  day.learning = makeMiniFlowSpelling(flow.groupWords, seed);
   for (const word of flow.groupWords) {
     flow.translationWords.push(word);
     day.directions.push(
@@ -276,10 +297,22 @@ export function currentMiniWindow(day: MiniDay): MiniWindow | undefined {
 
 export type MiniWindowAction = Extract<
   MiniAction,
-  { type: 'window_choose' | 'window_correct' | 'window_advance' | 'window_draft' }
+  {
+    type:
+      'window_choose' | 'window_correct' | 'window_advance' | 'window_familiar' | 'window_draft';
+  }
 >;
 
-export function applyMiniWindowAction(day: MiniDay, action: MiniWindowAction, at: number) {
+function readyForSpelling(event: MiniWindowEvent) {
+  return event.selfReportedFamiliar === true || (event.remembered && event.stage === 2);
+}
+
+export function applyMiniWindowAction(
+  day: MiniDay,
+  action: MiniWindowAction,
+  at: number,
+  requestId?: string,
+) {
   const window = currentMiniWindow(day);
   const visit = window?.visit;
   requireFlow(
@@ -297,6 +330,12 @@ export function applyMiniWindowAction(day: MiniDay, action: MiniWindowAction, at
       day.sentences.some((sentence) => same(sentence.word, visit.word)),
     '请先准备当前词的例句。',
   );
+  const familiar = action.type === 'window_familiar';
+  if (familiar)
+    requireFlow(
+      day.phase === 'learning' && visit.stage === 0 && visit.initial === undefined,
+      '只能在新词的完整词卡上标记已认识。',
+    );
   if ('draft' in action && action.draft !== undefined) visit.draft = action.draft;
   if (action.type === 'window_draft') return;
   if (action.type === 'window_choose') {
@@ -311,16 +350,27 @@ export function applyMiniWindowAction(day: MiniDay, action: MiniWindowAction, at
     visit.correctedAt = at;
     return;
   }
+  if (action.type === 'window_advance' && action.markWrong) {
+    requireFlow(
+      visit.stage > 0 &&
+        visit.initial === true &&
+        visit.correctedAt === undefined &&
+        action.remembered === undefined,
+    );
+    visit.correctedAt = at;
+  }
+  const initial = familiar ? true : action.remembered;
   if (visit.stage === 0 && visit.initial === undefined) {
-    requireFlow(action.remembered !== undefined);
-    visit.initial = action.remembered;
+    requireFlow(initial !== undefined);
+    visit.initial = initial;
     visit.selectedAt = at;
     visit.revealedAt = at;
-  } else requireFlow(action.remembered === undefined, '请在展开后核对，再确认下一词。');
+  } else requireFlow(initial === undefined, '请在展开后核对，再确认下一词。');
   requireFlow(visit.initial !== undefined && visit.selectedAt !== undefined);
   const remembered = visit.initial && visit.correctedAt === undefined;
   const event: MiniWindowEvent = {
     ...visit,
+    ...(familiar ? { selfReportedFamiliar: true } : {}),
     remembered,
     confirmedAt: at,
     sequence: ++window.sequence,
@@ -330,7 +380,7 @@ export function applyMiniWindowAction(day: MiniDay, action: MiniWindowAction, at
   requireFlow(member);
   window.visit = null;
   member.lastVisit = window.sequence;
-  const completed = remembered && member.stage === 2;
+  const completed = readyForSpelling(event);
   if (completed) window.members = window.members.filter((item) => !same(item.word, visit.word));
   else member.stage = remembered ? member.stage + 1 : 0;
   if (!remembered) window.forceUnseen = true;
@@ -351,10 +401,8 @@ export function applyMiniWindowAction(day: MiniDay, action: MiniWindowAction, at
       added ??= word;
     }
     if (window.members.length === 0) {
-      session.phase = 'spelling';
-      session.queue = [...session.words];
-      session.spellingDraft = '';
-    } else selectMiniWindowVisit(window, at, completed ? added : undefined);
+      startSpellingRound(session, session.words, 1, undefined, requestId);
+    } else selectMiniWindowVisit(window, at, completed ? added : undefined, requestId);
     return;
   }
   const flow = day.flow;
@@ -363,17 +411,17 @@ export function applyMiniWindowAction(day: MiniDay, action: MiniWindowAction, at
     day.studiedWords.push({ word: visit.word, at });
   }
   if (flow.groupWords.length >= flow.groupTarget && flow.groupWords.length > 0) {
-    freezeMiniFlowGroup(day, at);
+    freezeMiniFlowGroup(day, at, requestId);
     return;
   }
   if (completed) {
     const added = fillLearningWindow(day, at);
     if (window.members.length === 0) {
-      freezeMiniFlowGroup(day, at);
+      freezeMiniFlowGroup(day, at, requestId);
       return;
     }
-    selectMiniWindowVisit(window, at, added);
-  } else selectMiniWindowVisit(window, at);
+    selectMiniWindowVisit(window, at, added, requestId);
+  } else selectMiniWindowVisit(window, at, undefined, requestId);
 }
 
 export function finishMiniFlowGroup(day: MiniDay, at: number) {
@@ -394,6 +442,7 @@ export function finishMiniFlowGroup(day: MiniDay, at: number) {
   flow.groupIndex += 1;
   flow.groupStartedAt = at;
   flow.groupWords = [];
+  delete flow.extraGroupTarget;
   flow.groupTarget = Math.min(flow.groupSize, remainingFlow(flow));
   delete day.learning;
   delete day.learningFinishedAt;
@@ -404,7 +453,11 @@ export function finishMiniFlowGroup(day: MiniDay, at: number) {
   } else beginMiniFlowLearning(day, at);
 }
 
-export function validateMiniWindow(window: MiniWindow, allowed: MiniWord[]) {
+export function validateMiniWindow(
+  window: MiniWindow,
+  allowed: MiniWord[],
+  session: 'learning' | 'review',
+) {
   requireFlow(window.sequence === window.events.length, '窗口访问序号不一致。');
   requireFlow(
     new Set(window.members.map((item) => key(item.word))).size === window.members.length,
@@ -442,9 +495,17 @@ export function validateMiniWindow(window: MiniWindow, allowed: MiniWord[]) {
         event.remembered === (event.initial && event.correctedAt === undefined),
       '窗口初选或核对事实不完整。',
     );
+    if (event.selfReportedFamiliar)
+      requireFlow(
+        session === 'learning' &&
+          event.stage === 0 &&
+          event.remembered &&
+          event.selectedAt === event.confirmedAt,
+        '已认识标记须对应新词完整词卡上的一次明确选择。',
+      );
     const next = event.remembered ? event.stage + 1 : 0;
     progress.set(identity, next);
-    if (next === 3) passed.add(identity);
+    if (readyForSpelling(event)) passed.add(identity);
     lastConfirmation = event.confirmedAt;
   }
   for (const member of window.members) {
@@ -496,8 +557,8 @@ export function validateMiniFlowDay(
       new Set(flow.candidates.map(key)).size === flow.candidates.length,
     '候选池进度无效。',
   );
-  validateMiniWindow(flow.window, day.learningWords);
-  const passed = flow.window.events.filter((event) => event.remembered && event.stage === 2);
+  validateMiniWindow(flow.window, day.learningWords, 'learning');
+  const passed = flow.window.events.filter(readyForSpelling);
   const allGroups = [...flow.groups.flatMap((group) => group.words), ...flow.groupWords];
   const passedKeys = new Set(passed.map((event) => key(event.word)));
   requireFlow(

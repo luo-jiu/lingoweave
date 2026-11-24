@@ -15,7 +15,7 @@ struct MiniDailyStudyTests {
 
     static func main() throws {
         let tests = MiniDailyStudyTests()
-        tests.testPlanKeepsUnfinishedDayAndFreezesCohort()
+        tests.testPlanRestartsOnANewDateAndFreezesTodaysCohort()
         tests.testLearningRequiresCanonicalSentenceAndActualStudy()
         try tests.testPendingTranslationAndFeedbackSurviveRelaunch()
         tests.testDueWindowsUseFirstAnswersAndReuseCanonicalSentences()
@@ -26,11 +26,60 @@ struct MiniDailyStudyTests {
         tests.testTodayActivityWaitsForTheFinalMemoryRound()
         try tests.testSentenceHighlightsWholeWordsAndInflections()
         try tests.testWindowDotsReflectTheCurrentAnswer()
-        print("11 daily study behavior tests passed.")
+        tests.testImmediateWindowTraceThroughFirstSpelling()
+        print("12 daily study behavior tests passed.")
     }
 
     private func expect(_ condition: Bool, _ explanation: String, file: StaticString = #file, line: UInt = #line) {
         precondition(condition, explanation, file: file, line: line)
+    }
+
+    private func testImmediateWindowTraceThroughFirstSpelling() {
+        let at = date(1)
+        let words = (0..<15).map { MiniWord(spelling: "word\($0)", meaning: "义项\($0)") }
+        var ledger = MiniDailyLedger()
+        var day = ledger.beginOrResume(deck: words, at: at, calendar: calendar)
+        var window = MiniMemoryWindow(version: "interleaved-v2", size: 5, gap: 3, members: [], visit: nil,
+                                      events: [], sequence: 0, forceUnseen: false)
+        for word in words.prefix(5) { window.admit(word, at: at) }
+        window.selectNext(id: UUID(), preferred: nil, at: at)
+        day.learning = nil
+        day.flow = MiniLearningFlow(version: "sliding-window-v2", targetDate: day.id, dailyNewGoal: 10, completedBeforeRun: 0,
+                                   groupSize: 5, candidates: words, candidateIndex: 5, window: window, groupId: UUID(),
+                                   groupIndex: 1, groupStartedAt: at, groupTarget: 5, groupWords: [], translationWords: [],
+                                   groups: [], completed: [], goalReached: false)
+        expect(day.addSentences(words.map(example)), "Seed the same prepared pool as the service trace")
+        func current() -> MiniMemoryWindow.Visit { guard let visit = day.memoryWindow?.visit else { preconditionFailure() }; return visit }
+        for word in words.prefix(4) {
+            let id = UUID()
+            expect(current().word == word, "Visit unseen words until the first recall gap is reached")
+            expect(day.advanceWindow(visitId: current().id, nextId: id, remembered: true, markWrong: false, familiar: false,
+                                     draft: nil, at: at), "First encounter advances in one action")
+            expect(current().id == id, "The next visit is addressable before any receipt")
+        }
+        let original = current()
+        expect(original.word == words[0] && original.stage == 1, "The fourth unseen word yields to contextual recall")
+        expect(!day.advanceWindow(visitId: original.id, nextId: UUID(), remembered: nil, markWrong: true, familiar: false,
+                                  draft: nil, at: at), "A concealed card cannot be corrected")
+        var chosen = original
+        chosen.initial = true; chosen.selectedAt = at; chosen.revealedAt = at
+        expect(day.updateWindowVisit(chosen), "Expose an unacknowledged recalled card")
+        expect(day.advanceWindow(visitId: original.id, nextId: UUID(), remembered: nil, markWrong: true, familiar: false,
+                                 draft: nil, at: at), "A correction and advance are one input")
+        let event = day.flow?.window.events.last
+        expect(event?.id == original.id && event?.initial == true && event?.remembered == false && event?.correctedAt == at,
+               "Keep the original choice as well as the confirmed correction")
+        expect(day.flow?.window.members.first(where: { $0.word == words[0] })?.stage == 0, "The corrected word returns to stage zero")
+        let seed = UUID(uuidString: "12345678-9abc-4def-8000-000000000001")!
+        for index in 4..<9 {
+            expect(current().word == words[index], "Each new spare is selected immediately")
+            expect(day.advanceWindow(visitId: current().id, nextId: index == 8 ? seed : UUID(), remembered: nil, markWrong: false,
+                                     familiar: true, draft: nil, at: at), "Familiar skips memory only")
+        }
+        expect(day.learning?.spellingRounds == [.init(round: 1, order: [2, 4, 3, 0, 1])] && day.learning?.currentWord == words[6],
+               "Window completion shows the exact first spelling prompt and permutation published by the service")
+        expect(day.flow?.groupWords == Array(words[4..<9]) && day.flow?.translationWords == Array(words[4..<9]),
+               "Spelling shuffles independently of translation order")
     }
 
     private func testWindowDotsReflectTheCurrentAnswer() throws {
@@ -114,7 +163,7 @@ struct MiniDailyStudyTests {
         }
     }
 
-    private func testPlanKeepsUnfinishedDayAndFreezesCohort() {
+    private func testPlanRestartsOnANewDateAndFreezesTodaysCohort() {
         let deck = MiniWord.starter.dropFirst()
         let duplicate = MiniWord(spelling: "APPLE", meaning: apple.meaning, phonetic: "other IPA")
         var ledger = MiniDailyLedger()
@@ -123,9 +172,13 @@ struct MiniDailyStudyTests {
         expect(initial.review == nil && initial.phase == .learning, "Unseen words never enter the initial review")
         expect(initial.learningWords.count == 5 && initial.learningWords.filter { $0.spelling.lowercased() == "apple" }.count == 1, "Learning cohort is capped and pronunciation variants do not duplicate a target")
         ledger.days[0].setPaused(true, at: date(1))
-        let resumed = ledger.beginOrResume(deck: [water], at: date(2), calendar: calendar)
-        expect(resumed.id == initial.id && resumed.paused, "Incomplete paused day survives the local midnight")
+        let resumed = ledger.beginOrResume(deck: [water], at: date(1), calendar: calendar)
+        expect(resumed.id == initial.id && resumed.paused, "A pause earlier today keeps the current group")
         expect(resumed.learningWords == initial.learningWords && ledger.days.count == 1, "Deck edits never change a started cohort")
+
+        let fresh = ledger.beginOrResume(deck: [water], at: date(2), calendar: calendar)
+        expect(fresh.id != initial.id && fresh.nextUnstudiedWord == water && ledger.days.count == 2,
+               "A new local date starts the current deck from a full word card")
 
         var empty = MiniDailyLedger()
         let noGloss = MiniWord(spelling: "door", meaning: " ")
@@ -184,6 +237,9 @@ struct MiniDailyStudyTests {
         expect(activity.learnedWords == 1, "Today's studied words use normalized spelling and meaning across groups")
         expect(activity.reviewedWords == 1, "Repeated judgments and spelling attempts count as one reviewed word")
         expect(activity.writingAnswers == 1, "Today's submitted answer counts once by its durable attempt identity before feedback")
+        let byDay = MiniTodayActivity.byDay(ledger: ledger, from: date(1, hour: 0), through: now, calendar: calendar)
+        expect(byDay[date(4, hour: 0)] == activity, "The historical date bucket uses the same deduplicated counts as today")
+        expect(byDay[date(3, hour: 0)] == nil, "Opening the group on a previous day does not move later review activity to that day")
     }
 
     private func testTodayActivityUsesTheCalendarAndIgnoresFutureEvents() {
@@ -197,12 +253,31 @@ struct MiniDailyStudyTests {
         let now = date(4)
         expect(MiniTodayActivity(ledger: ledger, now: now, calendar: calendar).learnedWords == 1,
                "Today's local midnight is included while yesterday and later today are excluded")
+        let byDay = MiniTodayActivity.byDay(ledger: ledger, from: date(3, hour: 0), through: now, calendar: calendar)
+        expect(byDay[date(3, hour: 0)]?.learnedWords == 1 && byDay[date(4, hour: 0)]?.learnedWords == 1,
+               "Each local-day bucket includes only the learning activity that has actually happened on that date")
+        expect(byDay[date(4, hour: 0)]?.completedNewWords == nil,
+               "A legacy-only ledger continues to provide the saved study marks as its fallback")
         var utc = Calendar(identifier: .gregorian)
         utc.timeZone = TimeZone(secondsFromGMT: 0)!
         expect(MiniTodayActivity(ledger: ledger, now: now, calendar: utc).learnedWords == 0,
                "The supplied plan calendar decides which local date each event belongs to")
         expect(MiniTodayActivity(ledger: ledger, now: date(5), calendar: calendar).learnedWords == 0,
                "A group with historical progress does not create activity on a later day")
+
+        let window = MiniMemoryWindow(version: "interleaved-v2", size: 5, gap: 3, members: [], visit: nil,
+                                      events: [], sequence: 0, forceUnseen: false)
+        let completion = MiniLearningFlow.Completion(word: apple, attemptId: UUID(), at: date(3, hour: 23),
+                                                     date: "2026-11-03")
+        day.flow = MiniLearningFlow(version: "sliding-window-v2", targetDate: day.id, dailyNewGoal: 3, completedBeforeRun: 0,
+                                   groupSize: 3, candidates: [apple, book, water], candidateIndex: 3, window: window,
+                                   groupId: UUID(), groupIndex: 1, groupStartedAt: date(1), groupTarget: 3,
+                                   groupWords: [], translationWords: [], groups: [], completed: [completion], goalReached: false)
+        ledger.days[0] = day
+        let completed = MiniTodayActivity.byDay(ledger: ledger, from: date(3, hour: 0), through: now, calendar: calendar)
+        expect(completed[date(3, hour: 0)]?.completedNewWords == 1 &&
+               completed[date(4, hour: 0)]?.completedNewWords == 0,
+               "Modern heatmap counts use the actual completion date and exclude unconfirmed study marks")
     }
 
     private func testTodayActivityWaitsForTheFinalMemoryRound() {
@@ -256,6 +331,20 @@ struct MiniDailyStudyTests {
         loaded.setPaused(false, at: date(1))
         expect(loaded.pauseEvents?.map(\.paused) == [true, false], "Pause and resume are durable facts")
         expect(loaded.advanceTranslation(at: date(1)), "Continue only after feedback")
+        let previousId = loaded.translation[0].taskID
+        expect(loaded.translationPageIndex(selection: previousId) == 0
+               && loaded.translationTask(at: 0)?.id == previousId && loaded.currentTranslation?.id != previousId,
+               "Reviewing a submitted translation keeps the active question in place")
+        expect(loaded.translationPageIndex(selection: "another-day/0") == loaded.translationIndex
+               && loaded.translationTask(at: loaded.translationIndex + 1) == nil,
+               "Navigation is scoped to reached questions in this group")
+        let oldDraft = MiniTranslationAttempt.draftKey(taskId: previousId, revision: id)
+        guard let nextId = loaded.currentTranslation?.id else { preconditionFailure("Missing next translation") }
+        let activeDraft = MiniTranslationAttempt.draftKey(taskId: nextId)
+        expect(loaded.pendingTranslationEdit(in: [oldDraft: "新译文", activeDraft: "下一题草稿"]) == 0
+               && loaded.pendingTranslationEdit(in: [oldDraft: raw, activeDraft: "下一题草稿"]) == nil,
+               "Pending changes to a previous answer remain distinct from the current unfinished draft")
+
         expect(loaded.currentTranslation?.direction == .chineseToEnglish, "Alternate direction across different sentences")
         expect(!loaded.gradeTranslation(id: id, feedback: correct, at: date(1), calendar: calendar), "Ignore callbacks for past exercises")
         expect(loaded.scheduleUpdates == updates, "Advancing does not repeat schedule writes")

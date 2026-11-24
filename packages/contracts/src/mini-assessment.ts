@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { miniAiEffortSchema, miniAiSelectionSchema } from './mini-ai-selection.js';
 
 const uuid = z.uuid().toLowerCase();
 const at = z.number().finite();
@@ -38,6 +39,8 @@ export const miniAssessmentSourceSchema = z
     // JSON values allow old and new flow versions to keep their original evidence.
     learningEvidence: z.record(z.string(), z.json()),
     discussion: z.array(miniAssessmentDiscussionSchema).default([]),
+    // Optional to preserve the original evidence hash of older queued and completed jobs.
+    aiSelection: miniAiSelectionSchema.optional(),
   })
   .strict();
 export type MiniAssessmentSource = z.infer<typeof miniAssessmentSourceSchema>;
@@ -53,10 +56,42 @@ export const miniAssessmentObservationSchema = z
     evidenceIds: z.array(z.string().min(1).max(200)).max(30),
   })
   .strict();
+export const miniExpressionGradeSchema = z
+  .enum(['natural', 'understandable', 'off_meaning'])
+  .describe(
+    'For englishToChinese use ONLY natural (whole meaning correct, even in informal Chinese) or off_meaning (material meaning error). Ignore inconsequential punctuation and stylistic preferences. For chineseToEnglish, natural: faithful and idiomatic, including valid alternative phrasing. understandable: conveys the main idea but a concrete wording or accuracy improvement matters. off_meaning: an essential idea is changed, missing or unintelligible. This learner-facing grade has no scheduling effect.',
+  );
+export type MiniExpressionGrade = z.infer<typeof miniExpressionGradeSchema>;
+export const miniExpressionBatchSchema = z
+  .object({
+    grades: z
+      .array(
+        z
+          .object({
+            attemptId: uuid,
+            expressionGrade: miniExpressionGradeSchema,
+            meaningComment: z
+              .string()
+              .trim()
+              .min(1)
+              .max(1500)
+              .optional()
+              .describe(
+                'Required for English to Chinese. Give a fresh brief Chinese comment on the meaning, pointing out a specific semantic discrepancy only if present.',
+              ),
+          })
+          .strict(),
+      )
+      .min(1)
+      .max(20),
+  })
+  .strict();
+
 export const miniAssessmentResultSchema = z
   .object({
     sourceId: uuid,
     inputHash: z.string().regex(/^[a-f0-9]{64}$/),
+    expressionGrade: miniExpressionGradeSchema.optional(),
     meaning: miniAssessmentObservationSchema,
     spelling: miniAssessmentObservationSchema,
     usage: miniAssessmentObservationSchema,
@@ -64,6 +99,16 @@ export const miniAssessmentResultSchema = z
     strengths: z.array(z.string().max(1000)).max(10),
     improvements: z.array(z.string().max(1000)).max(10),
     referenceTranslation: z.string().max(6000),
+    reusablePhrase: z
+      .object({
+        expression: z.string().trim().min(1).max(300),
+        explanation: z.string().trim().min(1).max(800),
+      })
+      .strict()
+      .optional()
+      .describe(
+        'When this translation illustrates a reusable English expression, give one natural expression from the question or your feedback and its Chinese meaning. Omit when none is worth revisiting. Do not include private details or quote a learner error as a model.',
+      ),
     uncertainties: z
       .array(z.string().max(1000))
       .max(10)
@@ -77,7 +122,7 @@ export type MiniAssessmentResult = z.infer<typeof miniAssessmentResultSchema>;
 export const miniAssessmentTraceSchema = z
   .object({
     model: z.string(),
-    effort: z.literal('xhigh'),
+    effort: miniAiEffortSchema,
     threadId: z.string().nullable(),
     rulesVersion: z.literal('mini-assessment-v1'),
     skillHash: z.string().regex(/^[a-f0-9]{64}$/),
@@ -147,6 +192,31 @@ export const miniAssessmentDetailSchema = z
   .strict();
 export type MiniAssessmentDetail = z.infer<typeof miniAssessmentDetailSchema>;
 export const miniAssessmentRetrySchema = z.object({ requestId: uuid, jobId: uuid }).strict();
+const feedbackPoints = z.array(z.string().trim().min(1).max(1000)).max(10);
+// Apply requirements for learner-facing text only to new submissions. Older saved
+// assessments retain their original content and evidence hashes when reopened.
 export const miniAssessmentCommitSchema = z
-  .object({ requestId: uuid, result: miniAssessmentResultSchema })
+  .object({
+    requestId: uuid,
+    result: miniAssessmentResultSchema.safeExtend({
+      expressionGrade: miniExpressionGradeSchema,
+      summary: miniAssessmentResultSchema.shape.summary.describe(
+        'Brief Chinese feedback addressed to the learner about this translation. Keep scores, scheduling evidence and adoption decisions out of the learner-facing fields.',
+      ),
+      strengths: feedbackPoints.describe(
+        'Quote a phrase from the submitted answer and explain in Chinese what it conveys well. May be empty.',
+      ),
+      improvements: feedbackPoints.describe(
+        'For correct English-to-Chinese answers submit an empty array. For an off-meaning translation explain the actual change of meaning. For Chinese-to-English, suggest a specific correction or optional more natural expression when helpful.',
+      ),
+      referenceTranslation: z
+        .string()
+        .trim()
+        .min(1)
+        .max(6000)
+        .describe(
+          'One complete natural translation in the requested target language. An already natural answer can be kept.',
+        ),
+    }),
+  })
   .strict();

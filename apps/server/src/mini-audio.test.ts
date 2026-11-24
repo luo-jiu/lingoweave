@@ -172,20 +172,32 @@ test('word synthesis sends the exact spelling with its recorded short-word param
   assert.equal(cached.asset?.profile.generationVersion, 'v1/word-2');
 });
 
-test('a valid WAV containing an excessively long word never becomes the current asset', async (t) => {
+test('rejected word audio retries on the remaining voices and only publishes the accepted attempt', async (t) => {
   const { service, runtime, store } = await fixture(t);
   runtime.behavior = (input) => writeFile(input.outputFile, wave(12.4));
-  const result = await service.request(request());
+  const input = request();
+  const result = await service.request(input);
   assert.ok(result.job);
   const failed = await settled(service, result.job.id);
   assert.equal(failed.status, 'failed');
   assert.match(failed.error ?? '', /单词音频/);
   assert.equal(store.assets().length, 0);
   assert.equal((await service.lookup(target)).asset, null);
+  assert.equal((await service.request(input)).job?.id, failed.id);
+  assert.equal(runtime.calls.length, 1);
+  const second = await service.request(request());
+  assert.ok(second.job && second.job.id !== failed.id);
+  assert.equal((await settled(service, second.job.id)).status, 'failed');
   runtime.behavior = null;
   const retry = await service.request(request());
   assert.ok(retry.job);
   assert.equal((await settled(service, retry.job.id)).status, 'completed');
+  assert.deepEqual(
+    runtime.calls.map((call) => call.voice),
+    ['ryan', 'aiden', 'serena'],
+  );
+  assert.equal((await service.request(request())).asset?.id, retry.job.id);
+  assert.equal((await service.request(input)).job?.status, 'failed');
   assert.equal(store.assets().length, 1);
 });
 
@@ -219,8 +231,8 @@ test('usable legacy words and sentence caches survive while overlong legacy word
       request({ target }),
       targetKey,
       { target, profile, text, normalizedText: text, instructions },
-      'ryan',
       null,
+      () => 0,
     );
     assert.ok(saved.result.job);
     const id = saved.result.job.id,
@@ -301,13 +313,13 @@ test('regeneration retains the old current asset until a valid replacement is co
   assert.equal((await service.lookup(target)).asset?.id, original.asset.id);
   assert.equal((await service.file(original.asset.id)).asset.voice, 'ryan');
   runtime.behavior = null;
-  const replacement = await service.request(request({ operation: 'regenerate', voice: 'serena' }));
+  const replacement = await service.request(request({ operation: 'regenerate', voice: 'aiden' }));
   assert.ok(replacement.job);
   await settled(service, replacement.job.id);
   const current = await service.lookup(target);
   assert.ok(current.asset);
   assert.notEqual(current.asset.id, original.asset.id);
-  assert.equal(current.asset.voice, 'serena');
+  assert.equal(current.asset.voice, 'aiden');
   assert.equal(store.assets().length, 2);
   assert.deepEqual((await service.file(original.asset.id)).data, wave());
 });
@@ -435,7 +447,6 @@ test('audio snapshots survive reopening; unfinished jobs recover without automat
     input,
     'unfinished',
     { profile, text: 'book', normalizedText: 'book', instructions: 'read', target: input.target },
-    'ryan',
     null,
   );
   runtime = new FakeRuntime();

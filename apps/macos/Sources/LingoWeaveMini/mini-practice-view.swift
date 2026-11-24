@@ -3,14 +3,13 @@ import SwiftUI
 struct MiniDictationPracticeView: View {
     let practice: MiniDictation
     @Binding var draft: String
-    let saving: Bool
     let submit: (String) -> Void
     let reveal: () -> Void
     let close: () -> Void
-    var playWord: (MiniWord) -> Void = { _ in }
     @State private var hiddenAttemptCount = 0
     @State private var showingReference = false
     @State private var focusRequest = 0
+    @Environment(\.miniStudyAppearance) private var appearance
 
     private var attempt: MiniDictationAttempt? {
         practice.attempts.count > hiddenAttemptCount ? practice.attempts.last : nil
@@ -21,9 +20,11 @@ struct MiniDictationPracticeView: View {
     var body: some View {
         VStack(spacing: 8) {
             HStack {
-                Text("草稿拼写").font(.caption).foregroundStyle(.secondary)
+                Text("Scratchpad").font(.caption).foregroundStyle(.secondary)
+                    .accessibilityLabel("草稿拼写")
                 Spacer()
-                Button("退出拼写", action: close).font(.caption)
+                MiniStudyIconButton(title: "退出拼写", systemImage: "xmark", action: close)
+                    .font(.caption)
                     .accessibilityIdentifier("closeScratchpad")
             }
             GeometryReader { area in
@@ -33,29 +34,32 @@ struct MiniDictationPracticeView: View {
                         VStack(spacing: 2) {
                             ReviewAnswerField(text: $draft, selectOnFocus: attempt?.correct == false,
                                 onSubmit: { answer in
-                                    guard !saving else { return false }
                                     if accepted { repeatSpelling() } else { submitAnswer(answer) }
                                     return false
-                                }, accepted: accepted, incorrect: incorrect, inputLocked: saving, focusRequest: focusRequest)
+                                }, accepted: accepted, incorrect: incorrect, focusRequest: focusRequest)
                                 .frame(height: 30)
                                 .accessibilityIdentifier("singleCardAnswer")
                             Divider()
                         }.frame(width: 206)
                         let referenceVisible = attempt?.correct == false || showingReference
-                        Text(practice.word.spelling).font(.callout).foregroundStyle(.secondary)
-                            .frame(height: 18)
-                            .opacity(referenceVisible ? 1 : 0)
-                            .accessibilityHidden(!referenceVisible)
-                            .accessibilityIdentifier("singleCardRevealedAnswer")
+                        ZStack {
+                            Text(practice.word.spelling).font(.callout).foregroundStyle(.secondary)
+                                .opacity(referenceVisible ? 1 : 0)
+                                .accessibilityHidden(!referenceVisible)
+                                .accessibilityIdentifier("singleCardRevealedAnswer")
+                            if appearance.isSimple, accepted, !referenceVisible {
+                                Image(systemName: "checkmark.circle").foregroundStyle(.secondary)
+                                    .accessibilityLabel("拼写正确")
+                            }
+                        }.frame(height: 18)
                         HStack(spacing: 12) {
                             if accepted || showingReference {
-                                Button("再拼一次", action: repeatSpelling)
+                                MiniStudyIconButton(title: "再拼一次", systemImage: "arrow.clockwise", action: repeatSpelling)
                                     .accessibilityIdentifier("repeatScratchpad")
                             } else {
-                                Button("比对") { submitAnswer() }
+                                MiniStudyIconButton(title: "比对", systemImage: "checkmark", prominent: true) { submitAnswer() }
                                     .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                                Button("看答案") {
-                                    guard !saving else { return }
+                                MiniStudyIconButton(title: "看答案", systemImage: "eye") {
                                     showingReference = true
                                     reveal()
                                 }
@@ -66,21 +70,19 @@ struct MiniDictationPracticeView: View {
                 }
             }
         }
-        .allowsHitTesting(!saving)
         .accessibilityIdentifier("singleCardPractice")
-        .onChange(of: practice.attempts.last?.id) { previous, current in
-            if let current, current != previous { playWord(practice.word) }
+        .onChange(of: practice.attempts.count) { _, count in
+            hiddenAttemptCount = min(count, hiddenAttemptCount)
         }
     }
 
     private func submitAnswer(_ answer: String? = nil) {
         let value = answer ?? draft
-        guard !saving, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        guard !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         submit(value)
     }
 
     private func repeatSpelling() {
-        guard !saving else { return }
         hiddenAttemptCount = practice.attempts.count
         showingReference = false
         draft = ""
@@ -97,38 +99,60 @@ struct MiniIndependentProbeView: View {
     let reveal: () -> Void
     let end: () -> Void
     let close: () -> Void
+    @Environment(\.miniStudyAppearance) private var appearance
     private var cards: [MiniMemoryCard] { scheduling?.orderedCards.filter { MiniProbePrompt.text(for: $0.word) != nil } ?? [] }
 
     var body: some View {
-        ScrollView {
-            VStack(spacing: 10) {
-                HStack {
-                    Text("独立拼写检验").font(.headline)
-                    Spacer(minLength: 4)
-                    Button(scheduling?.activeProbe == nil ? "返回" : "退出检验", action: close)
-                    .font(.caption)
-                }
-                if let probe = scheduling?.activeProbe {
-                    attempt(probe)
-                } else if !cards.isEmpty {
-                    Text("按中文回忆英文拼写").font(.caption).foregroundStyle(.secondary)
-                    ForEach(cards.prefix(20)) { card in
-                        Button { begin(card.word) } label: {
-                            HStack {
-                                Text(MiniProbePrompt.text(for: card.word) ?? "").multilineTextAlignment(.leading)
-                                Spacer(minLength: 5)
-                                Text(card.dueAt, style: .relative).font(.caption2).foregroundStyle(.secondary)
-                            }
-                            .padding(.vertical, 4)
-                        }
-                        .buttonStyle(.borderless)
-                    }
-                } else {
-                    Text("有中文释义的学习词卡会出现在这里。").font(.callout).foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                }
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Label("Spelling check", systemImage: "pencil.line").font(.headline)
+                    .accessibilityLabel("独立拼写检验")
+                Spacer(minLength: 4)
+                let active = scheduling?.activeProbe != nil
+                MiniStudyIconButton(title: active ? "退出检验" : "返回", systemImage: active ? "xmark" : "arrow.left",
+                                    action: close).font(.caption)
             }
-            .padding(.vertical, 6)
+            Divider()
+            if let probe = scheduling?.activeProbe {
+                ScrollView {
+                    attempt(probe)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 6)
+                }
+            } else if !cards.isEmpty {
+                HStack {
+                    Text("Word")
+                    Spacer()
+                    Text("Suggested time")
+                }
+                .font(.caption).foregroundStyle(.secondary)
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        ForEach(cards.prefix(20)) { card in
+                            Button { begin(card.word) } label: {
+                                HStack(spacing: 6) {
+                                    Text(MiniProbePrompt.text(for: card.word) ?? "")
+                                        .multilineTextAlignment(.leading)
+                                    Spacer(minLength: 3)
+                                    Text(card.suggestedProbeAt, style: .relative)
+                                        .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                                        .environment(\.locale, Locale(identifier: "en_US"))
+                                    Image(systemName: "chevron.right")
+                                        .font(.caption2).foregroundStyle(.tertiary).accessibilityHidden(true)
+                                }
+                                .padding(.vertical, 7).contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            Divider()
+                        }
+                    }
+                }
+            } else {
+                Text("No words available")
+                    .font(.callout).foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
         }
         .disabled(saving)
         .accessibilityIdentifier("independentSpellingProbe")
@@ -136,39 +160,42 @@ struct MiniIndependentProbeView: View {
 
     private func attempt(_ probe: MiniProbe) -> some View {
         VStack(spacing: 10) {
-            Text(MiniProbePrompt.text(for: probe.word) ?? "暂无可用的中文提示").font(.title3).multilineTextAlignment(.center)
+            Text(MiniProbePrompt.text(for: probe.word) ?? "No clue available").font(.title3).multilineTextAlignment(.center)
                 .accessibilityIdentifier("independentProbePrompt")
             if probe.status == .active, MiniProbePrompt.text(for: probe.word) != nil {
                 ReviewAnswerField(text: $draft, selectOnFocus: false, onSubmit: { answer in submitAnswer(answer); return false })
                     .frame(height: 32)
                     .accessibilityIdentifier("independentProbeAnswer")
-                Button("提交") { submitAnswer() }
+                MiniStudyIconButton(title: "提交", systemImage: "arrow.up", prominent: true) { submitAnswer() }
                     .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
             if let answer = probe.answer {
-                Text("你的答案 \(answer)").font(.callout).textSelection(.enabled)
+                Text(answer).font(.callout).textSelection(.enabled)
+                    .accessibilityLabel("你的答案 \(answer)")
             }
             if let correct = probe.correct {
-                Label(correct ? "拼写正确" : "拼写需要调整", systemImage: correct ? "checkmark.circle" : "arrow.counterclockwise")
-                    .font(.callout).foregroundStyle(correct ? .green : .secondary)
+                Image(systemName: correct ? "checkmark.circle" : "arrow.counterclockwise")
+                    .font(.callout).foregroundStyle(correct && !appearance.isSimple ? Color.green : .secondary)
+                    .accessibilityLabel(correct ? "拼写正确" : "拼写需要调整")
             }
             if let classification = probe.classification {
-                Text(classification.label).font(.callout.weight(.medium))
+                Text(classificationTitle(classification))
+                    .font(.callout.weight(.medium)).accessibilityLabel(classification.label)
                 if let due = probe.dueAt, probe.rating != nil {
-                    Text("下次检验 \(due.formatted(.dateTime.month().day().hour().minute()))")
+                    let date = due.formatted(.dateTime.month().day().hour().minute().locale(Locale(identifier: "en_US")))
+                    Text("Next check \(date)")
                         .font(.caption).foregroundStyle(.secondary)
-                }
-                if classification == .tooSoon {
-                    Text("稍后再检验，期间可以学习其他词。").font(.caption).foregroundStyle(.secondary)
                 }
             }
             if probe.revealedAt != nil {
                 Text(probe.word.spelling).font(.title2.weight(.semibold)).textSelection(.enabled)
                     .accessibilityIdentifier("independentProbeRevealedAnswer")
             } else {
-                Button("揭晓答案", action: reveal).font(.caption)
+                MiniStudyIconButton(title: "揭晓答案", systemImage: "eye", action: reveal).font(.caption)
             }
-            if probe.status == .answered { Button("完成这一词", action: end) }
+            if probe.status == .answered {
+                MiniStudyIconButton(title: "完成这一词", systemImage: "checkmark", prominent: true, action: end)
+            }
         }
     }
 
@@ -176,5 +203,16 @@ struct MiniIndependentProbeView: View {
         let value = answer ?? draft
         guard !saving, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         submit(value)
+    }
+
+    private func classificationTitle(_ classification: MiniMeasurementClassification) -> String {
+        switch classification {
+        case .pendingReview: "Pending"
+        case .unmeasured: "No attempt"
+        case .supported: "Used a hint"
+        case .tooSoon: "Try again later"
+        case .independentSuccess: "Recalled without hints"
+        case .independentFailure: "Needs more practice"
+        }
     }
 }

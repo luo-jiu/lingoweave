@@ -1,8 +1,14 @@
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { MiniStore } from './mini-store.js';
+import { miniAssessmentHash } from './mini-assessment-store.js';
 import {
   miniSnapshotSchema,
+  type MiniAssessmentApplication,
   type MiniDay,
   type MiniWord,
   type MiniWindow,
@@ -15,6 +21,7 @@ import {
   miniCandidates,
   miniPreparationWords,
   miniWritingWords,
+  reachedTranslation,
   resumeMiniFlow,
   swiftTime,
   validateMiniFacts,
@@ -51,9 +58,9 @@ function fixture(goal = 10, groupSize = 5, deck = words) {
     assert.ok(value);
     return value;
   };
-  const act = (action: Action) => {
+  const act = (action: Action, requestId?: string) => {
     now += 1;
-    applyMiniAction(state, action, now, timezone);
+    applyMiniAction(state, action, now, timezone, undefined, requestId);
     validateMiniFacts(state);
     miniSnapshotSchema.parse(state);
   };
@@ -214,6 +221,48 @@ test('v2 interleaves per-word stages, services the unseen fifth word, and waits 
   assert.equal(f.day().learningWords.length, 5);
 });
 
+test('window input identity names its next card; correction, admission and first spelling match the native trace', () => {
+  const f = fixture(10, 5);
+  for (let i = 0; i < 4; i++) {
+    const id = randomUUID();
+    assert.equal(f.visit().word.spelling, `word${i}`);
+    f.act({ ...f.windowCtx(), type: 'window_advance', remembered: true }, id);
+    assert.equal(f.visit().id, id);
+  }
+  assert.equal(f.visit().stage, 1);
+  assert.equal(f.visit().word.spelling, 'word0');
+  assert.throws(() => f.act({ ...f.windowCtx(), type: 'window_advance', markWrong: true }));
+  f.act({ ...f.windowCtx(), type: 'window_choose', remembered: true });
+  const originalVisit = f.visit().id;
+  const id = randomUUID();
+  f.act({ ...f.windowCtx(), type: 'window_advance', markWrong: true }, id);
+  const last = f.day().flow?.window.events.at(-1);
+  assert.equal(last?.id, originalVisit);
+  assert.equal(last?.initial, true);
+  assert.equal(last?.remembered, false);
+  assert.equal(last?.correctedAt, last?.confirmedAt);
+  assert.equal(f.visit().id, id);
+  assert.equal(
+    f.day().flow?.window.members.find((member) => member.word.spelling === 'word0')?.stage,
+    0,
+  );
+  for (let i = 4; i < 9; i++) {
+    assert.equal(f.visit().word.spelling, `word${i}`);
+    const id = i === 8 ? '12345678-9abc-4def-8000-000000000001' : randomUUID();
+    f.act({ ...f.windowCtx(), type: 'window_familiar', session: 'learning' }, id);
+    if (i < 8) assert.equal(f.visit().id, id);
+  }
+  assert.deepEqual(f.day().learning?.spellingRounds, [{ round: 1, order: [2, 4, 3, 0, 1] }]);
+  assert.deepEqual(
+    f.day().learning?.queue.map((word) => word.spelling),
+    ['word6', 'word8', 'word7', 'word4', 'word5'],
+  );
+  assert.deepEqual(
+    f.day().flow?.groupWords.map((word) => word.spelling),
+    ['word4', 'word5', 'word6', 'word7', 'word8'],
+  );
+});
+
 test('v2 cannot advance concealed recall or make a helped initial failure into success', () => {
   const f = fixture();
   for (let i = 0; i < 4; i++) f.memory();
@@ -222,6 +271,19 @@ test('v2 cannot advance concealed recall or make a helped initial failure into s
   assert.throws(() => f.act({ ...f.windowCtx(), type: 'window_advance', remembered: true }));
   f.act({ ...f.windowCtx(), type: 'window_advance' });
   assert.equal(f.day().flow?.window.events.at(-1)?.remembered, false);
+});
+
+test('familiarity applies only to the open initial new-word card before a choice', () => {
+  const f = fixture();
+  const mark = () => f.act({ ...f.windowCtx(), session: 'learning', type: 'window_familiar' });
+  f.act({ ...f.windowCtx(), type: 'window_choose', remembered: true });
+  assert.throws(mark);
+  f.act({ ...f.windowCtx(), type: 'window_advance' });
+  for (let i = 0; i < 3; i++) f.memory();
+  assert.equal(f.visit().stage, 1);
+  assert.throws(mark);
+  assert.equal(f.day().flow?.groupWords.length, 0);
+  assert.ok(f.day().flow?.window.events.every((event) => event.selfReportedFamiliar === undefined));
 });
 
 test('v2 five permanently weak words never free a slot or admit an outside word', () => {
@@ -264,33 +326,46 @@ test('v2 spelling retries only the immediately preceding first failures, pauses 
   f.finishMemory();
   const session = f.day().learning;
   assert.ok(session);
-  const [a, b, c] = session.words;
+  const [a, b, c] = session.queue;
+  assert.deepEqual(new Set(session.queue), new Set(session.words));
+  assert.notDeepEqual(session.queue, session.words);
   assert.ok(a && b && c);
-  f.spell('wrong-a');
+  f.spell('  \t');
+  const blankFirst = session.spellingAttempts.at(-1);
+  assert.equal(session.spellingState, 'correcting');
+  assert.equal(blankFirst?.answer, '  \t');
+  assert.equal(blankFirst?.kind, 'first');
+  assert.equal(blankFirst?.correct, false);
+  assert.equal(blankFirst?.revealedAnswerAt, blankFirst?.submittedAt);
+  assert.throws(() => f.spell('  \t'));
   f.spell(a.spelling);
   f.advanceSpell();
   f.spell();
   assert.equal(session.spellingState, 'readyToAdvance');
   f.advanceSpell();
   f.spell('wrong-c');
+  f.spell('');
+  assert.equal(session.spellingAttempts.at(-1)?.kind, 'correction');
+  assert.equal(session.spellingAttempts.at(-1)?.encounter, 1);
   f.spell(c.spelling);
   f.advanceSpell();
   assert.deepEqual(
     session.queue.map((word) => word.spelling),
-    [a.spelling, c.spelling],
+    [c.spelling, a.spelling],
   );
-  f.spell();
-  f.advanceSpell();
   f.spell('wrong-c2');
   f.spell(c.spelling);
+  f.advanceSpell();
+  f.spell();
   f.advanceSpell();
   assert.deepEqual(
     session.queue.map((word) => word.spelling),
     [c.spelling],
   );
-  f.spell('wrong-c3');
+  f.spell('');
   assert.equal(session.spellingState, 'skipped');
   assert.equal(session.phase, 'spelling');
+  assert.equal(session.spellingAttempts.at(-1)?.answer, '');
   assert.throws(() => f.spell(c.spelling));
   f.advanceSpell();
   assert.equal(session.phase, 'finished');
@@ -334,18 +409,11 @@ test('v2 translation advances without feedback, preserves group spelling and kee
   assert.equal(f.day().flow?.completed.length, 4);
   assert.ok((f.day().flow?.window.members.length ?? 0) > 0);
   assert.equal(f.day().flow?.groups.length, 2);
-  const tomorrow = f.now + 86400;
-  resumeMiniFlow(
-    f.day(),
-    { dailyNewGoal: 2, groupSize: 2, completedToday: 0 },
-    tomorrow,
-    timezone,
-    words.slice(10),
+  const beforeTomorrow = structuredClone(f.day());
+  assert.throws(() =>
+    resumeMiniFlow(f.day(), { dailyNewGoal: 2, groupSize: 2 }, f.now + 86400, timezone),
   );
-  f.day().paused = false;
-  assert.equal(f.day().flow?.goalReached, false);
-  assert.equal(f.day().flow?.completedBeforeRun, 0);
-  assert.ok(currentMiniWindow(f.day())?.visit);
+  assert.deepEqual(f.day(), beforeTomorrow);
   validateMiniFacts(f.state);
 });
 
@@ -430,7 +498,7 @@ test('v2 review failures enter card relearning with no new-word admissions and t
       limits: { wordLimit: 10, newWordLimit: 5 },
       writingRequired: true,
       newGroup: true,
-      flow: { dailyNewGoal: 1, groupSize: 1 },
+      flow: { dailyNewGoal: 1, groupSize: reviewed.length },
     },
   );
   const day = state.ledger.days.at(-1);
@@ -458,6 +526,16 @@ test('v2 review failures enter card relearning with no new-word admissions and t
   }
   assert.deepEqual(day.review?.relearningWords, reviewed.slice(2));
   assert.ok(day.review?.relearning?.visit);
+  const reviewVisit = day.review.relearning.visit;
+  assert.throws(() =>
+    act({
+      ...ctx,
+      session: 'learning',
+      type: 'window_familiar',
+      word: reviewVisit.word,
+      visitId: reviewVisit.id,
+    }),
+  );
   assert.deepEqual(currentLearningWord(day), day.review.relearning.visit.word);
   assert.deepEqual(
     miniAIContext(state, { timezone }, now).currentLearning?.word,
@@ -513,7 +591,8 @@ test('v2 review failures enter card relearning with no new-word admissions and t
     day.review?.relearning?.events.filter((event) => event.remembered && event.stage === 2).length,
     7,
   );
-  assert.deepEqual(day.review?.queue, day.reviewWords);
+  assert.deepEqual(new Set(day.review?.queue), new Set(day.reviewWords));
+  assert.notDeepEqual(day.review?.queue, day.reviewWords);
   assert.equal(day.learningWords.length, 0);
   assert.equal(day.translation.length, 0);
 });
@@ -721,4 +800,184 @@ test('v2 window visits record visible English exposure and pause closes it witho
   f.act(pause);
   observeMiniLearningCommand(f.state, pause, f.now);
   assert.equal(f.state.scheduling.visibleWord, null);
+});
+
+test('the current translation group allows revisions without repeating completion or discarding drafts', (t) => {
+  const f = fixture(5, 3);
+  f.finishMemory();
+  f.finishSpelling();
+  f.prepareWriting();
+  f.act({ ...f.ctx(), type: 'complete_learning' });
+  const directory = mkdtempSync(join(tmpdir(), 'lingoweave-revise-'));
+  const database = join(directory, 'mini.sqlite');
+  let at = f.now;
+  const open = () =>
+    new MiniStore(database, { now: () => new Date((at + 978307200) * 1000), timezone });
+  let study = open();
+  t.after(() => {
+    study.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+  study.importLegacy({
+    requestId: randomUUID(),
+    ledger: f.state.ledger,
+    reviewRecord: null,
+    reviewHistory: [],
+    timezone,
+  });
+  const day = () => {
+    const current = study.snapshot().ledger.days.at(-1);
+    assert.ok(current);
+    return current;
+  };
+  const ctx = f.ctx();
+  const command = (action: Action) => ({
+    requestId: randomUUID(),
+    expectedRevision: study.snapshot().revision,
+    action,
+  });
+  const send = (action: Action) => {
+    at++;
+    return study.command(command(action));
+  };
+  const submit = (answer: string) => {
+    const task = currentTranslation(day());
+    assert.ok(task);
+    send({ ...ctx, type: 'submit_translation', taskId: task.id, answer });
+    const attempt = day().translation.at(-1);
+    assert.ok(attempt);
+    return attempt;
+  };
+  const first = submit('original one');
+  send({ ...ctx, type: 'advance_translation', taskId: first.task.id });
+  const secondTask = currentTranslation(day());
+  assert.ok(secondTask);
+  send({ ...ctx, type: 'translation_draft', taskId: secondTask.id, draft: 'in progress' });
+  const completed = day().flow?.completed;
+  const schedules = study.snapshot().scheduling.flow;
+  const revise = {
+    ...ctx,
+    type: 'revise_translation' as const,
+    taskId: first.task.id,
+    attemptId: first.id,
+    answer: 'new one',
+  };
+  const retry = command(revise);
+  at++;
+  const revised = study.command(retry);
+  assert.deepEqual(study.command(retry), revised);
+  assert.equal(currentTranslation(day())?.id, secondTask.id);
+  assert.equal(day().translationDraft, 'in progress');
+  assert.deepEqual(day().flow?.completed, completed);
+  assert.deepEqual(study.snapshot().scheduling.flow, schedules);
+  const version = day().translation[0]?.revisions?.[0];
+  assert.ok(version);
+  assert.equal(day().translation[0]?.answer, 'original one');
+  assert.equal(study.assessmentSource(first.id)?.answer, 'original one');
+  const revisedSource = study.assessmentSource(version.id);
+  assert.equal(revisedSource?.attemptId, first.id);
+  assert.equal(revisedSource?.answer, 'new one');
+  assert.equal(revisedSource?.learningEvidence.originalAnswer, 'original one');
+  assert.throws(() => send({ ...revise, answer: 'stale edit' }));
+  assert.throws(() => study.aiCommand(command({ ...revise, attemptId: version.id })));
+  const prior = study.snapshot().revision;
+  assert.equal(send({ ...revise, attemptId: version.id, answer: ' new one ' }).revision, prior);
+  assert.equal(reachedTranslation(day(), first.task.id)?.id, first.task.id);
+  assert.equal(reachedTranslation(day(), ctx.dayId + '/2'), undefined);
+
+  const second = submit('original two');
+  send({
+    ...ctx,
+    type: 'revise_translation',
+    taskId: second.task.id,
+    attemptId: second.id,
+    answer: 'new two',
+  });
+  const secondVersion = day().translation[1]?.revisions?.[0];
+  assert.ok(secondVersion);
+  assert.equal(study.assessmentSource(secondVersion.id), undefined);
+  send({ ...ctx, type: 'advance_translation', taskId: second.task.id });
+  assert.equal(study.assessmentSource(secondVersion.id)?.answer, 'new two');
+  const third = submit('third');
+  send({ ...ctx, type: 'advance_translation', taskId: third.task.id });
+  assert.equal(day().flow?.completed.length, 3);
+  assert.equal(day().flow?.groups[0]?.translationAttemptIds.length, 3);
+  assert.equal(reachedTranslation(day(), first.task.id), undefined);
+  assert.throws(() => send({ ...revise, attemptId: version.id, answer: 'closed group' }));
+  const saved = study.snapshot();
+  study.close();
+  study = open();
+  assert.deepEqual(study.snapshot(), saved);
+
+  const application = (id: string, summary: string): MiniAssessmentApplication => {
+    const source = study.assessmentSource(id);
+    assert.ok(source);
+    const hash = miniAssessmentHash(source);
+    const observation = {
+      outcome: 'incorrect' as const,
+      explanation: '测试中的目标词有误。',
+      evidenceIds: [id],
+    };
+    return {
+      requestId: randomUUID(),
+      source,
+      result: {
+        sourceId: id,
+        inputHash: hash,
+        expressionGrade: 'off_meaning',
+        meaning: observation,
+        spelling: observation,
+        usage: observation,
+        summary,
+        strengths: [],
+        improvements: [],
+        referenceTranslation: source.question.english,
+        uncertainties: [],
+      },
+      trace: {
+        model: 'test',
+        effort: 'high',
+        threadId: null,
+        rulesVersion: 'mini-assessment-v1',
+        skillHash: hash,
+        promptHash: hash,
+        inputHash: hash,
+        startedAt: at,
+        assessedAt: at,
+      },
+    };
+  };
+  const report = () => study.translationReview({ date: '2026-11-17', timezone }, () => null);
+  const latest = application(version.id, '点评修改稿');
+  const flowBefore = study.snapshot().scheduling.flow;
+  const receipt = study.applyAssessment(latest);
+  assert.equal(receipt.scheduling.affectedEvents, 0);
+  assert.deepEqual(study.snapshot().scheduling.flow, flowBefore);
+  const reviewed = report().entries.find((entry) => entry.attemptId === first.id);
+  assert.equal(reviewed?.commentary?.summary, latest.result.summary);
+  assert.equal(reviewed?.answer, version.answer);
+  const lateOriginal = application(first.id, '迟到的首答点评');
+  study.applyAssessment(lateOriginal);
+  const afterAssessment = study.snapshot();
+  assert.deepEqual(
+    report().entries.find((entry) => entry.attemptId === first.id),
+    reviewed,
+  );
+  assert.equal(report().entries.length, 3);
+  assert.deepEqual(afterAssessment.ledger, saved.ledger);
+  assert.deepEqual(
+    afterAssessment.scheduling.flow.events
+      .filter((event) => event.kind === 'assessment')
+      .map((event) => event.sourceId),
+    [first.id],
+  );
+  assert.deepEqual(study.applyAssessment(latest), receipt);
+  study.applyAssessment(lateOriginal);
+  assert.deepEqual(study.snapshot(), afterAssessment);
+  study.close();
+  study = open();
+  assert.deepEqual(
+    report().entries.find((entry) => entry.attemptId === first.id),
+    reviewed,
+  );
 });

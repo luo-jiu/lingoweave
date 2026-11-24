@@ -9,7 +9,7 @@ struct MiniAIReceipt: Decodable, Sendable, Identifiable {
 }
 
 struct MiniAIJob: Decodable, Sendable, Identifiable {
-    enum Kind: String, Codable, Sendable { case prepare, writing, feedback, advisor }
+    enum Kind: String, Codable, Sendable { case prepare, writing, feedback, advisor, dialogue }
     enum Status: String, Decodable, Sendable {
         case queued, running, completed, failed, cancelled, interrupted
         var isActive: Bool { self == .queued || self == .running }
@@ -32,6 +32,7 @@ struct MiniAIJob: Decodable, Sendable, Identifiable {
     let dayId: String?
     let attemptId: UUID?
     let conversationId: String
+    var dialogueStep: String? = nil
     let model: String
     let effort: String
     let progress: String
@@ -76,11 +77,12 @@ struct MiniAIStart: Codable, Sendable {
     var word: MiniWord? = nil
     let conversationId: String
     var message: String? = nil
+    var dialogueStep: String? = nil
     let model: String
     let effort: String
 
     private enum CodingKeys: String, CodingKey {
-        case requestId, kind, timezone, dayId, attemptId, word, conversationId, message, model, effort
+        case requestId, kind, timezone, dayId, attemptId, word, conversationId, message, dialogueStep, model, effort
     }
 
     func encode(to encoder: Encoder) throws {
@@ -93,14 +95,15 @@ struct MiniAIStart: Codable, Sendable {
         try values.encodeIfPresent(word, forKey: .word)
         try values.encode(conversationId, forKey: .conversationId)
         try values.encodeIfPresent(message, forKey: .message)
+        try values.encodeIfPresent(dialogueStep, forKey: .dialogueStep)
         try values.encode(model, forKey: .model)
         try values.encode(effort, forKey: .effort)
     }
 
     init(requestId: UUID = UUID(), kind: MiniAIJob.Kind, timezone: String = TimeZone.current.identifier,
          dayId: String? = nil, attemptId: UUID? = nil, word: MiniWord? = nil,
-         conversationId: String = "advisor", message: String? = nil,
-         model: String = "gpt-6.1-sol", effort: String = "xhigh") {
+         conversationId: String = "advisor", message: String? = nil, dialogueStep: String? = nil,
+         model: String = MiniAISelection.initial.model, effort: String = MiniAISelection.initial.effort) {
         self.requestId = requestId
         self.kind = kind
         self.timezone = timezone
@@ -109,6 +112,7 @@ struct MiniAIStart: Codable, Sendable {
         self.word = word
         self.conversationId = conversationId
         self.message = message
+        self.dialogueStep = dialogueStep
         self.model = model
         self.effort = effort
     }

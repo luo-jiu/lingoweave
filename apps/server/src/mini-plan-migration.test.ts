@@ -79,7 +79,7 @@ for (const reason of ['budget', 'manual'] as const) {
         JSON.stringify(raw.prepare('SELECT body FROM mini_state').get()).includes('minutes'),
         false,
       );
-      assert.equal(raw.prepare('PRAGMA user_version').get()?.user_version, 8);
+      assert.equal(raw.prepare('PRAGMA user_version').get()?.user_version, 13);
       raw.close();
       store.close();
       store = new MiniStore(file, { now: () => start, timezone });

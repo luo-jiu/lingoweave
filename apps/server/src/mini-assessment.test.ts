@@ -4,12 +4,17 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
+import { DatabaseSync } from 'node:sqlite';
 import { setImmediate } from 'node:timers/promises';
 import { test, type TestContext } from 'node:test';
+import { z } from 'zod';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import {
+  miniAssessmentResultSchema,
   miniAssessmentSourceSchema,
+  miniTranslationReviewSchema,
+  miniPhrasePageSchema,
   type MiniAssessmentApplication,
   type MiniAssessmentReceipt,
   type MiniAssessmentResult,
@@ -19,11 +24,13 @@ import {
 } from '@lingoweave/contracts';
 import { MiniAssessmentStore, miniAssessmentHash } from './mini-assessment-store.js';
 import { MiniAssessmentService, type MiniAssessmentRepository } from './mini-assessment-service.js';
+import { MiniExpressionGrades } from './mini-expression-grades.js';
 import { MiniAiStore } from './mini-ai-store.js';
 import type { PreparationRuntime } from './preparation-service.js';
 import { LearningError } from './learning-store.js';
 import { buildApp } from './app.js';
 import { MiniStore } from './mini-store.js';
+import { applyFlowAssessment } from './mini-flow-scheduler.js';
 import {
   currentMiniWindow,
   currentTranslation,
@@ -67,6 +74,7 @@ function result(input: MiniAssessmentSource): MiniAssessmentResult {
   return {
     sourceId: input.id,
     inputHash: miniAssessmentHash(input),
+    expressionGrade: 'natural',
     meaning: observation,
     spelling: observation,
     usage: observation,
@@ -123,15 +131,23 @@ class Runtime implements PreparationRuntime {
           isDefault: true,
           supportedReasoningEfforts: this.supported ? ['xhigh'] : ['high'],
         },
+        {
+          id: 'alternate-model',
+          name: 'Another model',
+          isDefault: false,
+          supportedReasoningEfforts: ['low'],
+        },
       ],
       error: null,
     };
   }
   async prepare(options: RuntimeOptions) {
     this.calls.push(options);
-    options.onThread?.({ threadId: `thread-${options.jobId}`, model: 'gpt-6.1-sol' });
+    assert.ok(options.model);
+    const thread = { threadId: `thread-${options.jobId}`, model: options.model };
+    options.onThread?.(thread);
     await this.behavior(options);
-    return { threadId: `thread-${options.jobId}`, model: 'gpt-6.1-sol' };
+    return thread;
   }
   async close() {}
 }
@@ -196,6 +212,62 @@ test('confirmed answers dispatch without opening home and preserve the original 
   assert.equal(f.service.detail(first.id).job.receipt?.revision, 1);
 });
 
+test('the model receives the revised version, and a judgment of that answer must cite its own evidence', async (t) => {
+  const f = fixture(t);
+  const first = source();
+  const revised = {
+    ...first,
+    id: randomUUID(),
+    answer: 'I have a blue bag.',
+    learningEvidence: { revisionOf: first.id, originalAnswer: first.answer },
+  };
+  f.repository.sources.set(revised.id, revised);
+  f.runtime.behavior = async (options) => {
+    const context = z
+      .object({ source: miniAssessmentSourceSchema, evidenceIds: z.array(z.string()) })
+      .parse(f.call(options, 'context'));
+    assert.deepEqual(context.source, revised);
+    assert.ok(context.evidenceIds.includes(revised.id));
+    const assessment = result(revised);
+    assert.throws(() => f.submit(options, assessment), hasCode('ASSESSMENT_EVIDENCE_INVALID'));
+    for (const dimension of [assessment.meaning, assessment.spelling, assessment.usage])
+      dimension.evidenceIds = [revised.id];
+    f.submit(options, assessment);
+  };
+  f.service.setBaseUrl('http://127.0.0.1:12345');
+  await finished(f.service);
+  const detail = f.service.detail(revised.id);
+  assert.equal(detail.job.status, 'completed', detail.job.error ?? undefined);
+  assert.equal(detail.job.attemptId, first.id);
+  assert.equal(detail.job.sourceId, revised.id);
+});
+
+test('a new assessment saves readable feedback in the same turn and still reads sparse historical feedback', async (t) => {
+  const f = fixture(t);
+  const original = source();
+  f.repository.sources.set(original.id, original);
+  const sparse = { ...result(original), strengths: [], improvements: [], referenceTranslation: '' };
+  const historic = { ...sparse, expressionGrade: undefined };
+  assert.equal(miniAssessmentResultSchema.parse(historic).expressionGrade, undefined);
+  const feedback = {
+    ...sparse,
+    summary: '你用 is 把包和它的颜色连在一起，意思完整，读起来也自然。',
+    referenceTranslation: original.answer,
+  };
+  f.runtime.behavior = async (options) => {
+    assert.throws(() => f.submit(options, { ...feedback, expressionGrade: undefined }));
+    assert.throws(() => f.submit(options, sparse));
+    assert.equal(f.service.detail(original.id).application, null);
+    f.submit(options, feedback);
+  };
+  f.service.setBaseUrl('http://127.0.0.1:12345');
+  await finished(f.service);
+  assert.equal(f.runtime.calls.length, 1);
+  assert.equal(f.repository.applications.length, 1);
+  assert.deepEqual(f.service.detail(original.id).application?.result, feedback);
+  assert.equal(f.service.detail(original.id).source.answer, original.answer);
+});
+
 test('assessment tools enforce task credentials, context, frozen source and evidence identity', async (t) => {
   const f = fixture(t),
     original = source();
@@ -220,6 +292,8 @@ test('assessment tools enforce task credentials, context, frozen source and evid
     );
     const invalid = result(original);
     invalid.meaning = { ...invalid.meaning, evidenceIds: ['invented-history'] };
+    assert.throws(() => f.submit(options, invalid), hasCode('ASSESSMENT_EVIDENCE_INVALID'));
+    invalid.meaning.evidenceIds = [original.question.id];
     assert.throws(() => f.submit(options, invalid), hasCode('ASSESSMENT_EVIDENCE_INVALID'));
     assert.throws(() => f.call(options, 'history'), hasCode('ASSESSMENT_TOOL_INVALID'));
     f.submit(options);
@@ -629,22 +703,14 @@ test('real learning Next freezes an outbox, advances immediately and adopts a ba
       chinese: '我有一个包。',
     })),
   });
-  for (let index = 0; index < 10; index++) {
-    const visit = currentMiniWindow(day())?.visit;
-    if (!visit) break;
-    const windowTarget = {
-      ...target,
-      session: 'learning' as const,
-      word: visit.word,
-      visitId: visit.id,
-    };
-    if (visit.stage > 0) act({ ...windowTarget, type: 'window_choose', remembered: true });
-    act({
-      ...windowTarget,
-      type: 'window_advance',
-      ...(visit.stage === 0 ? { remembered: true } : {}),
-    });
-  }
+  const first = currentMiniWindow(day())?.visit;
+  assert.ok(first);
+  act({ ...target, type: 'window_familiar', session: 'learning', word, visitId: first.id });
+  assert.equal(
+    study.snapshot().scheduling.flow.events.length,
+    0,
+    'The self-report has no recall rating.',
+  );
   assert.equal(day().learning?.phase, 'spelling');
   time += 360_000;
   act({
@@ -689,6 +755,32 @@ test('real learning Next freezes an outbox, advances immediately and adopts a ba
   act({ ...target, type: 'submit_translation', taskId: task.id, answer: '这是我蓝色的包。' });
   const attempt = day().translation.at(-1);
   assert.ok(attempt);
+  const reviewURL = '/api/mini/translations/review?date=2026-11-17&timezone=Asia%2FShanghai';
+  const reviewEntries = async () => {
+    const response = await app.inject({
+      method: 'GET',
+      url: reviewURL,
+      headers: { authorization },
+    });
+    assert.equal(response.statusCode, 200, response.body);
+    return miniTranslationReviewSchema.parse(response.json()).entries;
+  };
+  assert.equal((await app.inject({ method: 'GET', url: reviewURL })).statusCode, 401);
+  assert.equal(
+    (
+      await app.inject({
+        method: 'GET',
+        url: reviewURL.replace('2026-11-17', '2026-02-30'),
+        headers: { authorization },
+      })
+    ).statusCode,
+    400,
+  );
+  assert.equal(
+    (await reviewEntries())[0]?.status,
+    'submitted',
+    'the original answer is visible before Next',
+  );
   assert.equal(study.pendingAssessments().length, 0);
   const legacy = new MiniStore(':memory:', { now: clock, timezone: 'Asia/Shanghai' });
   try {
@@ -706,6 +798,11 @@ test('real learning Next freezes an outbox, advances immediately and adopts a ba
     });
     const recovered = legacy.assessmentSource(attempt.id);
     assert.ok(recovered);
+    assert.equal(
+      recovered.aiSelection,
+      undefined,
+      'old actions retain their original evidence shape',
+    );
     assert.equal(
       recovered.learningEvidence.capturedAtSubmission,
       false,
@@ -765,7 +862,44 @@ test('real learning Next freezes an outbox, advances immediately and adopts a ba
     assert.equal(context.status, 200);
     const source = study.assessmentSource(attempt.id);
     assert.ok(source);
+    const frozen = z
+      .object({ source: miniAssessmentSourceSchema })
+      .parse(await context.json()).source;
+    assert.deepEqual(frozen.learningEvidence.selfReportedFamiliar, {
+      id: first.id,
+      at: day().flow?.window.events[0]?.confirmedAt,
+    });
+    const events = z
+      .array(z.object({ id: z.string(), stage: z.number(), selfReportedFamiliar: z.boolean() }))
+      .parse(frozen.learningEvidence.windowEvents);
+    assert.deepEqual(events, [{ id: first.id, stage: 0, selfReportedFamiliar: true }]);
+    assert.deepEqual(
+      z
+        .array(z.object({ answer: z.string(), kind: z.string() }))
+        .parse(frozen.learningEvidence.spellingAttempts),
+      [
+        { answer: 'bga', kind: 'first' },
+        { answer: 'bag', kind: 'correction' },
+        { answer: 'bag', kind: 'first' },
+      ],
+    );
+    const unsupported = result(frozen);
+    unsupported.meaning = { ...unsupported.meaning, evidenceIds: [first.id] };
+    const rejected = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        action: 'commit',
+        input: { requestId: randomUUID(), result: unsupported },
+      }),
+    });
+    assert.equal(rejected.status, 400);
+    assert.deepEqual(
+      z.object({ error: z.object({ code: z.string() }) }).parse(await rejected.json()),
+      { error: { code: 'ASSESSMENT_EVIDENCE_INVALID' } },
+    );
     const evaluated = result(source);
+    evaluated.reusablePhrase = { expression: 'a blue bag', explanation: '一个蓝色的包' };
     evaluated.spelling = {
       outcome: 'not_tested',
       explanation: '英译中没有测试英文拼写。',
@@ -782,10 +916,11 @@ test('real learning Next freezes an outbox, advances immediately and adopts a ba
     assert.equal(committed.status, 200, await committed.text());
   };
   time += 1000;
+  const aiSelection = { model: 'alternate-model', effort: 'low' };
   const next = {
     requestId: randomUUID(),
     expectedRevision: study.snapshot().revision,
-    action: { ...target, type: 'advance_translation', taskId: task.id },
+    action: { ...target, type: 'advance_translation', taskId: task.id, aiSelection },
   };
   const response = await app.inject({
     method: 'POST',
@@ -801,12 +936,21 @@ test('real learning Next freezes an outbox, advances immediately and adopts a ba
   );
   const source = study.assessmentSource(attempt.id);
   assert.ok(source);
+  assert.deepEqual(source.aiSelection, aiSelection);
   assert.equal(source.answer, '这是我蓝色的包。');
   assert.equal(source.learningEvidence.capturedAtSubmission, true);
   assert.deepEqual(
     source.learningEvidence.exposures,
     [],
     'post-answer help is not inserted into the immutable pre-answer evidence',
+  );
+  const completion = study
+    .snapshot()
+    .scheduling.flow.events.find((event) => event.kind === 'completion');
+  assert.equal(
+    completion?.reviewCeilingDays,
+    2,
+    'An actual spelling miss retains its conservative interval even after marking familiar.',
   );
   const qualification = source.learningEvidence.eligibility;
   assert.ok(qualification && typeof qualification === 'object' && !Array.isArray(qualification));
@@ -819,15 +963,30 @@ test('real learning Next freezes an outbox, advances immediately and adopts a ba
   assert.equal(source.discussion[0]?.relation, 'after_answer');
   assert.equal(study.pendingAssessments().length, 1);
   assert.equal(service.snapshot().runningCount + service.snapshot().pendingCount, 1);
+  assert.ok(['queued', 'running'].includes((await reviewEntries())[0]?.status ?? ''));
   chat.clear({ requestId: randomUUID(), conversationId: 'bag' });
   assert.deepEqual(
     study.assessmentSource(attempt.id),
     source,
     'clearing a chat cannot remove the confirmed assessment evidence',
   );
+  const beforeAssessment = study.snapshot();
   release();
   await finished(service);
   assert.equal(service.detail(attempt.id).job.status, 'completed');
+  const phrasePage = await app.inject({
+    method: 'GET',
+    url: '/api/mini/phrases?kind=feedback&q=blue',
+    headers: { authorization },
+  });
+  const phrases = miniPhrasePageSchema.parse(phrasePage.json());
+  assert.equal(phrases.total, 1);
+  assert.deepEqual(phrases.items[0]?.words, ['bag']);
+  assert.equal(phrases.items[0]?.explanation, '一个蓝色的包');
+  assert.ok(
+    !phrasePage.body.includes(attempt.answer),
+    'The phrase library does not expose the learner answer or discussion.',
+  );
   assert.equal(study.pendingAssessments().length, 0);
   const adopted = study
     .snapshot()
@@ -837,6 +996,70 @@ test('real learning Next freezes an outbox, advances immediately and adopts a ba
   const committed = study.snapshot();
   const application = service.detail(attempt.id).application;
   assert.ok(application);
+  const irrelevant = structuredClone(application);
+  irrelevant.result.spelling.outcome = 'incorrect';
+  irrelevant.result.usage.outcome = 'incorrect';
+  const rechecked = structuredClone(beforeAssessment);
+  applyFlowAssessment(rechecked, irrelevant, application.trace.assessedAt);
+  assert.deepEqual(
+    rechecked.scheduling.flow.events,
+    committed.scheduling.flow.events,
+    'English-to-Chinese only measures the understanding of the English source.',
+  );
+  for (const expressionGrade of ['natural', 'understandable', 'off_meaning'] as const) {
+    const independent = structuredClone(beforeAssessment);
+    const receipt = applyFlowAssessment(
+      independent,
+      {
+        ...application,
+        result: { ...application.result, expressionGrade },
+      },
+      application.trace.assessedAt,
+    );
+    assert.deepEqual(independent.scheduling.flow.cards, committed.scheduling.flow.cards);
+    assert.deepEqual(independent.scheduling.flow.events, committed.scheduling.flow.events);
+    assert.deepEqual(receipt, service.detail(attempt.id).job.receipt);
+  }
+  assert.deepEqual(study.translationModel(attempt.id), aiSelection);
+  const entries = await reviewEntries();
+  assert.deepEqual(entries, [
+    {
+      attemptId: attempt.id,
+      dayId: day().id,
+      word,
+      direction: task.direction,
+      question: task.sentence.english,
+      answer: attempt.answer,
+      submittedAt: attempt.submittedAt,
+      status: 'ready',
+      expressionGrade: 'natural',
+      retryJobId: null,
+      commentary: {
+        summary: application.result.summary,
+        strengths: application.result.strengths,
+        improvements: application.result.improvements,
+        keyPoints: ['a blue bag · 一个蓝色的包'],
+        referenceTranslation: application.result.referenceTranslation,
+      },
+    },
+  ]);
+  const queued = await app.inject({
+    method: 'POST',
+    url: '/api/mini/translations/review/grade-missing',
+    headers: { authorization },
+    payload: { date: '2026-11-17', timezone: 'Asia/Shanghai' },
+  });
+  assert.equal(queued.statusCode, 200, queued.body);
+  assert.deepEqual(miniTranslationReviewSchema.parse(queued.json()).entries, entries);
+  assert.equal(
+    runtime.calls.length,
+    1,
+    'opening a review or requesting existing grades never queues another model run',
+  );
+  assert.equal(runtime.calls[0]?.model, aiSelection.model);
+  assert.equal(runtime.calls[0]?.effort, aiSelection.effort);
+  assert.equal(application.trace.model, aiSelection.model);
+  assert.equal(application.trace.effort, aiSelection.effort);
   study.applyAssessment(application);
   assert.deepEqual(
     study.snapshot(),
@@ -850,9 +1073,343 @@ test('real learning Next freezes an outbox, advances immediately and adopts a ba
     reopenedTasks = new MiniAssessmentStore(aiFile);
   try {
     assert.deepEqual(reopenedStudy.snapshot(), committed);
+    assert.deepEqual(
+      reopenedStudy.translationReview({ date: '2026-11-17', timezone: 'Asia/Shanghai' }, () => null)
+        .entries,
+      entries,
+      'saved learner commentary remains readable without the transient AI queue',
+    );
     assert.deepEqual(reopenedTasks.detail(attempt.id), detail);
   } finally {
     reopenedStudy.close();
     reopenedTasks.close();
+  }
+});
+
+test('historical expression grades are scoped to the original translations, isolated from scheduling and immutable across retries', async (t) => {
+  const f = fixture(t);
+  const app = buildApp({
+    mini: { store: new MiniStore(':memory:'), token: 'v'.repeat(64), assessment: f.service },
+  });
+  const url = await app.listen({ host: '127.0.0.1', port: 0 });
+  t.after(() => app.close());
+  const historic = (answer: string) => {
+    const original = source();
+    return {
+      attemptId: original.id,
+      dayId: original.dayId,
+      word: original.word,
+      direction: original.question.direction,
+      question: original.question.chinese,
+      answer,
+      submittedAt: original.submittedAt,
+      status: 'ready' as const,
+      retryJobId: null,
+      commentary: {
+        summary: '原点评',
+        strengths: [],
+        improvements: [],
+        keyPoints: [],
+        referenceTranslation: original.question.english,
+      },
+    };
+  };
+  const entries = [
+    historic('My bag is blue.'),
+    historic('Bag mine blue.'),
+    historic('My bag is red.'),
+  ];
+  const report = { date: '2026-11-17', timezone: 'Asia/Shanghai', entries };
+  const originalReport = structuredClone(report);
+  const selection = { model: 'alternate-model', effort: 'low' as const };
+  const grades = ['natural', 'understandable', 'off_meaning'] as const;
+  const input = {
+    grades: entries.map((entry, i) => ({ attemptId: entry.attemptId, expressionGrade: grades[i] })),
+  };
+  let error: unknown;
+  f.runtime.behavior = async (options) => {
+    const client = new Client({ name: 'expression-grade-test', version: '1' });
+    try {
+      assert.equal(options.model, selection.model);
+      assert.equal(options.effort, selection.effort);
+      assert.throws(
+        () => f.service.tool(options.jobId, 'wrong-token', 'context', {}),
+        hasCode('EXPRESSION_TASK_EXPIRED'),
+      );
+      await client.connect(new StdioClientTransport({ ...options.mcp, stderr: 'pipe' }));
+      assert.deepEqual((await client.listTools()).tools.map((tool) => tool.name).sort(), [
+        'learning_get_translations',
+        'learning_submit_expression_grades',
+      ]);
+      const commit = (args: object) =>
+        client.callTool({ name: 'learning_submit_expression_grades', arguments: { ...args } });
+      assert.equal((await commit(input)).isError, true);
+      const context = await client.callTool({ name: 'learning_get_translations', arguments: {} });
+      const content = context.content;
+      assert.ok(Array.isArray(content));
+      const visible = JSON.parse(z.object({ text: z.string() }).parse(content[0]).text);
+      assert.deepEqual(visible, {
+        translations: entries.map(({ attemptId, question, direction, answer, commentary }) => ({
+          attemptId,
+          question,
+          direction,
+          answer,
+          commentary,
+        })),
+      });
+      assert.equal((await commit({ grades: input.grades.slice(1) })).isError, true);
+      const first = input.grades[0];
+      assert.ok(first);
+      assert.equal((await commit({ grades: [first, first, first] })).isError, true);
+      assert.equal(
+        (
+          await commit({
+            grades: [{ ...first, attemptId: randomUUID() }, ...input.grades.slice(1)],
+          })
+        ).isError,
+        true,
+      );
+      assert.notEqual((await commit(input)).isError, true);
+      assert.notEqual((await commit(input)).isError, true);
+      assert.equal(
+        (
+          await commit({
+            grades: [{ ...first, expressionGrade: 'off_meaning' }, ...input.grades.slice(1)],
+          })
+        ).isError,
+        true,
+      );
+    } catch (err) {
+      error = err;
+    } finally {
+      await client.close();
+    }
+    throw new Error('disconnect after tool commit');
+  };
+  assert.deepEqual(f.service.expressions.display(report), report);
+  f.service.setBaseUrl(url);
+  assert.equal(f.runtime.calls.length, 0);
+  f.service.expressions.enqueue(report, () => selection);
+  f.service.expressions.enqueue(report, () => selection);
+  while (f.service.expressions.handles(f.runtime.calls[0]?.jobId ?? '')) await setImmediate();
+  if (error) throw error;
+  const saved = f.service.expressions.enqueue(report, () => selection);
+  assert.deepEqual(
+    saved.entries.map((e) => e.expressionGrade),
+    grades,
+  );
+  assert.ok(saved.entries.every((e) => !e.expressionGradeStatus));
+  const oldEntry = entries[2];
+  assert.ok(oldEntry);
+  const newVersion = { ...oldEntry, answer: 'My bag is blue.', answerRevisionId: randomUUID() };
+  const revisedReport = { ...report, entries: [newVersion] };
+  assert.equal(
+    f.service.expressions.display(revisedReport).entries[0]?.expressionGrade,
+    undefined,
+    'the original off-meaning grade cannot be attached to the new answer version',
+  );
+  assert.deepEqual(report, originalReport);
+  assert.equal(f.runtime.calls.length, 1);
+  assert.equal(f.repository.applications.length, 0);
+});
+
+test('an interrupted display-only batch resumes from disk; failure retries only ungraded answers using each original model', async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), 'lingoweave-expression-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const filename = join(directory, 'mini-ai.sqlite');
+  const entries = [source(), source()].map((item) => ({
+    attemptId: item.id,
+    dayId: item.dayId,
+    word: item.word,
+    direction: item.question.direction,
+    question: item.question.chinese,
+    answer: item.answer,
+    submittedAt: item.submittedAt,
+    status: 'ready' as const,
+    retryJobId: null,
+    commentary: {
+      summary: '已点评',
+      strengths: [],
+      improvements: [],
+      keyPoints: [],
+      referenceTranslation: item.answer,
+    },
+  }));
+  const report = { date: '2026-11-17', timezone: 'Asia/Shanghai', entries };
+  const first = entries[0],
+    second = entries[1];
+  assert.ok(first && second);
+  const originalModel = (id: string) =>
+    id === first.attemptId
+      ? { model: 'alternate-model', effort: 'low' as const }
+      : { model: 'gpt-6.1-sol', effort: 'xhigh' as const };
+  let store = new MiniAssessmentStore(filename);
+  let runtime = new Runtime();
+  let service = new MiniAssessmentService(new Repository(), store, runtime);
+  runtime.behavior = (options) =>
+    new Promise((resolve) =>
+      options.signal.addEventListener('abort', () => resolve(), { once: true }),
+    );
+  service.setBaseUrl('http://127.0.0.1:4312');
+  service.expressions.enqueue(report, originalModel);
+  assert.equal(runtime.calls.length, 1);
+  await service.close();
+  store = new MiniAssessmentStore(filename);
+  runtime = new Runtime();
+  service = new MiniAssessmentService(new Repository(), store, runtime);
+  t.after(() => service.close());
+  let allowFirst = false;
+  runtime.behavior = async (options) => {
+    if (options.model === 'alternate-model' && !allowFirst) throw new Error('model unavailable');
+    const token = options.mcp.env.LINGOWEAVE_MINI_ASSESSMENT_TOKEN;
+    assert.ok(token);
+    const { translations } = z
+      .object({ translations: z.array(z.object({ attemptId: z.uuid() })) })
+      .parse(service.tool(options.jobId, token, 'context', {}));
+    service.tool(options.jobId, token, 'commit', {
+      grades: translations.map((original) => ({
+        attemptId: original.attemptId,
+        expressionGrade: 'natural',
+      })),
+    });
+  };
+  service.setBaseUrl('http://127.0.0.1:4312');
+  await setImmediate();
+  assert.deepEqual(
+    service.expressions
+      .display(report)
+      .entries.map((e) => e.expressionGrade ?? e.expressionGradeStatus),
+    ['failed', 'natural'],
+  );
+  assert.equal(runtime.calls.length, 2);
+  allowFirst = true;
+  service.expressions.enqueue(report, originalModel);
+  await setImmediate();
+  assert.deepEqual(
+    runtime.calls.map((call) => [call.model, call.effort]),
+    [
+      ['alternate-model', 'low'],
+      ['gpt-6.1-sol', 'xhigh'],
+      ['alternate-model', 'low'],
+    ],
+  );
+  assert.deepEqual(
+    service.expressions.display(report).entries.map((e) => e.expressionGrade),
+    ['natural', 'natural'],
+  );
+});
+
+test('new Chinese comprehension grades enforce two meaning judgments independently of target evidence', async (t) => {
+  const f = fixture(t);
+  for (const correct of [true, false]) {
+    const input = source();
+    input.question.direction = 'englishToChinese';
+    input.answer = correct ? '我的包是蓝的。' : '我的包是红的。';
+    f.repository.sources.set(input.id, input);
+  }
+  f.runtime.behavior = async (options) => {
+    const input = f.repository.get(options.jobId);
+    assert.ok(input);
+    const feedback = { ...result(input), referenceTranslation: input.question.chinese };
+    assert.throws(
+      () => f.submit(options, { ...feedback, expressionGrade: 'understandable' }),
+      hasCode('TRANSLATION_MEANING_RUBRIC'),
+    );
+    assert.throws(
+      () => f.submit(options, { ...feedback, improvements: ['改用书面表达。'] }),
+      hasCode('TRANSLATION_MEANING_RUBRIC'),
+    );
+    f.submit(
+      options,
+      input.answer.includes('红')
+        ? {
+            ...feedback,
+            expressionGrade: 'off_meaning',
+            improvements: ['blue 是蓝色，原答写成了红色。'],
+          }
+        : feedback,
+    );
+  };
+  f.service.setBaseUrl('http://127.0.0.1:12345');
+  await finished(f.service, 2);
+  assert.deepEqual(f.repository.applications.map((a) => a.result.expressionGrade).sort(), [
+    'natural',
+    'off_meaning',
+  ]);
+  assert.ok(f.repository.applications.every((a) => a.result.meaning.outcome === 'correct'));
+});
+
+test('historical Chinese meaning reviews reject amber and save a fresh comment for exactly the frozen answer', async () => {
+  const db = new DatabaseSync(':memory:');
+  db.exec(
+    `CREATE TABLE mini_expression_grades (id TEXT PRIMARY KEY, original TEXT NOT NULL, model TEXT NOT NULL, effort TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'queued', grade TEXT)`,
+  );
+  const input = source();
+  const entry = {
+    attemptId: input.id,
+    dayId: input.dayId,
+    word: input.word,
+    direction: 'englishToChinese' as const,
+    question: input.question.english,
+    answer: '我的包是红色的。',
+    submittedAt: input.submittedAt,
+    status: 'ready' as const,
+    retryJobId: null,
+    commentary: {
+      summary: '建议使用书面语。',
+      strengths: [],
+      improvements: ['换成书面用词。'],
+      keyPoints: [],
+      referenceTranslation: input.question.chinese,
+    },
+  };
+  const report = { date: '2026-11-17', timezone: input.timezone, entries: [entry] };
+  const selection = { model: 'gpt-6.1-sol', effort: 'xhigh' as const };
+  const { attemptId, direction, question, answer, commentary } = entry;
+  db.prepare('INSERT INTO mini_expression_grades VALUES(?,?,?,?,?,?)').run(
+    attemptId,
+    JSON.stringify({ attemptId, direction, question, answer, commentary }),
+    selection.model,
+    selection.effort,
+    'ready',
+    'understandable',
+  );
+  const runtime = new Runtime();
+  const grades = new MiniExpressionGrades(db, runtime);
+  try {
+    const hidden = grades.display(report).entries[0];
+    assert.equal(hidden?.expressionGrade, undefined);
+    assert.equal(hidden?.commentary, null);
+    assert.equal(runtime.calls.length, 0);
+    const meaningComment = '你把 blue 译成了红色，这里说的是蓝色的包。';
+    runtime.behavior = async (options) => {
+      const token = options.mcp.env.LINGOWEAVE_MINI_ASSESSMENT_TOKEN;
+      assert.ok(token);
+      grades.tool(options.jobId, token, 'context', {});
+      const commit = (grade: string, comment?: string) =>
+        grades.tool(options.jobId, token, 'commit', {
+          grades: [{ attemptId, expressionGrade: grade, meaningComment: comment }],
+        });
+      assert.throws(
+        () => commit('understandable', meaningComment),
+        hasCode('TRANSLATION_MEANING_RUBRIC'),
+      );
+      assert.throws(() => commit('off_meaning'), hasCode('EXPRESSION_COMMENT_REQUIRED'));
+      commit('off_meaning', meaningComment);
+      commit('off_meaning', meaningComment);
+      assert.throws(() => commit('off_meaning', '另一份点评'), hasCode('EXPRESSION_CONFLICT'));
+    };
+    grades.setBaseUrl('http://127.0.0.1:12345');
+    grades.enqueue(report, () => selection);
+    await setImmediate();
+    const displayed = grades.enqueue(report, () => selection).entries[0];
+    assert.equal(displayed?.expressionGrade, 'off_meaning');
+    assert.equal(displayed?.commentary?.summary, meaningComment);
+    assert.deepEqual(displayed?.commentary?.improvements, []);
+    assert.equal(runtime.calls.length, 1);
+    assert.equal(entry.commentary.summary, '建议使用书面语。');
+  } finally {
+    await grades.close();
+    db.close();
   }
 });

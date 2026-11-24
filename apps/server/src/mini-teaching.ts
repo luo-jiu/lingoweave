@@ -22,9 +22,11 @@ import {
   currentLearningWord,
   currentMiniWindow,
   currentTranslation,
+  reachedTranslation,
   localDay,
   miniPreparationWords,
   sameWord,
+  spellingResultSession,
   wordKey,
 } from './mini-study.js';
 
@@ -193,10 +195,30 @@ export function applyMiniTeachingAction(
   }
   if (action.type === 'record_exposure') {
     requireFact(
+      !action.taskId ||
+        (action.target === 'daily' && (action.source === 'audio' || action.source === 'chat')),
+      '题号只能关联当前翻译题的朗读或讨论。',
+    );
+    requireFact(
       action.audioKind === undefined || action.source === 'audio',
       '音频类型只能附在真实音频曝光上。',
     );
+    const spellingResult = action.spellingResultAt !== undefined;
+    if (spellingResult) {
+      requireFact(
+        action.source === 'audio' &&
+          action.audioKind === 'word' &&
+          action.kind === 'potentialHelp' &&
+          !action.taskId &&
+          !action.translationPromptAudio &&
+          action.spellingResultAt !== undefined &&
+          !!spellingResultSession(state, action, action.word, action.spellingResultAt),
+        '拼写结果朗读必须对应刚保存的正确答案。',
+      );
+    }
     let session = action.session;
+    let translationTaskId = action.taskId;
+    let practiceSession: MiniReviewSession | undefined;
     let beforeAttemptCount: number;
     let beforeJudgmentCount: number | undefined;
     if (action.target === 'daily') {
@@ -210,14 +232,38 @@ export function applyMiniTeachingAction(
           ? (currentMiniWindow(day)?.visit?.word ?? day.review?.queue[0])
           : day.phase === 'learning'
             ? currentLearningWord(day)
-            : currentTranslation(day)?.sentence.word;
-      requireFact(sameWord(expected, action.word), '帮助目标已变化，不能写到另一张词卡。');
+            : (action.taskId ? reachedTranslation(day, action.taskId) : currentTranslation(day))
+                ?.sentence.word;
+      if (action.taskId)
+        requireFact(day.phase === 'translation' && !day.paused, '当前没有正在进行的翻译。');
+      requireFact(
+        spellingResult || sameWord(expected, action.word),
+        '帮助目标已变化，不能写到另一张词卡。',
+      );
       const expectedSession = day.phase === 'translation' ? undefined : day.phase;
       requireFact(
         session === undefined || session === expectedSession,
         '帮助对应的学习阶段已变化。',
       );
       session = expectedSession;
+      if (day.phase === 'translation') translationTaskId ??= currentTranslation(day)?.id;
+      if (action.translationPromptAudio) {
+        const task = translationTaskId && reachedTranslation(day, translationTaskId);
+        requireFact(
+          action.source === 'audio' &&
+            action.audioKind !== undefined &&
+            day.phase === 'translation' &&
+            !!task &&
+            task.direction === 'englishToChinese',
+          '题面朗读必须来自本题已显示的英文。',
+        );
+      }
+      practiceSession =
+        expectedSession === 'review'
+          ? day.review
+          : expectedSession === 'learning'
+            ? day.learning
+            : undefined;
       if (expectedSession === 'review') beforeJudgmentCount = day.review?.judgmentEvents.length;
       beforeAttemptCount =
         expectedSession === 'review'
@@ -226,15 +272,17 @@ export function applyMiniTeachingAction(
             ? (day.learning?.spellingAttempts.length ?? 0)
             : 0;
     } else {
+      requireFact(!action.translationPromptAudio, '题面朗读只能关联翻译题。');
       const record = state.reviewRecord;
       requireFact(
         !!record &&
           record.id.toLowerCase() === action.recordId?.toLowerCase() &&
-          sameWord(record.session.queue[0], action.word),
+          (spellingResult || sameWord(record.session.queue[0], action.word)),
         '帮助必须关联当前复习词卡。',
       );
       requireFact(session === undefined || session === 'review', '帮助对应的复习阶段不匹配。');
       session = 'review';
+      practiceSession = record.session;
       beforeAttemptCount = record.session.spellingAttempts.length;
       beforeJudgmentCount = record.session.judgmentEvents.length;
     }
@@ -250,6 +298,13 @@ export function applyMiniTeachingAction(
       kind: action.kind,
       source: action.source,
       ...(action.audioKind ? { audioKind: action.audioKind } : {}),
+      ...(action.translationPromptAudio ? { translationPromptAudio: true as const } : {}),
+      ...(translationTaskId ? { taskId: translationTaskId } : {}),
+      ...(!spellingResult &&
+      practiceSession?.phase === 'spelling' &&
+      practiceSession.spellingState === 'awaitingFirst'
+        ? { spellingAttemptHelp: true as const }
+        : {}),
       focusIds: action.focusIds,
       ...(action.sourceMessageId ? { sourceMessageId: action.sourceMessageId } : {}),
       beforeAttemptCount,
@@ -446,7 +501,7 @@ export function miniFactHistory(state: MiniSnapshot): MiniHistoryItem[] {
           word: item.word,
           data: {
             ...item,
-            evidence: 'interleaved_memory',
+            evidence: item.selfReportedFamiliar ? 'self_reported_familiar' : 'interleaved_memory',
             mastered: false,
             ...(session === 'review' &&
             item.stage === 1 &&
@@ -691,7 +746,13 @@ export function miniAIContext(state: MiniSnapshot, raw: MiniAIContextInput, at: 
       ...(state.ledger.days.some((day) => day.memory || day.flow)
         ? {
             memoryRoundAdvances: actual.filter(
-              (item) => item.kind === 'memory' && item.data.undoneAt === undefined,
+              (item) =>
+                item.kind === 'memory' &&
+                item.data.selfReportedFamiliar !== true &&
+                item.data.undoneAt === undefined,
+            ).length,
+            familiarityDeclarations: actual.filter(
+              (item) => item.kind === 'memory' && item.data.selfReportedFamiliar === true,
             ).length,
             skippedSpellingWords: new Set(
               actual

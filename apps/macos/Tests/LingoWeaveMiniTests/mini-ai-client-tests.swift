@@ -12,12 +12,47 @@ struct MiniAIClientTests {
         try tests.testQualitativeAndLegacyFeedback()
         try tests.testWritingPromptsKeepSubmittedMaterial()
         try tests.testServerTaskAndReceiptDecoding()
-        print("6 mini AI client recovery and material tests passed.")
+        try tests.testAISelectionAndQueuedAssessment()
+        try await tests.testLessonReadRecovery()
+        try tests.testFrameIntroductionsRespectStudyOrder()
+        try tests.testDialogueRequestsPreserveLearnerAuthorship()
+        print("10 mini AI client, model selection, curriculum entry and material tests passed.")
         let environment = ProcessInfo.processInfo.environment
         if let address = environment["MINI_TEST_AI_SERVICE_URL"], let url = URL(string: address),
            let token = environment["MINI_TEST_AI_TOKEN_PATH"] {
             try await tests.testLiveAI(baseURL: url, tokenFile: URL(fileURLWithPath: token))
             print("Swift → HTTP AI task, tool receipt and recovery integration passed.")
+        }
+    }
+
+    private func testLessonReadRecovery() async throws {
+        let delays = Array(repeating: Duration.zero, count: 3)
+        var requests = 0
+        let progress = try await MiniDailyAI.readWithRetry(delays: delays) {
+            requests += 1
+            if requests == 1 { throw URLError(.networkConnectionLost) }
+            return 25
+        }
+        expect(progress == 25 && requests == 2, "Observation recovers after a temporary connection failure")
+        requests = 0
+        do {
+            try await MiniDailyAI.readWithRetry(delays: delays) {
+                requests += 1
+                throw MiniStudyClientError.unavailable
+            }
+            preconditionFailure("An offline service must eventually return control for manual retry")
+        } catch MiniStudyClientError.unavailable {
+            expect(requests == 4, "Temporary failures have at most three automatic retries")
+        }
+        requests = 0
+        do {
+            try await MiniDailyAI.readWithRetry(delays: delays) {
+                requests += 1
+                throw MiniStudyClientError.unauthorized
+            }
+            preconditionFailure("An invalid credential cannot succeed with the same request")
+        } catch MiniStudyClientError.unauthorized {
+            expect(requests == 1, "An authorization failure requires intervention before retry")
         }
     }
 
@@ -141,6 +176,31 @@ struct MiniAIClientTests {
         expect(snapshot.jobs[0].receipts[0].revision == 12, "Only a server receipt proves a business write committed")
     }
 
+    private func testAISelectionAndQueuedAssessment() throws {
+        let catalog = MiniChatRuntime(available: true, authenticated: true, models: [
+            MiniChatModel(id: "example", name: "Example", supportedReasoningEfforts: ["medium", "high"], defaultReasoningEffort: "high")
+        ], error: nil)
+        let supported = MiniAISelection(model: "example", effort: "medium")
+        expect(catalog.selectionIssue(supported) == nil, "The exact supported combination can be selected")
+        expect(catalog.selectionIssue(.initial) != nil, "A missing saved model stays unavailable")
+        expect(catalog.selectionIssue(.init(model: "example", effort: "xhigh")) != nil,
+               "Selecting a model that lacks the saved effort requires an explicit choice")
+        let unavailable = MiniChatRuntime(available: false, authenticated: false, models: catalog.models, error: "offline")
+        expect(unavailable.selectionIssue(supported) != nil, "A stale catalog cannot approve a choice while disconnected")
+
+        var action = MiniStudyAction(type: .advanceTranslation, target: .daily, dayId: "example")
+        action.taskId = "translation"
+        let old = try JSONEncoder().encode(action)
+        expect(try JSONDecoder().decode(MiniStudyAction.self, from: old).aiSelection == nil,
+               "Older queued actions remain readable")
+        action.aiSelection = supported
+        let command = MiniStudyCommand(expectedRevision: 7, action: action)
+        let outbox = try JSONEncoder().encode(command)
+        let replay = try JSONDecoder().decode(MiniStudyCommand.self, from: outbox)
+        expect(replay.requestId == command.requestId && replay.action.aiSelection == supported,
+               "A queued background assessment retains its original model and effort through replay")
+    }
+
     private func testLiveAI(baseURL: URL, tokenFile: URL) async throws {
         let directory = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -178,6 +238,15 @@ struct MiniAIClientTests {
         state = try await study.snapshot()
         let learningSentence = state.ledger.days.first { $0.id == dayId }?.sentences.first
         expect(learningSentence != nil, "Validated AI learning material is actually saved")
+        let patterns = MiniPatternClient(study: study)
+        expect(try await patterns.phrases(kind: .sentence).total == 0,
+               "Preparing a lesson cannot place an unseen example in the phrase library")
+        var view = MiniStudyAction(type: .recordCardView, target: .daily, dayId: dayId, session: .learning, word: word)
+        view.visibleSentence = learningSentence
+        state = try await perform(view)
+        let seenSentence = try await patterns.phrases(query: word.meaning, kind: .sentence)
+        expect(seenSentence.items.first?.expression == learningSentence?.english && seenSentence.total == 1,
+               "Looking at a muted card captures its actual English example for later lookup")
         state = try await perform(MiniStudyAction(type: .markStudied, target: .daily, dayId: dayId, word: word))
         var spelling = MiniStudyAction(type: .submitSpelling, target: .daily, dayId: dayId, session: .learning, word: word)
         spelling.answer = word.spelling
@@ -215,6 +284,143 @@ struct MiniAIClientTests {
                "The original user message persists once across client recreation")
         expect(snapshot.jobs.contains { $0.id == completed.id && $0.receipts.count == completed.receipts.count },
                "Reopening keeps the real job status and committed receipts")
+        let initial = try await patterns.batch(timezone: "Asia/Shanghai")
+        guard let card = initial.next else { preconditionFailure("Expected a new isolated frame batch") }
+        let notes = try await patterns.phrases(query: "on the table", kind: .feedback)
+        expect(notes.total == 1 && notes.items.first?.status == .feedback,
+               "An expression saved in feedback can be looked up independently of practiced frames")
+        expect(try await patterns.learnedPatterns().total == 0,
+               "The home pattern library excludes visible word examples, translation feedback and unviewed starter frames")
+        for _ in 0..<2 { try await patterns.recordView(batchId: initial.batchId, patternId: card.id, timezone: "Asia/Shanghai") }
+        let seen = try await patterns.learnedPatterns(query: card.meaning)
+        expect(seen.total == 1 && seen.items.first?.status == .viewed && seen.items.first?.exampleEnglish == card.example,
+               "Viewing the same frame twice yields one searchable bilingual entry without a practice attempt")
+        let miss = MiniPatternSubmission(timezone: "Asia/Shanghai", batchId: initial.batchId, patternId: card.id,
+                                         answer: "Unrelated sentence.", usedHint: false, continueAfterFeedback: false)
+        let result = try await patterns.practice(miss)
+        expect(!result.correct && !result.reference.isEmpty && result.snapshot.next?.id == card.id,
+               "An unmatched cue gives feedback but does not silently complete the card")
+        let retry = try await patterns.practice(miss)
+        expect(retry.reference == result.reference && retry.snapshot.completedIds == result.snapshot.completedIds,
+               "Repeating the actual transport request is idempotent")
+        let confirmed = try await patterns.practice(MiniPatternSubmission(timezone: miss.timezone,
+              batchId: initial.batchId, patternId: card.id, answer: miss.answer, usedHint: true, continueAfterFeedback: true))
+        expect(!confirmed.correct && confirmed.snapshot.completedIds.contains(card.id),
+               "Reading a reference can continue study without inventing a correct answer")
+        let practiced = try await patterns.learnedPatterns(query: card.frame)
+        expect(practiced.items.first?.status == .practiced && practiced.items.first?.id == seen.items.first?.id,
+               "Returning after practice updates the original frame and preserves its identity")
+        let patternPage = try await patterns.learnedPatterns(limit: 1)
+        let pastEnd = try await patterns.learnedPatterns(offset: 1, limit: 1)
+        expect(patternPage.total == 1 && patternPage.items.first?.id == seen.items.first?.id
+               && pastEnd.total == 1 && pastEnd.items.isEmpty,
+               "Frame-only pagination and counts exclude feedback and word example matches")
+        let firstPage = try await patterns.phrases(limit: 1)
+        let secondPage = try await patterns.phrases(offset: 1, limit: 1)
+        expect(firstPage.total >= 3 && firstPage.items.count == 1 && secondPage.items.count == 1
+               && firstPage.items.first?.id != secondPage.items.first?.id,
+               "Browsing can continue across pages without repeating the last entry")
+        expect(try await patterns.batch(timezone: miss.timezone).next?.id != card.id,
+               "A new native read resumes at the server's next unpracticed card")
+        expect(try await study.snapshot().revision == state.revision, "Pattern practice never advances word learning")
+        let scene = "dialogue:" + UUID().uuidString.lowercased()
+        let reply = "I need a bag."
+        for turn in [MiniAIStart(kind: .dialogue, conversationId: scene),
+                     MiniAIStart(kind: .dialogue, conversationId: scene, message: reply),
+                     MiniAIStart(kind: .dialogue, conversationId: scene, dialogueStep: "reflect")] {
+            let result = try await finishRequest(turn, client: ai)
+            expect(result.kind == .dialogue && result.status == .completed && result.receipts.isEmpty &&
+                   result.dialogueStep == turn.dialogueStep, "Dialogue returns a read-only turn or reflection")
+        }
+        let dialogue = try await reconnected.snapshot().messages.filter { $0.conversationId == scene }
+        expect(dialogue.filter { $0.role == .user }.map(\.text) == [reply] && dialogue.filter { $0.role == .assistant }.count == 3,
+               "Reopening the scene shows original learner input and never invents an opening or closing message")
+        expect(try await study.snapshot().revision == state.revision, "Dialogue and reflection do not alter study facts")
+    }
+
+    private func testFrameIntroductionsRespectStudyOrder() throws {
+        func context(due: Int = 0, pending: String? = nil, mode: MiniPlanMode = .normal,
+                     remaining: Int = 10, canStart: Bool = true) -> MiniPlanContext {
+            MiniPlanContext(date: "2026-11-18", timezone: "Asia/Shanghai",
+                effective: .init(mode: mode, wordLimit: 10, newWordLimit: 10), todayOverride: nil, dueCount: due,
+                newCount: 100, lastActivityAt: nil, absenceDays: 0, recoverySuggested: false, recoveryWordLimit: 3,
+                pendingDayId: pending, pendingGroups: [], canStart: canStart, canContinue: pending != nil, blockedReason: nil,
+                remainingNewCount: remaining, hasDueReviews: due > 0)
+        }
+        let start = MiniPatternStartIntent(dayId: nil)
+        expect(start.offersIntroduction(context()), "A fresh word start offers a frame introduction")
+        expect(!start.offersIntroduction(context(due: 1)), "Due reviews always come first")
+        expect(!start.offersIntroduction(context(pending: "existing")), "Do not interrupt a saved group")
+        expect(!start.offersIntroduction(context(mode: .reviewOnly)), "No curriculum gate on review-only days")
+        expect(!start.offersIntroduction(context(mode: .rest)), "No curriculum gate on rest days")
+        expect(!start.offersIntroduction(context(remaining: 0)), "Do not open frames after the goal is reached")
+        let today = context(pending: "today", canStart: false)
+        expect(today.hasTaskAfterReview && !start.offersIntroduction(today),
+               "Returning from a review side group within the day resumes today's in-progress learning")
+        let freshDay = context()
+        expect(freshDay.hasTaskAfterReview && start.offersIntroduction(freshDay),
+               "After overnight unfinished work, today's fresh plan can proceed directly into today's frames")
+        expect(context(mode: .normal).hasTaskAfterReview && context(due: 1, mode: .reviewOnly).hasTaskAfterReview,
+               "The next planned step can be a fresh task or another due-review batch")
+        expect(!context(mode: .rest).hasTaskAfterReview && !context(canStart: false).hasTaskAfterReview,
+               "Rest and exhausted plans stop at the end of review without beginning another group")
+        for mode in [MiniPlanMode.normal, .reviewOnly] {
+            let more = context(due: 270, mode: mode)
+            expect(more.afterCompletingReview(activePhase: .review) == .activeReview,
+                   "A committed next review group stays open without starting it a second time")
+            expect(more.afterCompletingReview(activePhase: .learning) == .begin,
+                   "Any remaining due words take priority over a prepared learning group")
+        }
+        expect(today.afterCompletingReview(activePhase: .learning) == .activeStudy,
+               "The final side group can resume the prepared original day despite the change of id")
+        expect(context(mode: .reviewOnly).afterCompletingReview(activePhase: .finished) == .home,
+               "Review-only mode finishes when every due group is complete")
+        var reviewStart = start
+        reviewStart.entry = .review
+        expect(!reviewStart.offersIntroduction(freshDay) &&
+               freshDay.afterCompletingReview(activePhase: .learning, intent: .review) == .home,
+               "A dedicated review finishes at home even when the server has a new-word group ready")
+        var rest = context(due: 7, mode: .rest, canStart: false)
+        rest.canStartReview = true
+        rest.canStartLearning = false
+        rest.canStartExtraGroup = true
+        var extra = start
+        extra.extraGroupForDate = rest.date
+        expect(rest.reviewAvailable && !rest.learningAvailable &&
+               rest.afterCompletingReview(activePhase: .finished, intent: .review) == .begin &&
+               !extra.offersIntroduction(rest),
+               "Rest-day due reviews remain available between batches and precede optional new-word practice")
+        var cleared = context(mode: .rest, canStart: false)
+        cleared.canStartReview = false
+        cleared.canStartLearning = false
+        cleared.canStartExtraGroup = true
+        expect(!reviewStart.offersIntroduction(cleared) && extra.offersIntroduction(cleared) &&
+               !start.offersIntroduction(cleared) &&
+               cleared.afterCompletingReview(activePhase: .finished, intent: .review) == .home,
+               "On a rest day only explicitly requested extra practice opens starter patterns")
+        cleared.canStartLearning = true
+        expect(cleared.learningAvailable &&
+               cleared.afterCompletingReview(activePhase: .learning, intent: .learn) == .activeStudy,
+               "A granted rest-day new-word group can continue after reviews without authorizing a second group")
+        extra.extraGroupForDate = "2026-11-17"
+        expect(!extra.offersIntroduction(cleared), "Yesterday's extra-group click cannot start today's pattern introduction")
+        var explicit = start
+        explicit.dayId = "previous"
+        expect(!explicit.offersIntroduction(context()), "Explicitly continuing a task keeps its position")
+    }
+
+    private func testDialogueRequestsPreserveLearnerAuthorship() throws {
+        let scene = "dialogue:" + UUID().uuidString.lowercased()
+        let encoder = JSONEncoder()
+        for input in [MiniAIStart(kind: .dialogue, conversationId: scene),
+                      MiniAIStart(kind: .dialogue, conversationId: scene, message: "I need a bag."),
+                      MiniAIStart(kind: .dialogue, conversationId: scene, dialogueStep: "reflect")] {
+            let copy = try JSONDecoder().decode(MiniAIStart.self, from: encoder.encode(input))
+            expect(copy.conversationId == scene && copy.kind == .dialogue && copy.dayId == nil && copy.word == nil,
+                   "The scene can never be interpreted as a daily study or advisor submission")
+            expect(copy.message == input.message && copy.dialogueStep == input.dialogueStep,
+                   "Start and reflection have no synthetic learner utterance")
+        }
     }
 
     private func finish(_ initial: MiniAIJob, client: MiniAIClient) async throws -> MiniAIJob {

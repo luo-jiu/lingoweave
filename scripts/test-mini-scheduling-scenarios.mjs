@@ -378,6 +378,7 @@ function runner(specification) {
       const previous = current.judgmentEvents.filter(
         (entry) => entry.word.spelling === target.spelling,
       ).length;
+      action({ ...context(), session: 'review', type: 'record_card_view', word: target });
       if (targetVisit && previous === 0 && behavior.audioKind)
         action({
           ...context(),

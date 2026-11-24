@@ -16,8 +16,8 @@ struct MiniDictation: Decodable, Sendable, Identifiable {
     let word: MiniWord
     let openedAt: Date
     let closedAt: Date?
-    let revealedAt: Date?
-    let attempts: [MiniDictationAttempt]
+    var revealedAt: Date?
+    var attempts: [MiniDictationAttempt]
 }
 
 struct MiniPracticeSnapshot: Decodable, Sendable {
@@ -42,6 +42,8 @@ struct MiniMemoryCard: Decodable, Sendable, Identifiable {
     let priorityUpdatedAt: Date?
     let state: String
     let fsrs: MiniFsrsCard?
+
+    var suggestedProbeAt: Date { min(dueAt, nextProbeAt ?? dueAt) }
 }
 
 struct MiniFsrsCard: Decodable, Sendable {
@@ -80,7 +82,7 @@ struct MiniSchedulingSnapshot: Decodable, Sendable {
     var activeProbe: MiniProbe? { probes.last { $0.id == activeProbeId && $0.status != .ended } }
     var orderedCards: [MiniMemoryCard] {
         cards.sorted {
-            if $0.dueAt != $1.dueAt { return $0.dueAt < $1.dueAt }
+            if $0.suggestedProbeAt != $1.suggestedProbeAt { return $0.suggestedProbeAt < $1.suggestedProbeAt }
             return $0.senseId < $1.senseId
         }
     }

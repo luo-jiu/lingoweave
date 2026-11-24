@@ -21,12 +21,19 @@ private final class MiniPanel: NSPanel {
     override var canBecomeMain: Bool { true }
 }
 
+@MainActor
+private final class MiniPanelFocus: ObservableObject {
+    @Published var isFocused = false
+}
+
 private struct MiniPanelContent: View {
     @State private var isPinned = false
+    @ObservedObject var focus: MiniPanelFocus
     let onPinChange: (Bool) -> Void
 
     var body: some View {
         MiniStudyView(isPinned: $isPinned)
+            .environment(\.miniTranslationObscured, isPinned && !focus.isFocused)
             .onChange(of: isPinned) { _, pinned in onPinChange(pinned) }
     }
 }
@@ -48,13 +55,15 @@ struct MiniTitleDragRegion: NSViewRepresentable {
 @MainActor
 private final class MiniAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var panel: MiniPanel?
+    private let panelFocus = MiniPanelFocus()
     private var statusItem: NSStatusItem?
     private var statusMenu: NSMenu?
     private var visibilityItem: NSMenuItem?
     private var shortcutItem: NSMenuItem?
     private var hotKey: EventHotKeyRef?
     private var hotKeyHandler: EventHandlerRef?
-    private var memoryWindow: MiniMemoryWindowController?
+    private var memoryWindow: MiniDashboardWindowController?
+    private var dataOverviewWindow: MiniDashboardWindowController?
     private weak var lastActiveWindow: NSWindow?
 
     private enum Shortcut: String, CaseIterable {
@@ -101,11 +110,13 @@ private final class MiniAppDelegate: NSObject, NSApplicationDelegate, NSWindowDe
         panel.isExcludedFromWindowsMenu = false
         panel.contentMinSize = NSSize(width: 300, height: 250)
         panel.collectionBehavior = [.moveToActiveSpace, .canJoinAllApplications]
-        let host = NSHostingView(rootView: MiniPanelContent { [weak self] pinned in
+        let host = NSHostingView(rootView: MiniPanelContent(focus: panelFocus) { [weak self] pinned in
             self?.setPinned(pinned)
         })
         // The SwiftUI header shares the title bar's top row with the native buttons.
         host.safeAreaRegions = .keyboard
+        // The panel owns its size, including any resize the learner makes between cards.
+        host.sizingOptions = []
         panel.contentView = host
         panel.center()
         self.panel = panel
@@ -129,11 +140,28 @@ private final class MiniAppDelegate: NSObject, NSApplicationDelegate, NSWindowDe
 
     func applicationDidBecomeActive(_ notification: Notification) {
         restoreWindow()
+        panelFocus.isFocused = panel?.isKeyWindow == true
+    }
+
+    func applicationDidResignActive(_ notification: Notification) {
+        panelFocus.isFocused = false
+    }
+
+    func windowDidBecomeKey(_ notification: Notification) {
+        if let window = notification.object as? NSWindow, window === panel {
+            panelFocus.isFocused = NSApp.isActive
+        }
+    }
+
+    func windowDidResignKey(_ notification: Notification) {
+        if let window = notification.object as? NSWindow, window === panel {
+            panelFocus.isFocused = false
+        }
     }
 
     @objc private func windowBecameKey(_ notification: Notification) {
         guard let window = notification.object as? NSWindow,
-              window === panel || window === memoryWindow?.window else { return }
+              window === panel || window === memoryWindow?.window || window === dataOverviewWindow?.window else { return }
         lastActiveWindow = window
     }
 
@@ -151,6 +179,9 @@ private final class MiniAppDelegate: NSObject, NSApplicationDelegate, NSWindowDe
     private func setUpMainMenu() {
         let main = NSMenu()
         let application = NSMenu(title: "语织")
+        let settings = application.addItem(withTitle: "设置…", action: #selector(openSettings), keyEquivalent: ",")
+        settings.target = self
+        application.addItem(.separator())
         application.addItem(withTitle: "隐藏语织", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
         let hideOthers = application.addItem(withTitle: "隐藏其他应用", action: #selector(NSApplication.hideOtherApplications(_:)), keyEquivalent: "h")
         hideOthers.keyEquivalentModifierMask = [.command, .option]
@@ -176,6 +207,8 @@ private final class MiniAppDelegate: NSObject, NSApplicationDelegate, NSWindowDe
         study.target = self
         let memory = windows.addItem(withTitle: "记忆曲线…", action: #selector(openMemoryWindow), keyEquivalent: "2")
         memory.target = self
+        let dataOverview = windows.addItem(withTitle: "数据总览…", action: #selector(openDataOverviewWindow), keyEquivalent: "3")
+        dataOverview.target = self
         windows.addItem(.separator())
         windows.addItem(withTitle: "最小化", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
         windows.addItem(withTitle: "关闭窗口", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
@@ -187,6 +220,8 @@ private final class MiniAppDelegate: NSObject, NSApplicationDelegate, NSWindowDe
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        MiniStudyClient.reviewJournal.finishOnQuit()
+        MiniStudyClient.draftJournal.finishOnQuit()
         NotificationCenter.default.removeObserver(self)
         if let hotKey { UnregisterEventHotKey(hotKey) }
         if let hotKeyHandler { RemoveEventHandler(hotKeyHandler) }
@@ -225,6 +260,9 @@ private final class MiniAppDelegate: NSObject, NSApplicationDelegate, NSWindowDe
         let memory = NSMenuItem(title: "记忆曲线…", action: #selector(openMemoryWindow), keyEquivalent: "")
         memory.target = self
         menu.addItem(memory)
+        let dataOverview = NSMenuItem(title: "数据总览…", action: #selector(openDataOverviewWindow), keyEquivalent: "")
+        dataOverview.target = self
+        menu.addItem(dataOverview)
         let shortcut = NSMenuItem(title: "全局快捷键", action: nil, keyEquivalent: "")
         shortcut.submenu = NSMenu()
         shortcutItem = shortcut
@@ -295,8 +333,30 @@ private final class MiniAppDelegate: NSObject, NSApplicationDelegate, NSWindowDe
     }
 
     @objc private func openMemoryWindow() {
-        if memoryWindow == nil { memoryWindow = MiniMemoryWindowController() }
+        if memoryWindow == nil {
+            memoryWindow = MiniDashboardWindowController(
+                title: "记忆曲线 · 语织", frameName: "mini-memory-window", size: NSSize(width: 1120, height: 780),
+                minimum: NSSize(width: 900, height: 640), presented: .miniMemoryWindowPresented,
+                content: MiniMemoryView(study: MiniStudyClient())
+            )
+        }
         memoryWindow?.present()
+    }
+
+    @objc private func openDataOverviewWindow() {
+        if dataOverviewWindow == nil {
+            dataOverviewWindow = MiniDashboardWindowController(
+                title: "数据总览 · 语织", frameName: "mini-data-overview-window", size: NSSize(width: 920, height: 720),
+                minimum: NSSize(width: 720, height: 520), presented: .miniDataOverviewWindowPresented,
+                content: MiniDataOverviewView(study: MiniStudyClient())
+            )
+        }
+        dataOverviewWindow?.present()
+    }
+
+    @objc private func openSettings() {
+        showPanel()
+        NotificationCenter.default.post(name: .miniOpenSettings, object: nil)
     }
 
     @objc private func statusItemClicked(_ button: NSStatusBarButton) {

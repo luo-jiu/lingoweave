@@ -13,9 +13,12 @@ import {
   flowMemoryHistory,
   flowRetrievability,
   flowSenseId,
+  rebuildMiniFlowDueSchedules,
   recordFlowSchedule,
+  validateMiniFlowScheduling,
 } from './mini-flow-scheduler.js';
 import { memoryDetail, memoryOverview } from './mini-memory.js';
+import { orderMiniDue } from './mini-scheduler.js';
 import { swiftTime } from './mini-study.js';
 
 const word: MiniWord = { spelling: 'bag', meaning: '包', phonetic: '' };
@@ -58,6 +61,50 @@ function append(state: MiniSnapshot, overrides: Partial<Omit<MiniFlowScheduleEve
   return event;
 }
 const unixDate = (at: number) => new Date((at + 978307200) * 1000);
+
+test('due words are ordered by their current measured abilities before the oldest-waiting slot', () => {
+  const state = snapshot();
+  const weak = { ...word, spelling: 'zebra' };
+  append(state);
+  append(state, { word: weak, meaning: 'Again', spelling: null });
+  const items = [
+    { word, schedule: { dueAt: base } },
+    { word: weak, schedule: { dueAt: base + day } },
+  ];
+  assert.equal(orderMiniDue(items, state.scheduling, base + 5 * day)[0], items[1]);
+  state.scheduling.servedCount = 4;
+  assert.equal(orderMiniDue(items, state.scheduling, base + 5 * day)[0], items[0]);
+});
+
+test('corrected headword formatting retains the sense history and can repair an audited older schedule', () => {
+  const state = snapshot();
+  const revised = { ...word, spelling: word.spelling.toUpperCase(), phonetic: '/new/' };
+  append(state);
+  const second = append(state, { word: revised, sourceId: 'review-2', occurredAt: base + 4 * day });
+  assert.equal(flowMemory(state, revised)?.meaning?.reps, 2);
+  assert.equal(flowMemoryHistory(state, word).length, 2);
+  assert.deepEqual(state.scheduling.flow.events.at(-1)?.load, {});
+  const correct = structuredClone(state.scheduling.flow.cards);
+
+  const old = snapshot();
+  append(old, second);
+  state.scheduling.flow.cards = structuredClone(old.scheduling.flow.cards);
+  const last = state.scheduling.flow.changes.at(-1);
+  const former = state.scheduling.flow.cards[0];
+  assert.ok(last && former);
+  last.after = structuredClone(former);
+  assert.throws(() => validateMiniFlowScheduling(state));
+  validateMiniFlowScheduling(state, undefined, { allowArchivedDueDates: true });
+  assert.equal(rebuildMiniFlowDueSchedules(state, base + 5 * day), true);
+  assert.deepEqual(state.scheduling.flow.cards, correct);
+  assert.equal(rebuildMiniFlowDueSchedules(state, base + 5 * day), false);
+  validateMiniFlowScheduling(state);
+
+  const differentSense = { ...revised, meaning: '另一个义项' };
+  append(state, { word: differentSense, sourceId: 'other-sense' });
+  assert.equal(flowMemory(state, differentSense)?.meaning?.reps, 1);
+  assert.equal(flowMemory(state, word)?.meaning?.reps, 2);
+});
 
 test('memory display uses actual FSRS-6 decay and fractional days, preserving unknown ability states', () => {
   const state = snapshot();

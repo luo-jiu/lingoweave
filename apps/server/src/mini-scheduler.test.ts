@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -160,6 +160,78 @@ test('the actual exposure interval and intervening real target determine eligibi
   }
 });
 
+test('browsing the viewport records only the listed senses at observation time without scheduling them', async (t) => {
+  const data = await fixture(t);
+  data.begin(book);
+  data.answer('book');
+  data.end();
+  const before = data.store.snapshot();
+  data.advance(310);
+  const seen = swiftTime(data.date);
+  data.advance(40);
+  const command = miniCommandSchema.parse({
+    requestId: randomUUID(),
+    expectedRevision: before.revision,
+    occurredAt: seen,
+    action: { type: 'record_browse_views', target: 'daily', words: [apple, book] },
+  });
+  const saved = data.store.command(command);
+  assert.deepEqual(
+    saved.scheduling.views
+      .slice(before.scheduling.views.length)
+      .map(({ word, at }) => ({ word, at })),
+    [
+      { word: apple, at: seen },
+      { word: book, at: seen },
+    ],
+  );
+  assert.equal(saved.scheduling.cards.length, before.scheduling.cards.length);
+  assert.equal(miniMemory(saved, apple), undefined);
+  assert.deepEqual(miniMemory(saved, book), {
+    ...miniMemory(before, book),
+    lastAnswerExposureAt: seen,
+  });
+  assert.equal(saved.scheduling.visibleWord, before.scheduling.visibleWord);
+  assert.deepEqual(saved.scheduling.flow, before.scheduling.flow);
+  assert.deepEqual(saved.ledger, before.ledger);
+  assert.deepEqual(saved.planning, before.planning);
+  data.reopen();
+  assert.deepEqual(data.store.command(command), saved);
+  data.begin({ ...apple, meaning: '苹果公司' });
+  assert.equal(data.answer('apple').classification, 'too_soon');
+  data.end();
+  data.begin({ spelling: 'tea', meaning: '茶', phonetic: '' });
+  assert.equal(data.answer('tea').classification, 'independent_success');
+});
+
+test('viewport observations cannot forge independence on an active spelling probe', async (t) => {
+  const data = await fixture(t);
+  data.begin();
+  data.advance(300);
+  data.act({
+    type: 'record_browse_views',
+    target: 'daily',
+    words: [book, { ...apple, meaning: '另一词义' }],
+  });
+  assert.deepEqual(data.probe().helpSources, ['ui']);
+  assert.equal(data.answer('apple').classification, 'supported');
+  const invalidWords = [
+    [],
+    [apple, { ...apple, spelling: ' APPLE ', phonetic: '' }],
+    [{ ...apple, spelling: ' ' }],
+    Array.from({ length: 65 }, (_, i) => ({ ...book, spelling: String(i) })),
+  ];
+  for (const words of invalidWords)
+    assert.equal(
+      miniCommandSchema.safeParse({
+        requestId: randomUUID(),
+        expectedRevision: 0,
+        action: { type: 'record_browse_views', target: 'daily', words },
+      }).success,
+      false,
+    );
+});
+
 test('independent failure is saved once; late chat help and later correction cannot overwrite Again', async (t) => {
   const data = await fixture(t);
   data.begin();
@@ -191,6 +263,106 @@ test('independent failure is saved once; late chat help and later correction can
   });
   assert.equal(data.answer('apple').classification, 'supported');
   assert.equal(miniMemory(data.store.snapshot(), apple)?.fsrs?.reps, 1);
+});
+
+test('queued dictation preserves click times, identities and answer order across late receipts', async (t) => {
+  const data = await fixture(t);
+  data.act({
+    type: 'begin',
+    target: 'daily',
+    deck: [apple],
+    timezone,
+    flowVersion: 'sliding-window-v2',
+  });
+  const dayId = data.store.snapshot().planning.activeDayId;
+  assert.ok(dayId);
+  const ctx = { target: 'daily', dayId, session: 'learning' } as const;
+  data.act({ ...ctx, type: 'add_sentences', sentences: [example(apple)] });
+  data.act({ ...ctx, type: 'record_card_view', word: apple });
+
+  const before = data.store.snapshot();
+  const openedAt = swiftTime(data.date);
+  const openId = randomUUID().toUpperCase();
+  const dictationId = openId.toLowerCase();
+  const open = {
+    requestId: openId,
+    expectedRevision: before.revision,
+    occurredAt: openedAt,
+    action: { ...ctx, type: 'open_dictation', word: apple } as const,
+  };
+
+  // Capture all gestures before any commands reach the server.
+  data.advance(2.5);
+  const opened = data.store.command(open);
+  assert.equal(opened.practice.activeDictationId, dictationId);
+  assert.equal(opened.practice.dictations.at(-1)?.openedAt, openedAt);
+
+  const submitted = ['  aple  ', 'APPLE'].map((answer, index) => {
+    data.advance(2.5);
+    const command = {
+      requestId: randomUUID().toUpperCase(),
+      expectedRevision: data.store.snapshot().revision,
+      occurredAt: openedAt + (index + 1) / 10,
+      action: { ...ctx, type: 'submit_dictation', dictationId: openId, answer } as const,
+    };
+    const result = data.store.command(command);
+    assert.equal(data.store.command(command).revision, result.revision);
+    return {
+      id: command.requestId.toLowerCase(),
+      answer,
+      correct: index === 1,
+      submittedAt: command.occurredAt,
+    };
+  });
+
+  const closedAt = openedAt + 0.3;
+  const closed = data.store.command({
+    requestId: randomUUID(),
+    expectedRevision: data.store.snapshot().revision,
+    occurredAt: closedAt,
+    action: { ...ctx, type: 'close_dictation', dictationId },
+  });
+  const practice = closed.practice.dictations.at(-1);
+  assert.deepEqual(practice?.attempts, submitted);
+  assert.equal(practice?.revealedAt, submitted[0]?.submittedAt);
+  assert.equal(practice?.closedAt, closedAt);
+  assert.equal(closed.practice.activeDictationId, null);
+  assert.equal(closed.scheduling.visibleWord, null);
+  assert.deepEqual(closed.ledger, before.ledger);
+  assert.deepEqual(closed.scheduling.flow, before.scheduling.flow);
+  assert.deepEqual(
+    data.store.command(open),
+    closed,
+    'Replaying open after closure does not reopen the practice',
+  );
+
+  const visit = closed.ledger.days.at(-1)?.flow?.window.visit;
+  assert.ok(visit);
+  const prepared = data.store.command({
+    requestId: randomUUID(),
+    expectedRevision: closed.revision,
+    occurredAt: openedAt + 0.4,
+    action: { ...ctx, type: 'window_familiar', word: apple, visitId: visit.id },
+  });
+  const spelled = data.store.command({
+    requestId: randomUUID(),
+    expectedRevision: prepared.revision,
+    occurredAt: openedAt + 0.5,
+    action: {
+      ...ctx,
+      type: 'submit_spelling',
+      word: apple,
+      answer: 'apple',
+      advanceOnCorrect: false,
+    },
+  });
+  assert.equal(
+    spelled.ledger.days.at(-1)?.learning?.spellingAttempts.at(-1)?.lastPotentialHelpAt,
+    submitted.at(-1)?.submittedAt,
+    'Formal spelling can follow a quick scratchpad exit before either scratchpad receipt arrives',
+  );
+  data.reopen();
+  assert.deepEqual(data.store.snapshot(), spelled);
 });
 
 test('single-card dictation retains extra raw inputs and revelations without changing batch first answers or FSRS', async (t) => {
@@ -479,6 +651,59 @@ test('unrated targets retain unknown recall and every fifth actual position rese
   assert.equal(defaultMiniScheduling().cards.length, 0);
 });
 
+test('a 300-word backlog preserves the per-turn priority and fifth-slot waiting order across group boundaries', () => {
+  const scheduling = defaultMiniScheduling();
+  const items = Array.from({ length: 300 }, (_, i) => {
+    const word = {
+      spelling: 'term' + i.toString().padStart(3, '0'),
+      meaning: '单词',
+      phonetic: '',
+    };
+    const dueAt = 100 + (i % 13);
+    const lastServedAt = i % 3 === 0 ? dueAt + 10 : null;
+    const priority = i % 6;
+    scheduling.cards.push({
+      senseId:
+        'sense-' +
+        createHash('sha256')
+          .update(JSON.stringify([word.spelling, word.meaning]))
+          .digest('hex'),
+      word,
+      introducedAt: 0,
+      dueAt,
+      lastServedAt,
+      practicePriority: priority,
+      ability: 'spelling',
+      exposureKnown: true,
+      lastAnswerExposureAt: null,
+      state: 'introduced',
+      fsrs: null,
+    });
+    return {
+      word,
+      schedule: { dueAt },
+      waiting: Math.max(dueAt, lastServedAt ?? -Infinity),
+      priority,
+    };
+  });
+  for (const offset of [0, 3, 4]) {
+    scheduling.servedCount = offset;
+    const pool = items.slice().reverse();
+    const result = orderMiniDue(pool, scheduling, 200);
+    for (const [i, selected] of result.entries()) {
+      const reserveOldest = (offset + i + 1) % 5 === 0;
+      pool.sort(
+        (a, b) =>
+          (reserveOldest ? 0 : b.priority - a.priority) ||
+          a.waiting - b.waiting ||
+          a.word.spelling.localeCompare(b.word.spelling),
+      );
+      assert.equal(selected, pool.shift());
+    }
+    assert.equal(pool.length, 0);
+  }
+});
+
 test('legacy migration uses recorded exposure without inventing model reviews or forcing an extra card view', async (t) => {
   const data = await fixture(t);
   data.act({ type: 'begin', target: 'review', deck: [apple], timezone });
@@ -564,30 +789,76 @@ test('same-clock pre-probe exposure is too soon, while an actual in-probe view r
   );
 });
 
-test('delayed hide receipts preserve their actual time and cannot close a later visit to the same word', async (t) => {
-  await t.test('a recovered hide retains the real hidden recall interval', async (child) => {
-    const data = await fixture(child);
-    data.act({ type: 'record_card_view', target: 'daily', word: apple });
-    data.advance(10);
-    const hiddenAt = swiftTime(data.date);
-    data.advance(300);
+test('a queued study-card view keeps its display time and does not reopen an already hidden card', async (t) => {
+  const data = await fixture(t);
+  data.act({ type: 'begin', target: 'daily', deck: [apple], timezone });
+  const dayId = data.store.snapshot().planning.activeDayId;
+  assert.ok(dayId);
+  data.act({ type: 'add_sentences', target: 'daily', dayId, sentences: [example(apple)] });
+  const recordView = (occurredAt: number) =>
     data.store.command(
       miniCommandSchema.parse({
         requestId: randomUUID(),
         expectedRevision: data.store.snapshot().revision,
-        occurredAt: hiddenAt,
-        action: { type: 'hide_card', target: 'daily', word: apple },
+        occurredAt,
+        action: {
+          type: 'record_card_view',
+          target: 'daily',
+          dayId,
+          session: 'learning',
+          word: apple,
+        },
       }),
     );
-    assert.equal(data.store.snapshot().scheduling.visibleWord, null);
-    assert.equal(data.store.snapshot().scheduling.views.at(-1)?.at, hiddenAt);
+  data.advance(2);
+  const shown = swiftTime(data.date);
+  data.advance(3);
+  const first = recordView(shown);
+  assert.equal(first.teaching.exposures.at(-1)?.at, shown);
+  assert.equal(first.teaching.exposures.at(-1)?.beforeAttemptCount, 0);
+  assert.equal(miniMemory(first, apple)?.lastAnswerExposureAt, shown);
+  assert.deepEqual(first.scheduling.visibleWord, apple);
+  const hidden = swiftTime(data.date);
+  data.act({ type: 'hide_card', target: 'daily', word: apple });
+  data.advance(10);
+  const late = recordView(shown + 1);
+  assert.equal(late.scheduling.views.at(-1)?.at, shown + 1);
+  assert.equal(late.scheduling.visibleWord, null);
+  assert.equal(miniMemory(late, apple)?.lastAnswerExposureAt, hidden);
+  const now = swiftTime(data.date);
+  assert.equal(recordView(now + 2).teaching.exposures.at(-1)?.at, now);
+});
+
+test('delayed hide receipts preserve their actual time and cannot close a later visit to the same word', async (t) => {
+  await t.test('a recovered hide retains the real hidden recall interval', async (child) => {
+    const data = await fixture(child);
+    const shown = data.act({ type: 'record_card_view', target: 'daily', word: apple });
+    data.advance(10);
+    const hiddenAt = swiftTime(data.date);
+    const hide = miniCommandSchema.parse({
+      requestId: randomUUID(),
+      expectedRevision: shown.revision,
+      occurredAt: hiddenAt,
+      action: { type: 'hide_card', target: 'daily', word: apple },
+    });
+    data.advance(300);
+    const later = data.act({ type: 'record_browse_views', target: 'daily', words: [book] });
+    assert.ok(later.revision > hide.expectedRevision);
+    const closed = data.store.command(hide);
+    assert.equal(closed.scheduling.visibleWord, null);
+    assert.equal(closed.scheduling.views.at(-1)?.at, hiddenAt);
+    data.reopen();
+    assert.deepEqual(data.store.command(hide), closed);
+    assert.throws(() => data.store.command({ ...hide, expectedRevision: later.revision }), {
+      code: 'REQUEST_CONFLICT',
+    });
     data.begin();
     assert.equal(data.answer('apple').classification, 'independent_success');
     assert.equal(data.probe().measurement?.lastAnswerExposureAt, hiddenAt);
   });
   await t.test('an old hide cannot clear a new visible visit to the same answer', async (child) => {
     const data = await fixture(child);
-    data.act({ type: 'record_card_view', target: 'daily', word: apple });
+    const shown = data.act({ type: 'record_card_view', target: 'daily', word: apple });
     data.advance(10);
     const oldHiddenAt = swiftTime(data.date);
     data.advance(300);
@@ -596,7 +867,7 @@ test('delayed hide receipts preserve their actual time and cannot close a later 
     data.store.command(
       miniCommandSchema.parse({
         requestId: randomUUID(),
-        expectedRevision: data.store.snapshot().revision,
+        expectedRevision: shown.revision,
         occurredAt: oldHiddenAt,
         action: { type: 'hide_card', target: 'daily', word: apple },
       }),
@@ -607,4 +878,35 @@ test('delayed hide receipts preserve their actual time and cannot close a later 
     assert.equal(data.answer('apple').classification, 'too_soon');
     assert.equal(data.probe().rating, undefined);
   });
+  await t.test(
+    'switching words before delivery quietly acknowledges only a dated past hide',
+    async (child) => {
+      const data = await fixture(child);
+      const shown = data.act({ type: 'record_card_view', target: 'daily', word: apple });
+      data.advance(1);
+      const occurredAt = swiftTime(data.date);
+      data.advance(1);
+      const next = data.act({ type: 'record_card_view', target: 'daily', word: book });
+      const base = { expectedRevision: shown.revision, occurredAt };
+      const hide = miniCommandSchema.parse({
+        ...base,
+        requestId: randomUUID(),
+        action: { type: 'hide_card', target: 'daily', word: apple },
+      });
+      assert.deepEqual(data.store.command(hide), next);
+      assert.deepEqual(data.store.commandReceipt(hide.requestId), {
+        requestId: hide.requestId,
+        revision: next.revision,
+      });
+      for (const input of [
+        { ...hide, occurredAt: undefined },
+        { ...hide, expectedRevision: next.revision + 1 },
+        { ...hide, action: { type: 'record_card_view', target: 'daily', word: apple } },
+      ]) {
+        const command = miniCommandSchema.parse({ ...input, requestId: randomUUID() });
+        assert.throws(() => data.store.command(command), { code: 'MINI_REVISION_CONFLICT' });
+      }
+      assert.deepEqual(data.store.snapshot(), next);
+    },
+  );
 });

@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 struct MiniTeachingMemory: Decodable, Sendable, Identifiable {
     let id: UUID
@@ -174,6 +175,13 @@ fileprivate indirect enum MiniStudyRebaseValue: Codable, Equatable, Sendable {
     }
 }
 
+struct MiniAISelection: Codable, Equatable, Sendable {
+    var model: String
+    var effort: String
+
+    static let initial = Self(model: "gpt-6.1-sol", effort: "xhigh")
+}
+
 struct MiniStudyAction: Codable, Sendable {
     enum Kind: String, Codable, Sendable {
         case begin, pause
@@ -189,6 +197,7 @@ struct MiniStudyAction: Codable, Sendable {
         case windowChoose = "window_choose"
         case windowCorrect = "window_correct"
         case windowAdvance = "window_advance"
+        case windowFamiliar = "window_familiar"
         case windowDraft = "window_draft"
         case completeReview = "complete_review"
         case markStudied = "mark_studied"
@@ -196,6 +205,7 @@ struct MiniStudyAction: Codable, Sendable {
         case addSentences = "add_sentences"
         case translationDraft = "translation_draft"
         case submitTranslation = "submit_translation"
+        case reviseTranslation = "revise_translation"
         case recordFeedback = "record_feedback"
         case publishWriting = "publish_writing"
         case qualitativeFeedback = "qualitative_feedback"
@@ -208,6 +218,7 @@ struct MiniStudyAction: Codable, Sendable {
         case clearSessionPlan = "clear_session_plan"
         case endSession = "end_session"
         case recordCardView = "record_card_view"
+        case recordBrowseViews = "record_browse_views"
         case hideCard = "hide_card"
         case openDictation = "open_dictation"
         case submitDictation = "submit_dictation"
@@ -233,13 +244,16 @@ struct MiniStudyAction: Codable, Sendable {
     var timezone: String? = nil
     var session: Session? = nil
     var word: MiniWord? = nil
+    var words: [MiniWord]? = nil
     var judgment: MiniReviewJudgment? = nil
     var markWrong: Bool? = nil
     var paused: Bool? = nil
     var draft: String? = nil
     var answer: String? = nil
     var sentences: [MiniStudySentence]? = nil
+    var visibleSentence: MiniStudySentence? = nil
     var taskId: String? = nil
+    var aiSelection: MiniAISelection? = nil
     var attemptId: UUID? = nil
     var feedback: MiniTranslationFeedback? = nil
     var prompts: [MiniWritingPromptInput]? = nil
@@ -254,10 +268,13 @@ struct MiniStudyAction: Codable, Sendable {
     var probeId: UUID? = nil
     var remainOnCard: Bool? = nil
     var newGroup: Bool? = nil
+    var intent: MiniStudyIntent? = nil
+    var extraGroupForDate: String? = nil
     var flowVersion: String? = nil
     var round: Int? = nil
     var remembered: Bool? = nil
     var advanceOnCorrect: Bool? = nil
+    var advanceAfterCorrect: Bool? = nil
     var dailyNewGoal: Int? = nil
     var groupSize: Int? = nil
     var visitId: UUID? = nil
@@ -291,12 +308,364 @@ struct MiniStudyCommand: Codable, Sendable {
     }
 }
 
+/// User input waiting for its receipt. The cursor identifies the precise prompt, including
+/// repeated visits to a word. Only the input is persisted; projected sessions are never saved.
+struct MiniReviewInput: Codable, Sendable, Identifiable {
+    struct Cursor: Codable, Equatable, Sendable {
+        let phase: MiniReviewSession.Phase
+        let word: MiniWord?
+        let judgment: MiniReviewJudgment?
+        let judgmentCount: Int
+        let attemptCount: Int
+        let spellingState: MiniReviewSession.SpellingState
+        let lastAnswer: String?
+
+        init(_ session: MiniReviewSession) {
+            phase = session.phase
+            word = session.currentWord
+            judgment = session.currentJudgment
+            judgmentCount = session.judgmentEvents.count
+            attemptCount = session.spellingAttempts.count
+            spellingState = session.spellingState
+            lastAnswer = session.lastSpellingAttempt?.answer
+        }
+    }
+
+    let id: UUID
+    let action: MiniStudyAction
+    let occurredAt: Date
+    // Old review journals contain only cursor. Window inputs retain the independent
+    // visit ID even for card-view actions, whose HTTP payload has no visit ID.
+    struct WindowCursor: Codable, Equatable, Sendable {
+        let id: UUID
+        let stage: Int
+        let initial: Bool?
+        let corrected: Bool
+
+        init(_ visit: MiniMemoryWindow.Visit) {
+            id = visit.id
+            stage = visit.stage
+            initial = visit.initial
+            corrected = visit.correctedAt != nil
+        }
+    }
+
+    let cursor: Cursor?
+    let windowCursor: WindowCursor?
+    let dictationAttemptCount: Int?
+
+    init?(action: MiniStudyAction, practice: MiniDictation, at: Date = .now) {
+        guard action.dictationId == practice.id, practice.closedAt == nil else { return nil }
+        switch action.type {
+        case .submitDictation:
+            guard let answer = action.answer, !answer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  answer.utf16.count <= 100_000 else { return nil }
+        case .revealDictation, .closeDictation: break
+        default: return nil
+        }
+        self.action = action
+        cursor = nil
+        windowCursor = nil
+        dictationAttemptCount = practice.attempts.count
+        occurredAt = at
+        id = UUID()
+    }
+
+    init?(action: MiniStudyAction, visit: MiniMemoryWindow.Visit, at: Date = .now) {
+        guard action.target == .daily, action.dayId != nil, action.session != nil, action.word == visit.word,
+              action.type == .recordCardView || action.type == .openDictation || action.visitId == visit.id else { return nil }
+        switch action.type {
+        case .recordCardView, .windowDraft: break
+        case .openDictation:
+            guard visit.showsFullCard else { return nil }
+        case .windowChoose:
+            guard visit.initial == nil, action.remembered != nil else { return nil }
+        case .windowCorrect:
+            guard visit.canCorrect else { return nil }
+        case .windowAdvance:
+            if action.markWrong == true {
+                guard visit.stage > 0, visit.canCorrect, action.remembered == nil else { return nil }
+            } else if visit.initial == nil {
+                guard visit.stage == 0, action.remembered != nil else { return nil }
+            } else if action.remembered != nil { return nil }
+        case .windowFamiliar:
+            guard action.session == .learning, visit.stage == 0, visit.initial == nil else { return nil }
+        default: return nil
+        }
+        self.action = action
+        cursor = nil
+        windowCursor = WindowCursor(visit)
+        dictationAttemptCount = nil
+        occurredAt = at
+        id = UUID()
+    }
+
+    init?(action: MiniStudyAction, session: MiniReviewSession, at: Date = .now) {
+        guard action.word != nil, action.word == session.currentWord else { return nil }
+        switch action.type {
+        case .recordCardView:
+            guard session.phase == .judgment else { return nil }
+        case .openDictation:
+            guard session.phase == .judgment, session.currentJudgment != nil else { return nil }
+        case .chooseJudgment:
+            guard session.phase == .judgment, session.currentJudgment == nil, action.judgment != nil else { return nil }
+        case .advanceJudgment:
+            guard session.phase == .judgment, session.currentJudgment != nil else { return nil }
+        case .submitSpelling:
+            guard session.phase == .spelling, [.awaitingFirst, .correcting].contains(session.spellingState),
+                  let answer = action.answer, answer != session.lastSpellingAttempt?.answer else { return nil }
+        case .advanceSpelling:
+            guard session.phase == .spelling, [.readyToAdvance, .skipped].contains(session.spellingState) else { return nil }
+        default: return nil
+        }
+        self.action = action
+        cursor = Cursor(session)
+        windowCursor = nil
+        dictationAttemptCount = nil
+        occurredAt = at
+        id = UUID()
+    }
+
+    func applies(to action: MiniStudyAction) -> Bool {
+        self.action.target == action.target && self.action.session == action.session
+            && self.action.recordId == action.recordId && self.action.dayId == action.dayId
+    }
+
+    /// A late audio/visibility receipt may legitimately advance the database revision.
+    /// Only resend when the original study identity and exact input cursor still match.
+    func matches(_ snapshot: MiniStudySnapshot) -> Bool {
+        guard snapshot.scheduling?.activeProbe == nil else { return false }
+        if let dictationAttemptCount, let practice = snapshot.practice?.activeDictation {
+            return action.dictationId == practice.id && dictationAttemptCount == practice.attempts.count
+                && action.target == practice.target && action.dayId == practice.dayId
+                && action.recordId == practice.recordId && action.session == practice.session
+        }
+        guard snapshot.practice?.activeDictation == nil else { return false }
+        if let windowCursor {
+            guard snapshot.planning.activeDayId == action.dayId,
+                  let day = snapshot.ledger.days.first(where: { $0.id == action.dayId }), !day.paused,
+                  (day.phase == .learning && action.session == .learning) || (day.phase == .review && action.session == .review),
+                  let visit = day.memoryWindow?.visit else { return false }
+            return windowCursor == WindowCursor(visit) && action.word == visit.word
+        }
+        guard let cursor else { return false }
+        let session: MiniReviewSession?
+        if action.target == .review {
+            guard let record = snapshot.reviewRecord, record.id == action.recordId, !record.paused,
+                  !record.continuedToLearning else { return false }
+            session = record.session
+        } else {
+            guard snapshot.planning.activeDayId == action.dayId,
+                  let day = snapshot.ledger.days.first(where: { $0.id == action.dayId }), !day.paused else { return false }
+            if action.session == .review, day.phase == .review { session = day.review }
+            else if action.session == .learning, day.phase == .learning { session = day.learning }
+            else { return false }
+        }
+        return session.map(Cursor.init) == cursor
+    }
+
+    func presentDictation(in practice: inout MiniDictation?) {
+        if action.type == .openDictation, practice == nil, let word = action.word {
+            practice = MiniDictation(id: id, target: action.target, dayId: action.dayId, recordId: action.recordId,
+                                     session: action.session ?? .review, word: word, openedAt: occurredAt,
+                                     closedAt: nil, revealedAt: nil, attempts: [])
+            return
+        }
+        guard var displayed = practice, displayed.id == action.dictationId,
+              displayed.attempts.count == dictationAttemptCount else { return }
+        switch action.type {
+        case .submitDictation:
+            guard let answer = action.answer else { return }
+            displayed.attempts.append(.init(id: id, answer: answer,
+                correct: MiniReviewSession.matchesSpelling(answer, word: displayed.word.spelling, trimWord: true),
+                submittedAt: occurredAt))
+            displayed.revealedAt = displayed.revealedAt ?? occurredAt
+            practice = displayed
+        case .revealDictation:
+            displayed.revealedAt = displayed.revealedAt ?? occurredAt
+            practice = displayed
+        case .closeDictation:
+            practice = nil
+        default: break
+        }
+    }
+
+    @discardableResult
+    func present(in visit: inout MiniMemoryWindow.Visit) -> Bool {
+        guard windowCursor == WindowCursor(visit), action.word == visit.word else { return false }
+        switch action.type {
+        case .windowChoose:
+            visit.initial = action.remembered
+            visit.selectedAt = occurredAt
+            visit.revealedAt = occurredAt
+        case .windowCorrect:
+            visit.correctedAt = occurredAt
+        default: return false
+        }
+        return true
+    }
+
+    func presentWindow(in day: inout MiniDailyDay) {
+        guard action.dayId == day.id,
+              (day.phase == .learning && action.session == .learning) ||
+              (day.phase == .review && action.session == .review),
+              var visit = day.memoryWindow?.visit, windowCursor == WindowCursor(visit),
+              action.word == visit.word else { return }
+        switch action.type {
+        case .windowAdvance, .windowFamiliar:
+            _ = day.advanceWindow(visitId: visit.id, nextId: id, remembered: action.remembered,
+                                  markWrong: action.markWrong == true, familiar: action.type == .windowFamiliar,
+                                  draft: action.draft, at: occurredAt)
+        case .windowChoose, .windowCorrect:
+            if present(in: &visit) { day.updateWindowVisit(visit) }
+        default:
+            break
+        }
+    }
+
+    /// Returns false at a boundary whose next card must be assigned by the server.
+    @discardableResult
+    func present(in session: inout MiniReviewSession) -> Bool {
+        guard cursor == Cursor(session) else { return false }
+        switch action.type {
+        case .chooseJudgment:
+            guard let judgment = action.judgment else { return false }
+            return session.chooseJudgment(judgment, at: occurredAt)
+        case .submitSpelling:
+            guard let answer = action.answer else { return false }
+            guard session.submitSpelling(answer, at: occurredAt, advanceLegacySkip: false) else { return false }
+            if action.advanceAfterCorrect == true, session.spellingState == .readyToAdvance,
+               session.hasKnownNextSpelling {
+                return session.advanceSpelling()
+            }
+            return true
+        case .advanceJudgment:
+            return session.hasKnownNextJudgment && session.advanceJudgment(markWrong: action.markWrong == true, at: occurredAt)
+        case .advanceSpelling:
+            return session.hasKnownNextSpelling && session.advanceSpelling()
+        default: return false
+        }
+    }
+}
+
+/// Persist immutable snapshots in their submission order, off the UI thread. While the
+/// disk is busy only the newest waiting snapshot is needed: it includes every live input.
+final class MiniClientFileWriter<Value: Sendable>: Sendable {
+    private struct State: Sendable {
+        var revision = 0
+        var finished = 0
+        var succeeded = true
+        var running = false
+        var waiting: Value?
+        var readers: [(through: Int, receive: @Sendable (Bool) -> Void)] = []
+    }
+
+    private let state = OSAllocatedUnfairLock(initialState: State())
+    private let io = DispatchQueue(label: "com.lingoweave.mini.client-files", qos: .userInitiated)
+    private let write: @Sendable (Value) throws -> Void
+
+    init(write: @escaping @Sendable (Value) throws -> Void) { self.write = write }
+
+    func replace(_ value: Value) {
+        let start = state.withLock {
+            $0.revision += 1
+            $0.waiting = value
+            if $0.running { return false }
+            $0.running = true
+            return true
+        }
+        if start { io.async { self.writeLatest() } }
+    }
+
+    private func writeLatest() {
+        let work = state.withLock { state -> (Int, Value)? in
+            guard let value = state.waiting else { return nil }
+            state.waiting = nil
+            return (state.revision, value)
+        }
+        guard let (revision, value) = work else { return }
+        var saved = false
+        for attempt in 0...3 {
+            do { try write(value); saved = true; break }
+            catch {
+                if attempt < 3 { Thread.sleep(forTimeInterval: 0.05 * Double(attempt + 1)) }
+            }
+        }
+        let result = saved
+        let (readers, more) = state.withLock { state in
+            state.finished = revision
+            state.succeeded = result
+            let ready = state.readers.filter { $0.through <= revision }
+            state.readers.removeAll { $0.through <= revision }
+            state.running = state.waiting != nil
+            return (ready, state.running)
+        }
+        for reader in readers { reader.receive(result) }
+        if more { io.async { self.writeLatest() } }
+    }
+
+    private func afterCurrentWrite(_ receive: @escaping @Sendable (Bool) -> Void) {
+        let result = state.withLock { state -> Bool? in
+            if state.finished == state.revision { return state.succeeded }
+            state.readers.append((state.revision, receive))
+            return nil
+        }
+        if let result { receive(result) }
+    }
+
+    func flushed() async -> Bool {
+        await withCheckedContinuation { reply in afterCurrentWrite { reply.resume(returning: $0) } }
+    }
+
+    /// Closing the app can give the last local write a bounded grace period. No HTTP is awaited.
+    func finishOnQuit() {
+        let done = DispatchSemaphore(value: 0)
+        afterCurrentWrite { _ in done.signal() }
+        _ = done.wait(timeout: .now() + 1)
+    }
+
+    func perform<Result: Sendable>(_ operation: @escaping @Sendable () throws -> Result) async throws -> Result {
+        try await withCheckedThrowingContinuation { reply in
+            io.async { reply.resume(with: Swift.Result { try operation() }) }
+        }
+    }
+}
+
+typealias MiniReviewJournal = MiniClientFileWriter<[MiniReviewInput]>
+
 struct MiniStudyImport: Codable, Sendable {
     let requestId: UUID
     let ledger: MiniDailyLedger
     let reviewRecord: MiniReviewRecord?
     let reviewHistory: [MiniReviewRecord]
     let timezone: String
+}
+
+struct MiniBrowseViewport {
+    private(set) var rows: [MiniWord] = []
+    private var onScreen: [MiniWord] = []
+
+    private static func key(_ word: MiniWord) -> [String] {
+        [word.spelling.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+         word.meaning.trimmingCharacters(in: .whitespacesAndNewlines)]
+    }
+
+    mutating func update(_ layout: [MiniWord], visible: Bool, revision: Int, at: Date = .now) -> [MiniStudyCommand] {
+        var unique = Set<[String]>()
+        rows = layout.filter { word in
+            let key = Self.key(word)
+            return !key[0].isEmpty && unique.insert(key).inserted
+        }
+        let next = visible ? rows : []
+        let before = Set(onScreen.map(Self.key)), after = Set(next.map(Self.key))
+        let changed = onScreen.filter { !after.contains(Self.key($0)) } + next.filter { !before.contains(Self.key($0)) }
+        onScreen = next
+        return stride(from: 0, to: changed.count, by: 64).map { start in
+            var action = MiniStudyAction(type: .recordBrowseViews, target: .daily)
+            action.words = Array(changed[start..<min(start + 64, changed.count)])
+            return MiniStudyCommand(expectedRevision: revision, action: action, occurredAt: at)
+        }
+    }
 }
 
 /// The files below are recovery copies and a command outbox, never a writable learning ledger.
@@ -352,6 +721,21 @@ struct MiniStudyClient: Sendable {
         if command.action.type == .hideCard {
             return command.occurredAt != nil && command.action.target == .daily && command.action.word != nil
         }
+        if command.action.type == .reviseTranslation {
+            let action = command.action
+            guard command.occurredAt != nil, command.expectedRevision == before.revision,
+                  before.schemaVersion == after.schemaVersion, before.imported, after.imported,
+                  after.revision > before.revision, let dayId = action.dayId,
+                  let taskId = action.taskId, let attemptId = action.attemptId else { return false }
+            return [before, after].allSatisfy { snapshot in
+                guard snapshot.planning.activeDayId == dayId,
+                      let day = snapshot.ledger.days.first(where: { $0.id == dayId }),
+                      !day.paused, day.phase == .translation,
+                      let attempt = day.translation.last(where: { $0.taskID == taskId }),
+                      attempt.latestID == attemptId else { return false }
+                return day.translationTask(at: day.translationPageIndex(selection: taskId))?.id == taskId
+            }
+        }
         guard command.occurredAt != nil, command.expectedRevision == before.revision,
               before.schemaVersion == after.schemaVersion, before.imported, after.imported,
               after.revision > before.revision,
@@ -361,7 +745,7 @@ struct MiniStudyClient: Sendable {
         let word = action.word
         if action.type == .recordCardView { return true }
         switch action.type {
-        case .chooseJudgment, .advanceJudgment, .submitSpelling, .advanceSpelling, .submitTranslation, .advanceTranslation, .markStudied, .memoryAdvance, .memoryReveal, .memoryDraft, .windowChoose, .windowCorrect, .windowAdvance, .windowDraft: break
+        case .chooseJudgment, .advanceJudgment, .submitSpelling, .advanceSpelling, .submitTranslation, .advanceTranslation, .markStudied, .memoryAdvance, .memoryReveal, .memoryDraft, .windowChoose, .windowCorrect, .windowAdvance, .windowFamiliar, .windowDraft: break
         default: return false
         }
         let session: MiniReviewSession?
@@ -375,7 +759,8 @@ struct MiniStudyClient: Sendable {
                     ? day.currentAttempt == nil && action.answer?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
                     : day.currentAttempt != nil && day.currentAttempt?.confirmedAt == nil
             }
-            if [.windowChoose, .windowCorrect, .windowAdvance, .windowDraft].contains(action.type) {
+            if [.windowChoose, .windowCorrect, .windowAdvance, .windowFamiliar, .windowDraft].contains(action.type) {
+                if action.type == .windowFamiliar, day.phase != .learning || day.memoryWindow?.visit?.stage != 0 || day.memoryWindow?.visit?.initial != nil { return false }
                 return day.memoryWindow?.visit?.id == action.visitId && day.memoryWindow?.visit?.word == word
                     && action.session == (day.phase == .review ? .review : .learning)
             }
@@ -406,8 +791,10 @@ struct MiniStudyClient: Sendable {
         case .advanceSpelling:
             return session.phase == .spelling && (session.spellingState == .readyToAdvance || session.spellingState == .skipped)
         case .submitSpelling:
-            return session.phase == .spelling && session.spellingState != .readyToAdvance
-                && action.answer?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            guard let answer = action.answer else { return false }
+            return session.phase == .spelling
+                && (session.spellingState == .awaitingFirst || session.spellingState == .correcting)
+                && answer != session.lastSpellingAttempt?.answer
         default: return false
         }
     }
@@ -464,6 +851,27 @@ struct MiniStudyClient: Sendable {
         try writePrivate(JSONEncoder().encode(receipt), to: legacyDirectory.appending(path: "migration-backup/import-receipt.json"))
     }
 
+    static let reviewJournal = MiniReviewJournal { try MiniStudyClient().saveReviewInputs($0) }
+    static let draftJournal = MiniClientFileWriter<[String: String]> { try MiniStudyClient().saveDrafts($0) }
+
+    func persistPending(_ command: MiniStudyCommand) async throws {
+        try await Self.reviewJournal.perform { try self.savePending(command) }
+    }
+
+    func releasePending(_ id: UUID) async throws {
+        try await Self.reviewJournal.perform { try self.clearPending(requestId: id) }
+    }
+
+    func pendingReviewInputs() throws -> [MiniReviewInput] {
+        let file = legacyDirectory.appending(path: "service-client/review-inputs.json")
+        return try readIfPresent(file).map { try JSONDecoder().decode([MiniReviewInput].self, from: $0) } ?? []
+    }
+
+    func saveReviewInputs(_ inputs: [MiniReviewInput]) throws {
+        let file = legacyDirectory.appending(path: "service-client/review-inputs.json")
+        try writePrivate(JSONEncoder().encode(inputs), to: file)
+    }
+
     func pendingCommand() throws -> MiniStudyCommand? {
         try readIfPresent(pendingFile).map { try JSONDecoder().decode(MiniStudyCommand.self, from: $0) }
     }
@@ -499,6 +907,20 @@ struct MiniStudyClient: Sendable {
         try writePrivate(JSONEncoder().encode(commands), to: recoveryDirectory.appending(path: "visibility-outbox.json"))
     }
 
+    func pendingBrowseViews() throws -> [MiniStudyCommand] {
+        let pending = try readIfPresent(recoveryDirectory.appending(path: "browse-views.json"))
+            .map { try JSONDecoder().decode([MiniStudyCommand].self, from: $0) } ?? []
+        guard pending.allSatisfy({ $0.action.type == .recordBrowseViews && $0.action.target == .daily &&
+            (1...64).contains($0.action.words?.count ?? 0) && $0.occurredAt != nil }) else {
+            throw MiniStudyClientError.invalidResponse
+        }
+        return pending
+    }
+
+    func saveBrowseViews(_ commands: [MiniStudyCommand]) throws {
+        try writePrivate(JSONEncoder().encode(commands), to: recoveryDirectory.appending(path: "browse-views.json"))
+    }
+
     private var pendingFile: URL { legacyDirectory.appending(path: "service-client/pending-command.json") }
     private var draftsFile: URL { legacyDirectory.appending(path: "service-client/drafts.json") }
 
@@ -508,13 +930,15 @@ struct MiniStudyClient: Sendable {
         return snapshot
     }
 
-    func serviceRequest<Response: Decodable & Sendable>(path: String, body: Data?) async throws -> Response {
-        try JSONDecoder().decode(Response.self, from: await serviceData(path: path, body: body))
+    func serviceRequest<Response: Decodable & Sendable>(path: String, body: Data?, query: [URLQueryItem] = [],
+                                                      retryTransport: Bool = true) async throws -> Response {
+        try JSONDecoder().decode(Response.self, from: await serviceData(path: path, body: body, query: query,
+                                                                       retryTransport: retryTransport))
     }
 
     var recoveryDirectory: URL { legacyDirectory.appending(path: "service-client", directoryHint: .isDirectory) }
 
-    func serviceData(path: String, body: Data? = nil) async throws -> Data {
+    func serviceData(path: String, body: Data? = nil, query: [URLQueryItem] = [], retryTransport: Bool = true) async throws -> Data {
         guard baseURL.scheme == "http", ["127.0.0.1", "localhost", "[::1]"].contains(baseURL.host) else {
             throw MiniStudyClientError.configuration
         }
@@ -522,17 +946,18 @@ struct MiniStudyClient: Sendable {
         guard !token.isEmpty, token.count <= 4_096, !token.contains(where: \.isNewline) else {
             throw MiniStudyClientError.configuration
         }
-        var request = URLRequest(url: baseURL.appending(path: "api/mini/" + path),
+        let endpoint = baseURL.appending(path: "api/mini/" + path)
+        var request = URLRequest(url: query.isEmpty ? endpoint : endpoint.appending(queryItems: query),
                                  cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 15)
         request.httpMethod = body == nil ? "GET" : "POST"
         request.httpBody = body
         request.setValue("Bearer " + token, forHTTPHeaderField: "Authorization")
         if body != nil { request.setValue("application/json", forHTTPHeaderField: "Content-Type") }
-        let delays: [Duration] = body == nil ? [] : [.milliseconds(150), .milliseconds(350), .milliseconds(700)]
+        let delays: [Duration] = body != nil && retryTransport ? [.milliseconds(150), .milliseconds(350), .milliseconds(700)] : []
         var retry = 0
         while true {
             do {
-                return try await responseData(for: request)
+                return try await responseData(for: request, path: path)
             } catch {
                 let transient: Bool
                 switch error {
@@ -547,10 +972,23 @@ struct MiniStudyClient: Sendable {
         }
     }
 
-    private func responseData(for request: URLRequest) async throws -> Data {
+    private func responseData(for request: URLRequest, path: String) async throws -> Data {
         let (data, response) = try await Self.session.data(for: request)
         guard let response = response as? HTTPURLResponse else { throw MiniStudyClientError.invalidResponse }
-        if response.statusCode == 409 { throw MiniStudyClientError.conflict }
+        if response.statusCode == 409 {
+            if let detail = try? JSONDecoder().decode(MiniServiceFailure.self, from: data).error {
+                if path == "commands", let code = detail.code, code != "MINI_REVISION_CONFLICT" {
+                    throw MiniStudyClientError.commandRejected(detail.message)
+                }
+                if path == "audio/playback" {
+                    if detail.code == "AUDIO_TARGET_CHANGED" || detail.code == "AUDIO_AUTOPLAY_FORBIDDEN" {
+                        throw MiniStudyClientError.staleAudio
+                    }
+                    throw MiniStudyClientError.service(detail.message)
+                }
+            }
+            throw MiniStudyClientError.conflict
+        }
         if response.statusCode == 401 || response.statusCode == 403 { throw MiniStudyClientError.unauthorized }
         if response.statusCode >= 500 { throw MiniStudyClientError.unavailable }
         guard (200..<300).contains(response.statusCode) else {
@@ -576,13 +1014,13 @@ struct MiniStudyClient: Sendable {
 }
 
 private struct MiniServiceFailure: Decodable {
-    struct Detail: Decodable { let message: String }
+    struct Detail: Decodable { let code: String?; let message: String }
     let error: Detail
 }
 
 enum MiniStudyClientError: LocalizedError {
     case configuration, invalidResponse, unauthorized, conflict, rejected, backupConflict, unavailable
-    case service(String)
+    case commandRejected(String), service(String), staleAudio
 
     var errorDescription: String? {
         switch self {
@@ -593,7 +1031,8 @@ enum MiniStudyClientError: LocalizedError {
         case .rejected: "学习服务未接受这次操作，已有记录已保留。"
         case .backupConflict: "旧记录与迁移备份不一致，请先检查本机记录。"
         case .unavailable: "本机学习服务暂不可用。"
-        case .service(let message): message
+        case .commandRejected(let message), .service(let message): message
+        case .staleAudio: "当前词卡已切换，可在新词卡上重播。"
         }
     }
 }

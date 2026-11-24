@@ -9,6 +9,7 @@ struct MiniMemoryView: View {
     @State private var viewport = MiniMemoryViewport()
     @State private var query = ""
     @State private var filter = MemoryFilter.all
+    @State private var wordPageNumber = 1
     @State private var dimension = MiniMemoryDimension.meaning
     @State private var selectedID: String?
     @State private var hoveredID: String?
@@ -29,13 +30,13 @@ struct MiniMemoryView: View {
         return selectedID + "/" + viewport.key + "/\(overview.asOf.timeIntervalSinceReferenceDate)/\(detailReload)"
     }
     private var filteredWords: [MiniMemoryWord] {
+        let words = overview?.words ?? []
         let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        return (overview?.words ?? []).filter { item in
+        if needle.isEmpty && filter == .all { return words }
+        // The overview already orders all senses by due date, spelling and sense ID.
+        return words.filter { item in
             filter.includes(item.status) && (needle.isEmpty || item.word.spelling.localizedCaseInsensitiveContains(needle)
                 || item.word.meaning.localizedCaseInsensitiveContains(needle))
-        }.sorted {
-            if $0.dueAt != $1.dueAt { return ($0.dueAt ?? .distantFuture) < ($1.dueAt ?? .distantFuture) }
-            return $0.word.spelling.localizedStandardCompare($1.word.spelling) == .orderedAscending
         }
     }
     private var scatterWords: [MiniMemoryWord] {
@@ -51,18 +52,21 @@ struct MiniMemoryView: View {
                     summary(overview.summary)
                     controls
                     HStack(alignment: .top, spacing: 16) {
-                        ScrollView {
-                            VStack(spacing: 16) {
-                                scatterPanel
-                                workloadPanel(overview)
-                                wordList
-                                if !overview.notices.isEmpty {
-                                    Text(overview.notices.joined(separator: "\n"))
-                                        .font(.caption).foregroundStyle(.secondary)
-                                        .frame(maxWidth: .infinity, alignment: .leading)
+                        ScrollViewReader { scroll in
+                            ScrollView {
+                                LazyVStack(spacing: 0, pinnedViews: [.sectionHeaders]) {
+                                    scatterPanel.padding(.bottom, 16)
+                                    workloadPanel(overview).padding(.bottom, 16)
+                                    wordList(scroll: scroll)
+                                    if !overview.notices.isEmpty {
+                                        Text(overview.notices.joined(separator: "\n"))
+                                            .font(.caption).foregroundStyle(.secondary)
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                            .padding(.top, 16)
+                                    }
                                 }
+                                .padding(2)
                             }
-                            .padding(2)
                         }
                         .frame(maxWidth: .infinity)
                         ScrollView { detailPanel.padding(2) }
@@ -84,11 +88,11 @@ struct MiniMemoryView: View {
         .tint(accent)
         .task(id: requestKey) { await loadOverview() }
         .task(id: detailKey) { await loadDetail() }
-        .onReceive(NotificationCenter.default.publisher(for: Notification.Name("miniMemoryWindowPresented"))) { _ in
+        .onReceive(NotificationCenter.default.publisher(for: .miniMemoryWindowPresented)) { _ in
             if !loading, lastRefresh.map({ Date.now.timeIntervalSince($0) > 15 }) ?? false { reload += 1 }
         }
-        .onChange(of: query) { _, _ in keepSelectionVisible() }
-        .onChange(of: filter) { _, _ in keepSelectionVisible() }
+        .onChange(of: query) { _, _ in keepSelectionVisible(resetPage: true) }
+        .onChange(of: filter) { _, _ in keepSelectionVisible(resetPage: true) }
         .accessibilityIdentifier("memoryDashboard")
     }
 
@@ -121,9 +125,9 @@ struct MiniMemoryView: View {
     private func summary(_ summary: MiniMemoryOverview.Summary) -> some View {
         HStack(spacing: 12) {
             MemoryStat(title: "记录中的词", value: summary.wordCount, subtitle: "已完成 \(summary.completedWordCount) 词", color: accent)
-            MemoryStat(title: "到期复习", value: summary.dueCount, subtitle: "按真实复习安排", color: .orange)
+            MemoryStat(title: "待复习", value: summary.dueCount, subtitle: summary.overdueCount.map { "其中往日积压 \($0) 词" } ?? "含当前复习组", color: .orange)
             MemoryStat(title: "可看估计", value: summary.measuredWordCount, subtitle: "至少一个维度有证据", color: .indigo)
-            MemoryStat(title: "积累中", value: summary.learningCount, subtitle: "等待更多学习证据", color: .secondary)
+            MemoryStat(title: "学习中", value: summary.learningCount, subtitle: "当前还未完成的新词", color: .secondary)
         }
     }
 
@@ -191,7 +195,7 @@ struct MiniMemoryView: View {
                 }
                 HStack(spacing: 12) {
                     MemoryLegend(color: accent, text: "已安排")
-                    MemoryLegend(color: .orange, text: "已到期")
+                    MemoryLegend(color: .orange, text: "待复习")
                     Spacer(minLength: 2)
                     Text("图中 \(scatterWords.count) 词").font(.caption2).foregroundStyle(.secondary)
                 }
@@ -242,7 +246,11 @@ struct MiniMemoryView: View {
                             }
                         }
                         .gesture(SpatialTapGesture().onEnded { value in
-                            if let item = nearestWord(at: value.location, plot: plot) { selectedID = item.senseId }
+                            if let item = nearestWord(at: value.location, plot: plot),
+                               let index = filteredWords.firstIndex(where: { $0.senseId == item.senseId }) {
+                                selectedID = item.senseId
+                                wordPageNumber = MiniMemoryWordPage.number(containing: index)
+                            }
                         })
                 }
             }
@@ -279,7 +287,7 @@ struct MiniMemoryView: View {
                         BarMark(x: .value("日期", item.at, unit: .day), y: .value("词数", item.count))
                             .foregroundStyle(accent.opacity(0.55)).cornerRadius(2)
                     }
-                    .chartXScale(domain: viewport.range)
+                    .chartXScale(domain: viewport.calendarRange)
                     .chartXAxis { AxisMarks(values: .automatic(desiredCount: 4)) { _ in AxisValueLabel(format: .dateTime.month(.abbreviated).day()) } }
                     .chartYAxis { AxisMarks(position: .leading, values: .automatic(desiredCount: 3)) }
                     .frame(height: 110)
@@ -288,39 +296,28 @@ struct MiniMemoryView: View {
                     Text("这个时间范围内还没有已排期的复习。")
                         .font(.callout).foregroundStyle(.secondary).frame(maxWidth: .infinity, minHeight: 75)
                 }
-                Text("这是已经保存的安排；之后的复习与评价还会调整它。")
+                Text("按原定日期统计。往日积压计入上方「待复习」。")
                     .font(.caption2).foregroundStyle(.secondary)
             }
         }
     }
 
-    private var wordList: some View {
-        MemoryPanel {
+    private func wordList(scroll: ScrollViewProxy) -> some View {
+        let words = filteredWords
+        let page = MiniMemoryWordPage(words: words, number: wordPageNumber)
+        func changePage(_ number: Int) {
+            wordPageNumber = number
+            scroll.scrollTo("memoryWordListStart", anchor: .top)
+        }
+
+        return Section {
             VStack(alignment: .leading, spacing: 10) {
-                HStack {
-                    Text("词汇记录").font(.headline)
-                    Spacer()
-                    Text("\(filteredWords.count) 词").font(.caption).foregroundStyle(.secondary)
-                }
-                HStack(spacing: 8) {
-                    HStack(spacing: 5) {
-                        Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-                        TextField("搜索单词或释义", text: $query).textFieldStyle(.plain)
-                            .accessibilityIdentifier("memorySearch")
-                        if !query.isEmpty { Button { query = "" } label: { Image(systemName: "xmark.circle.fill") }.buttonStyle(.plain).foregroundStyle(.secondary) }
-                    }
-                    .padding(8).background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 8))
-                    Picker("到期状态", selection: $filter) {
-                        ForEach(MemoryFilter.allCases) { Text($0.rawValue).tag($0) }
-                    }
-                    .labelsHidden().frame(width: 110)
-                }
-                if filteredWords.isEmpty {
+                if page.rows.isEmpty {
                     Text(query.isEmpty ? "这个筛选下暂时没有词。" : "没有找到匹配的词。")
                         .foregroundStyle(.secondary).font(.callout).padding(.vertical, 18)
                 }
                 LazyVStack(spacing: 3) {
-                    ForEach(filteredWords) { item in
+                    ForEach(page.rows) { item in
                         Button { selectedID = item.senseId } label: {
                             HStack(spacing: 10) {
                                 VStack(alignment: .leading, spacing: 3) {
@@ -348,6 +345,47 @@ struct MiniMemoryView: View {
                 Text("词表保留范围外及积累中的词，搜索和状态筛选也会作用于散点。")
                     .font(.caption2).foregroundStyle(.secondary)
             }
+            .padding([.horizontal, .bottom], 17)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color(nsColor: .controlBackgroundColor), in: UnevenRoundedRectangle(bottomLeadingRadius: 16, bottomTrailingRadius: 16))
+        } header: {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Text("词汇记录").font(.headline)
+                    Text("\(words.count) 词").font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    if page.count > 1 {
+                        HStack(spacing: 10) {
+                            Button { changePage(page.number - 1) } label: { Image(systemName: "chevron.left") }
+                                .disabled(page.number == 1)
+                                .accessibilityLabel("上一页").accessibilityIdentifier("memoryWordPreviousPage")
+                            Text("\(page.number) / \(page.count) 页")
+                                .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                                .accessibilityIdentifier("memoryWordPage")
+                            Button { changePage(page.number + 1) } label: { Image(systemName: "chevron.right") }
+                                .disabled(page.number == page.count)
+                                .accessibilityLabel("下一页").accessibilityIdentifier("memoryWordNextPage")
+                        }
+                        .buttonStyle(.bordered).controlSize(.small)
+                    }
+                }
+                HStack(spacing: 8) {
+                    HStack(spacing: 5) {
+                        Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                        TextField("搜索单词或释义", text: $query).textFieldStyle(.plain)
+                            .accessibilityIdentifier("memorySearch")
+                        if !query.isEmpty { Button { query = "" } label: { Image(systemName: "xmark.circle.fill") }.buttonStyle(.plain).foregroundStyle(.secondary) }
+                    }
+                    .padding(8).background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 8))
+                    Picker("到期状态", selection: $filter) {
+                        ForEach(MemoryFilter.allCases) { Text($0.rawValue).tag($0) }
+                    }
+                    .labelsHidden().frame(width: 110)
+                }
+            }
+            .padding(.horizontal, 17).padding(.top, 14).padding(.bottom, 8)
+            .background(Color(nsColor: .controlBackgroundColor), in: UnevenRoundedRectangle(topLeadingRadius: 16, topTrailingRadius: 16))
+            .id("memoryWordListStart")
         }
     }
 
@@ -363,7 +401,7 @@ struct MiniMemoryView: View {
                                 Text(selectedWord.word.meaning).font(.callout).foregroundStyle(.secondary)
                             }
                             Spacer(minLength: 4)
-                            Text(selectedWord.status.label).font(.caption.weight(.medium))
+                            Text(selectedWord.inCurrentReview == true ? "本组待完成" : selectedWord.status.label).font(.caption.weight(.medium))
                                 .padding(.horizontal, 8).padding(.vertical, 4)
                                 .background(accent.opacity(0.08), in: Capsule()).foregroundStyle(accent)
                         }
@@ -383,7 +421,7 @@ struct MiniMemoryView: View {
                             Text("最近复习 " + last.formatted(.dateTime.year().month().day()) + " · \(selectedWord.reviewCount) 次记录")
                                 .font(.caption2).foregroundStyle(.secondary)
                         } else {
-                            Text("完成学习会先安排次日复习，再逐步积累可估计的记录。")
+                            Text("还没有完成的复习记录。")
                                 .font(.caption2).foregroundStyle(.secondary)
                         }
                     }
@@ -485,12 +523,14 @@ struct MiniMemoryView: View {
         }.frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    private func keepSelectionVisible() {
+    private func keepSelectionVisible(resetPage: Bool = false) {
         let visible = filteredWords
+        let page = MiniMemoryWordPage(words: visible, number: resetPage ? 1 : wordPageNumber)
+        wordPageNumber = page.number
         if !visible.contains(where: { $0.senseId == selectedID }) {
-            let measured = visible.filter { $0.meaning != nil || $0.spelling != nil }
+            let measured = page.rows.filter { $0.meaning != nil || $0.spelling != nil }
             selectedID = measured.first(where: { $0.dueAt.map(viewport.range.contains) == true })?.senseId
-                ?? measured.first?.senseId ?? visible.first?.senseId
+                ?? measured.first?.senseId ?? page.rows.first?.senseId
         }
         hoveredID = nil
     }
@@ -534,10 +574,10 @@ struct MiniMemoryView: View {
 }
 
 private enum MemoryFilter: String, CaseIterable, Identifiable {
-    case all = "全部状态", due = "已到期", scheduled = "已安排", learning = "积累中"
+    case all = "全部状态", due = "待复习", scheduled = "已安排", learning = "学习中", unscheduled = "未排期"
     var id: String { rawValue }
     func includes(_ status: MiniMemoryWord.Status) -> Bool {
-        switch self { case .all: true; case .due: status == .due; case .scheduled: status == .scheduled; case .learning: status == .learning || status == .unmeasured }
+        switch self { case .all: true; case .due: status == .due; case .scheduled: status == .scheduled; case .learning: status == .learning; case .unscheduled: status == .unmeasured }
     }
 }
 

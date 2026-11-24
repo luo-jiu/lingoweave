@@ -139,13 +139,14 @@ function focus(data: Fixture, expression = 'an apple') {
     .teaching.focusItems.at(-1);
 }
 const qualitative = {
-  comment: '意思清楚。',
-  tip: '可以留意冠词。',
+  expressionGrade: 'off_meaning' as const,
+  comment: '原句说的是今天需要苹果，译文漏掉了这件事。',
+  tip: '留意 need 的意思。',
   usefulPhrase: 'an apple',
-  strengths: ['表达了核心意思'],
-  improvements: ['加上冠词'],
-  keyPoints: ['可数名词单数的限定词'],
-  referenceTranslation: 'We need an apple today.',
+  strengths: [],
+  improvements: ['补出今天需要苹果这件事'],
+  keyPoints: ['need 表示需要'],
+  referenceTranslation: '我们今天需要一个苹果。',
 };
 function finishWriting(data: Fixture) {
   const task = currentTranslation(data.day());
@@ -280,6 +281,18 @@ test('new writing requires separate immutable prompts, qualitative feedback pres
     attemptId: attempt.id,
     feedback: qualitative,
   });
+  assert.throws(
+    () =>
+      data.store.aiCommand(
+        data.command({
+          ...data.context(),
+          type: 'qualitative_feedback',
+          attemptId: attempt.id,
+          feedback: { ...qualitative, expressionGrade: 'understandable' },
+        }),
+      ),
+    hasCode('TRANSLATION_MEANING_RUBRIC'),
+  );
   data.store.aiCommand(input);
   data.store.aiCommand(input);
   assert.equal(data.day().translation[0]?.answer, '  真正的用户原答  ');
@@ -722,6 +735,133 @@ test('AI preparation and preference changes never fabricate user activity in adv
   assert.equal(data.store.aiContext({ timezone }).summary.activityDays, 1);
   assert.equal(data.store.aiContext({ timezone }).summary.viewedLexemes, 1);
   assert.throws(() => data.store.wordContext({ word: river }), hasCode('MINI_TEACHING_CONFLICT'));
+});
+
+test('starter lookup finds a viewed frame through its example and excludes word cards with the same search term', (t) => {
+  const data = fixture(t);
+  const patternBatch = data.store.patterns(timezone);
+  const frame = patternBatch.batch[0];
+  assert.ok(frame);
+  data.store.viewPattern({ timezone, batchId: patternBatch.batchId, patternId: frame.id });
+  const bag = { spelling: 'bag', meaning: '包', phonetic: '' };
+  const example = { word: bag, english: 'My bag is on the chair.', chinese: '我的包在椅子上。' };
+  data.begin([bag]);
+  data.act({ ...data.context(), type: 'add_sentences', sentences: [example] });
+  data.act({ ...data.context(), type: 'mark_studied', word: bag });
+
+  const before = data.store.snapshot();
+  for (const q of ['bag', '包']) {
+    const query = { q, offset: 0, limit: 50 };
+    const mixed = data.store.phrases(query);
+    assert.deepEqual(mixed.items.map((item) => item.kind).sort(), ['pattern', 'sentence']);
+    const starters = data.store.phrases({ ...query, kind: 'pattern' });
+    assert.deepEqual(
+      starters.items,
+      mixed.items.filter((item) => item.kind === 'pattern'),
+    );
+    assert.equal(starters.total, 1);
+    assert.equal(starters.items[0]?.expression, frame.frame);
+    assert.equal(starters.items[0]?.exampleEnglish, frame.example);
+  }
+  assert.equal(data.store.phrases({ q: 'chair', kind: 'pattern', offset: 0, limit: 50 }).total, 0);
+  assert.deepEqual(data.store.snapshot(), before);
+});
+
+test('the phrase library distinguishes prepared focus from actual exposure, preserves archived history and refreshes read-only search', (t) => {
+  const data = fixture(t);
+  data.begin();
+  const item = focus(data);
+  assert.ok(item);
+  const query = { q: '常见 APPLE', offset: 0, limit: 50 };
+  assert.equal(data.store.phrases(query).total, 0);
+  for (let i = 0; i < 2; i++)
+    data.act({
+      ...data.context(),
+      type: 'record_exposure',
+      kind: 'focusView',
+      source: 'ui',
+      word: apple,
+      focusIds: [item.id],
+    });
+  const page = data.store.phrases(query);
+  assert.equal(page.total, 1);
+  assert.equal(page.items[0]?.kind, 'focus');
+  assert.equal(page.items[0]?.status, 'encountered');
+  data.act({
+    ...data.context(),
+    type: 'update_focus',
+    focusId: item.id,
+    status: 'archived',
+    reason: '过一段时间再复习',
+  });
+  const before = data.store.snapshot();
+  assert.deepEqual(data.store.phrases(query), page);
+  assert.deepEqual(data.store.snapshot(), before);
+});
+
+test('translation history lists English prompts and reproduced English references, never an unseen reference or wrong answer', (t) => {
+  for (const reproduce of [true, false]) {
+    const data = fixture(t);
+    data.begin([apple, bank]);
+    data.learn();
+    data.prepare();
+    const query = { q: 'need', offset: 0, limit: 50 };
+    assert.equal(data.store.phrases(query).total, 0);
+    const prompt = currentTranslation(data.day());
+    assert.equal(prompt?.direction, 'englishToChinese');
+    finishWriting(data);
+    assert.equal(data.store.phrases(query).items[0]?.expression, prompt?.sentence.english);
+    const next = currentTranslation(data.day());
+    assert.ok(next && next.direction === 'chineseToEnglish');
+    data.act({
+      ...data.context(),
+      type: 'submit_translation',
+      taskId: next.id,
+      answer: reproduce ? next.sentence.english.toLowerCase() : 'Private incorrect text',
+    });
+    const entries = data.store.phrases(query).items;
+    assert.equal(
+      entries.some((e) => e.expression === next.sentence.english),
+      reproduce,
+    );
+    assert.equal(data.store.phrases({ ...query, q: 'private incorrect' }).total, 0);
+  }
+});
+
+test('the advisor reports a learner’s familiarity declaration separately from memory practice', (t) => {
+  const data = fixture(t);
+  data.act({
+    type: 'begin',
+    target: 'daily',
+    deck: [apple],
+    timezone,
+    flowVersion: 'sliding-window-v2',
+  });
+  const visit = data.day().flow?.window.visit;
+  assert.ok(visit);
+  data.act({
+    ...data.context(),
+    type: 'add_sentences',
+    sentences: [{ word: apple, english: 'I have an apple.', chinese: '我有一个苹果。' }],
+  });
+  const command = data.command({
+    ...data.context(),
+    type: 'window_familiar',
+    session: 'learning',
+    word: apple,
+    visitId: visit.id,
+  });
+  assert.throws(() => data.store.aiCommand(command), hasCode('MINI_AI_ACTION_FORBIDDEN'));
+  data.store.command(command);
+  const { summary } = data.store.aiContext({ timezone });
+  assert.equal(summary.memoryRoundAdvances, 0);
+  assert.equal(summary.familiarityDeclarations, 1);
+  assert.equal(summary.firstSpellingAttempts, 0);
+  const item = data.store
+    .wordContext({ word: apple })
+    .history.items.find((item) => item.kind === 'memory');
+  assert.equal(item?.data.evidence, 'self_reported_familiar');
+  assert.equal(item?.data.mastered, false);
 });
 
 test('help after an incorrect first answer keeps that original fact unchanged even with identical clock timestamps', (t) => {

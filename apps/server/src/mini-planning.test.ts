@@ -117,7 +117,7 @@ function finishReview(data: Fixture) {
       data.act({ ...ctx, type: 'choose_judgment', session: 'review', word, judgment: 'clear' });
       data.act({ ...ctx, type: 'advance_judgment', session: 'review', word });
     }
-    for (const word of data.day().reviewWords)
+    for (const word of data.day().review?.queue ?? [])
       data.act({ ...ctx, type: 'submit_spelling', session: 'review', word, answer: word.spelling });
     data.act({ ...ctx, type: 'complete_review' });
   }
@@ -128,7 +128,7 @@ function finish(data: Fixture) {
   if (data.day().phase === 'learning') {
     addSentences(data);
     for (const word of data.day().learningWords) data.act({ ...ctx, type: 'mark_studied', word });
-    for (const word of data.day().learningWords)
+    for (const word of data.day().learning?.queue ?? [])
       data.act({
         ...ctx,
         type: 'submit_spelling',
@@ -351,7 +351,7 @@ test('different senses of the same spelling share word capacity while their lear
 
 test('long idle gaps do not pause spelling or discard the original and corrected answers', (t) => {
   const data = fixture(t);
-  data.begin([apple, book]);
+  data.begin([book, apple]);
   addSentences(data);
   for (const word of data.day().learningWords)
     data.act({ ...daily(data), type: 'mark_studied', word });
@@ -429,14 +429,14 @@ test('review-only new groups finish without fabricated writing; old learning sta
   assert.throws(() => pending.begin(), hasCode('MINI_PLAN_CONFLICT'));
 });
 
-test('absence uses real activity and recovery caps the current budget without rebuilding the old group', (t) => {
+test('absence uses real activity and recovery caps the current budget for a fresh group with the original facts preserved', (t) => {
   const data = fixture(t);
   data.begin();
   addSentences(data);
   assert.equal(data.context().lastActivityAt, null);
   data.act({ ...daily(data), type: 'mark_studied', word: apple });
   const originalWords = data.day().learningWords;
-  const originalQueue = data.day().learning?.queue;
+  const oldId = data.day().id;
   const originalAt = swiftTime(new Date('2026-11-13T04:00:00Z'));
   data.setDate('2026-11-17T04:00:00Z');
   data.today('normal');
@@ -446,11 +446,19 @@ test('absence uses real activity and recovery caps the current budget without re
   assert.equal(preview.recoverySuggested, true);
   assert.equal(preview.recoveryWordLimit, 3);
   data.begin(words, { recovery: true });
-  assert.deepEqual(data.day().learningWords, originalWords);
-  assert.deepEqual(data.day().learning?.queue, originalQueue);
+  assert.notEqual(data.day().id, oldId);
+  assert.deepEqual(data.day().learningWords, originalWords.slice(0, 3));
+  assert.deepEqual(data.day().studiedWords, []);
+  assert.deepEqual(
+    data.store
+      .snapshot()
+      .ledger.days.find((day) => day.id === oldId)
+      ?.studiedWords.map((item) => item.word),
+    [apple],
+  );
   assert.equal(data.store.snapshot().planning.sessions.at(-1)?.wordLimit, 3);
   assert.deepEqual(data.day().scheduleUpdates, []);
-  data.act({ ...daily(data), type: 'mark_studied', word: book });
+  data.act({ ...daily(data), type: 'mark_studied', word: apple });
   assert.equal(data.context().absenceDays, 0);
 });
 
@@ -462,8 +470,12 @@ test('daily capacity expires at the local day boundary even if a previous budget
   data.setDate('2026-11-13T16:01:00Z');
   assert.equal(data.context().effective.wordLimit, 10);
   assert.equal(data.context().todayOverride, null);
+  assert.throws(
+    () => data.act({ ...daily(data), type: 'mark_studied', word: apple }),
+    hasCode('MINI_PLAN_CONFLICT'),
+  );
+  data.begin([apple]);
   addSentences(data);
-  assert.equal(data.store.snapshot().planning.sessions.at(-1)?.wordLimit, 1);
   data.act({ ...daily(data), type: 'mark_studied', word: apple });
   assert.equal(data.store.snapshot().planning.sessions.at(-1)?.wordLimit, 10);
   assert.equal(

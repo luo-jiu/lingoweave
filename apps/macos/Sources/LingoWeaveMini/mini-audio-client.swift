@@ -45,16 +45,21 @@ enum MiniAudioTarget: Codable, Equatable, Sendable {
 
 enum MiniAudioContext: Codable, Equatable, Sendable {
     case daily(dayId: String, session: MiniStudyAction.Session?)
+    case translation(dayId: String, taskId: String)
     case review(recordId: UUID)
-    private enum CodingKeys: String, CodingKey { case target, dayId, recordId, session }
+    private enum CodingKeys: String, CodingKey { case target, dayId, recordId, session, taskId }
     private enum Target: String, Codable { case daily, review }
 
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         switch try values.decode(Target.self, forKey: .target) {
         case .daily:
-            self = .daily(dayId: try values.decode(String.self, forKey: .dayId),
-                          session: try values.decodeIfPresent(MiniStudyAction.Session.self, forKey: .session))
+            let dayId = try values.decode(String.self, forKey: .dayId)
+            if let taskId = try values.decodeIfPresent(String.self, forKey: .taskId) {
+                self = .translation(dayId: dayId, taskId: taskId)
+            } else {
+                self = .daily(dayId: dayId, session: try values.decodeIfPresent(MiniStudyAction.Session.self, forKey: .session))
+            }
         case .review: self = .review(recordId: try values.decode(UUID.self, forKey: .recordId))
         }
     }
@@ -62,6 +67,10 @@ enum MiniAudioContext: Codable, Equatable, Sendable {
     func encode(to encoder: Encoder) throws {
         var values = encoder.container(keyedBy: CodingKeys.self)
         switch self {
+        case .translation(let dayId, let taskId):
+            try values.encode(Target.daily, forKey: .target)
+            try values.encode(dayId, forKey: .dayId)
+            try values.encode(taskId, forKey: .taskId)
         case .daily(let dayId, let session):
             try values.encode(Target.daily, forKey: .target)
             try values.encode(dayId, forKey: .dayId)
@@ -151,7 +160,19 @@ struct MiniAudioPlaybackRequest: Encodable, Sendable {
     let visitId: UUID
     let mode: Mode
     let context: MiniAudioContext?
-    private enum CodingKeys: String, CodingKey { case requestId, assetId, visitId, mode, context }
+    let spellingSubmissionId: UUID?
+
+    init(requestId: UUID, assetId: UUID, visitId: UUID, mode: Mode, context: MiniAudioContext?,
+         spellingSubmissionId: UUID? = nil) {
+        self.requestId = requestId
+        self.assetId = assetId
+        self.visitId = visitId
+        self.mode = mode
+        self.context = context
+        self.spellingSubmissionId = spellingSubmissionId
+    }
+
+    private enum CodingKeys: String, CodingKey { case requestId, assetId, visitId, mode, context, spellingSubmissionId }
     func encode(to encoder: Encoder) throws {
         var values = encoder.container(keyedBy: CodingKeys.self)
         try values.encode(requestId.uuidString.lowercased(), forKey: .requestId)
@@ -159,6 +180,7 @@ struct MiniAudioPlaybackRequest: Encodable, Sendable {
         try values.encode(visitId.uuidString.lowercased(), forKey: .visitId)
         try values.encode(mode, forKey: .mode)
         try values.encodeIfPresent(context, forKey: .context)
+        try values.encodeIfPresent(spellingSubmissionId?.uuidString.lowercased(), forKey: .spellingSubmissionId)
     }
 }
 
@@ -176,7 +198,7 @@ struct MiniAudioPlaybackStart: Codable, Sendable, Equatable {
 }
 
 protocol MiniAudioServing: Sendable {
-    func request(_ input: MiniAudioRequest) async throws -> MiniAudioResult
+    func request(_ input: MiniAudioRequest, retryTransport: Bool) async throws -> MiniAudioResult
     func job(_ id: UUID) async throws -> MiniAudioJob
     func snapshot() async throws -> MiniAudioSnapshot
     func file(_ id: UUID) async throws -> Data
@@ -187,8 +209,8 @@ protocol MiniAudioServing: Sendable {
 struct MiniAudioClient: MiniAudioServing {
     private let study: MiniStudyClient
     init(study: MiniStudyClient = MiniStudyClient()) { self.study = study }
-    func request(_ input: MiniAudioRequest) async throws -> MiniAudioResult {
-        try await study.serviceRequest(path: "audio/request", body: JSONEncoder().encode(input))
+    func request(_ input: MiniAudioRequest, retryTransport: Bool = true) async throws -> MiniAudioResult {
+        try await study.serviceRequest(path: "audio/request", body: JSONEncoder().encode(input), retryTransport: retryTransport)
     }
     func job(_ id: UUID) async throws -> MiniAudioJob {
         try await study.serviceRequest(path: "audio/jobs/" + id.uuidString.lowercased(), body: nil)

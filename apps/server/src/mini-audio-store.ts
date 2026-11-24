@@ -9,6 +9,7 @@ import {
   miniAudioPlaybackReceiptSchema,
   miniAudioRequestSchema,
   miniAudioSnapshotSchema,
+  miniAudioVoiceSchema,
   miniCommandSchema,
   miniAudioProfileSchema,
   miniAudioTargetSchema,
@@ -21,6 +22,7 @@ import {
   type MiniAudioSnapshot,
   type MiniAudioVoice,
   type MiniCommand,
+  type MiniSentence,
 } from '@lingoweave/contracts';
 import { LearningError } from './learning-store.js';
 import { swiftTime } from './mini-study.js';
@@ -47,7 +49,23 @@ export type AudioGenerationInput = z.infer<typeof inputSchema>;
 const hash = (value: unknown) => createHash('sha256').update(JSON.stringify(value)).digest('hex');
 const busy = (job: MiniAudioJob) => job.status === 'queued' || job.status === 'running';
 
+function pickVoice(jobs: MiniAudioJob[], targetKey: string, random: () => number): MiniAudioVoice {
+  let candidates = miniAudioVoiceSchema.options;
+  for (let i = jobs.length - 1; i >= 0 && candidates.length > 1; i--) {
+    const previous = jobs[i];
+    if (previous?.targetKey !== targetKey) continue;
+    if (previous.status !== 'failed') break;
+    candidates = candidates.filter((voice) => voice !== previous.voice);
+  }
+  const index = Math.min(
+    candidates.length - 1,
+    Math.max(0, Math.floor(random() * candidates.length)),
+  );
+  return candidates[index] ?? 'ryan';
+}
+
 export class MiniAudioStore {
+  private phraseHistory?: { changes: number; items: { sentence: MiniSentence; at: number }[] };
   private readonly db: DatabaseSync;
   private closed = false;
   constructor(
@@ -90,6 +108,53 @@ export class MiniAudioStore {
   snapshot(): MiniAudioSnapshot {
     const state = this.raw();
     return { ...state, jobs: state.jobs.slice(-100), playbacks: state.playbacks.slice(-200) };
+  }
+  dataMetrics() {
+    const state = this.raw();
+    const currentIds = new Set(
+      this.db
+        .prepare('SELECT asset_id FROM audio_current')
+        .all()
+        .map((row) => z.object({ asset_id: z.string() }).parse(row).asset_id),
+    );
+    return {
+      assets: state.assets.map((asset) => ({ id: asset.id, fileName: asset.fileName })),
+      wordAssets: state.assets.filter((asset) => asset.target.kind === 'word').length,
+      sentenceAssets: state.assets.filter((asset) => asset.target.kind === 'sentence').length,
+      currentAssets: state.assets.filter((asset) => currentIds.has(asset.id)).length,
+      previousAssets: state.assets.filter((asset) => !currentIds.has(asset.id)).length,
+      pendingJobs: state.jobs.filter((job) => job.status === 'queued' || job.status === 'running')
+        .length,
+      failedJobs: state.jobs.filter(
+        (job) => job.status === 'failed' || job.status === 'interrupted',
+      ).length,
+    };
+  }
+  heardSentences() {
+    const changes = z.number().parse(this.db.prepare('SELECT total_changes() AS n').get()?.n);
+    if (this.phraseHistory?.changes === changes) return this.phraseHistory.items;
+    const state = this.raw();
+    const starts = new Map<string, number>();
+    for (const playback of state.playbacks) {
+      if (
+        playback.startedAt === null ||
+        playback.status !== 'started' ||
+        playback.learningRevision === null
+      )
+        continue;
+      starts.set(
+        playback.assetId,
+        Math.max(playback.startedAt, starts.get(playback.assetId) ?? playback.startedAt),
+      );
+    }
+    const items = state.assets.flatMap((asset) => {
+      const at = starts.get(asset.id);
+      return at !== undefined && asset.target.kind === 'sentence'
+        ? [{ sentence: asset.target.sentence, at }]
+        : [];
+    });
+    this.phraseHistory = { changes, items };
+    return items;
   }
   jobs() {
     return this.raw().jobs;
@@ -172,8 +237,8 @@ export class MiniAudioStore {
     raw: MiniAudioRequest,
     targetKey: string,
     generation: AudioGenerationInput,
-    voice: MiniAudioVoice,
     existing: MiniAudioAsset | null,
+    random: () => number = Math.random,
   ): { result: MiniAudioResult; dispatch: boolean } {
     const input = miniAudioRequestSchema.parse(raw);
     return this.atomic((state) => {
@@ -193,7 +258,7 @@ export class MiniAudioStore {
             targetKey,
             target: input.target,
             operation: input.operation,
-            voice,
+            voice: input.voice ?? pickVoice(state.jobs, targetKey, random),
             status: 'queued',
             progress: '等待生成…',
             error: null,

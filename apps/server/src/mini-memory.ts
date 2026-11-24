@@ -13,7 +13,14 @@ import {
 } from '@lingoweave/contracts';
 import { LearningError } from './learning-store.js';
 import { flowMemoryHistory, flowRetrievability, flowSenseId } from './mini-flow-scheduler.js';
-import { swiftTime } from './mini-study.js';
+import {
+  isMiniDayOnDate,
+  localDay,
+  miniReviewAvailability,
+  swiftTime,
+  wordKey,
+} from './mini-study.js';
+import { miniCompletedWordKeys } from './mini-vocabulary-store.js';
 
 const epoch = 978307200;
 const dateAt = (at: number) => new Date((at + epoch) * 1000);
@@ -48,101 +55,102 @@ function maximum(values: (number | null | undefined)[]): number | null {
   const present = values.filter((value): value is number => value !== null && value !== undefined);
   return present.length ? Math.max(...present) : null;
 }
-function indexedWords(snapshot: MiniSnapshot, asOf: number) {
-  const legacy = new Map(snapshot.scheduling.cards.map((card) => [flowSenseId(card.word), card]));
-  const facts = new Map<string, { first: number; completed: boolean; reviews: Set<string> }>();
-  for (const event of snapshot.scheduling.flow.events) {
-    const key = flowSenseId(event.word);
-    const item = facts.get(key) ?? {
-      first: event.occurredAt,
-      completed: false,
-      reviews: new Set<string>(),
-    };
-    item.first = Math.min(item.first, event.occurredAt);
-    if (event.kind === 'completion') item.completed = true;
-    if (event.kind === 'review') item.reviews.add(event.sourceId);
-    facts.set(key, item);
+export function miniSavedReviewVisits(snapshot: MiniSnapshot) {
+  const visits = new Map<string, { word: MiniWord; ids: Set<string>; latest: number | null }>();
+  function visit(word: MiniWord, id: string, at: number | null) {
+    const key = wordKey(word);
+    const item = visits.get(key) ?? { word, ids: new Set<string>(), latest: null };
+    item.ids.add(id);
+    item.latest = maximum([item.latest, at]);
+    visits.set(key, item);
   }
-  const completedLegacy = new Set<string>();
-  const currentLearning = new Set(
-    snapshot.ledger.days.flatMap((day) => (day.flow ? day.learningWords.map(flowSenseId) : [])),
-  );
-  const legacyReviews = new Map<string, Set<string>>();
-  function addReviews(words: MiniWord[], id: string) {
-    for (const word of words) {
-      const key = flowSenseId(word),
-        values = legacyReviews.get(key) ?? new Set<string>();
-      values.add(id);
-      legacyReviews.set(key, values);
-    }
+  for (const event of snapshot.scheduling.flow.events)
+    if (event.kind === 'review' || event.kind === 'probe')
+      visit(event.word, event.sourceId, event.occurredAt);
+  for (const day of snapshot.ledger.days)
+    if (day.reviewFinishedAt !== undefined)
+      for (const word of day.reviewWords) visit(word, day.id, day.reviewFinishedAt);
+  for (const record of [snapshot.reviewRecord, ...snapshot.reviewHistory]) {
+    if (record?.session.phase !== 'finished') continue;
+    for (const event of record.session.judgmentEvents)
+      visit(event.word, record.id, event.finalizedAt ?? event.selectedAt);
+    for (const attempt of record.session.spellingAttempts)
+      visit(attempt.word, record.id, attempt.submittedAt);
+  }
+  for (const probe of snapshot.scheduling.probes)
+    if (probe.rating && probe.submittedAt !== undefined)
+      visit(probe.word, probe.id, probe.submittedAt);
+  return visits;
+}
+function indexedWords(snapshot: MiniSnapshot, asOf: number, timezone: string) {
+  const date = localDay(dateAt(asOf), timezone);
+  const {
+    words: targets,
+    schedules,
+    outstanding,
+    inReviewGroup,
+  } = miniReviewAvailability(snapshot, asOf, date);
+  const learned = miniCompletedWordKeys(snapshot.ledger);
+  const currentLearning = new Set<string>();
+  const priorLearning = new Set<string>();
+  const firstEvents = new Map<string, number>();
+  const visits = miniSavedReviewVisits(snapshot);
+  for (const event of snapshot.scheduling.flow.events) {
+    const key = wordKey(event.word);
+    firstEvents.set(key, Math.min(firstEvents.get(key) ?? Infinity, event.occurredAt));
+    if (event.kind === 'completion') learned.add(key);
   }
   for (const day of snapshot.ledger.days) {
-    if (!day.flow && day.finishedAt !== undefined)
-      for (const word of day.learningWords) completedLegacy.add(flowSenseId(word));
-    if (day.reviewFinishedAt !== undefined) addReviews(day.reviewWords, day.id);
+    const set =
+      day.phase !== 'finished' && isMiniDayOnDate(day, date) ? currentLearning : priorLearning;
+    for (const word of day.learningWords) set.add(wordKey(word));
   }
-  for (const record of [snapshot.reviewRecord, ...snapshot.reviewHistory])
-    if (record?.session.phase === 'finished') addReviews(record.session.words, record.id);
-  let completedWordCount = 0,
-    excludedLegacyCount = 0;
+
+  const flow = new Map(snapshot.scheduling.flow.cards.map((card) => [wordKey(card.word), card]));
+  const legacy = new Map(snapshot.scheduling.cards.map((card) => [wordKey(card.word), card]));
   const words: MiniMemoryWord[] = [];
-  for (const card of snapshot.scheduling.flow.cards) {
-    const fact = facts.get(card.senseId);
-    const completed = fact?.completed === true || completedLegacy.has(card.senseId);
-    if (completed) completedWordCount++;
-    const learning = !completed && (fact?.reviews.size ?? 0) === 0;
-    const meaning = projectedAbility(card.meaning, asOf);
-    const spelling = projectedAbility(card.spelling, asOf);
-    const old = legacy.get(card.senseId);
-    const firstSeenAt = Math.min(fact?.first ?? Infinity, old?.introducedAt ?? Infinity);
-    words.push({
-      senseId: card.senseId,
-      word: card.word,
-      source: 'flow',
-      status: learning ? 'learning' : card.dueAt <= asOf ? 'due' : 'scheduled',
-      dueAt: learning ? null : card.dueAt,
-      idealDueAt: learning ? null : card.idealDueAt,
-      firstSeenAt: Number.isFinite(firstSeenAt) ? firstSeenAt : null,
-      lastReviewAt: maximum([meaning?.lastReviewAt, spelling?.lastReviewAt]),
-      reviewCount: fact?.reviews.size ?? 0,
-      meaning,
-      spelling,
-    });
-    legacy.delete(card.senseId);
-  }
-  for (const [senseId, card] of legacy) {
-    const spelling = projectedAbility(card.fsrs, asOf, snapshot.scheduling.parameters.weights);
-    if (completedLegacy.has(senseId)) completedWordCount++;
-    if (!spelling) {
-      if (currentLearning.has(senseId))
-        words.push({
-          senseId,
-          word: card.word,
-          source: 'flow',
-          status: 'learning',
-          dueAt: null,
-          idealDueAt: null,
-          firstSeenAt: card.introducedAt,
-          lastReviewAt: null,
-          reviewCount: 0,
-          meaning: null,
-          spelling: null,
-        });
-      else excludedLegacyCount++;
+  let excludedLegacyCount = 0;
+  for (const word of targets) {
+    const key = wordKey(word),
+      card = flow.get(key),
+      old = legacy.get(key);
+    const scheduled = schedules.get(key);
+    const meaning = projectedAbility(card?.meaning ?? null, asOf);
+    const spelling = card
+      ? projectedAbility(card.spelling, asOf)
+      : projectedAbility(old?.fsrs ?? null, asOf, snapshot.scheduling.parameters.weights);
+    if (
+      !scheduled &&
+      !outstanding.has(key) &&
+      !currentLearning.has(key) &&
+      !learned.has(key) &&
+      !meaning &&
+      !spelling &&
+      !visits.has(key)
+    ) {
+      if (old && !priorLearning.has(key)) excludedLegacyCount++;
       continue;
     }
-    const dueAt = Math.min(card.dueAt, card.nextProbeAt ?? Infinity);
+    const firstSeen = Math.min(firstEvents.get(key) ?? Infinity, old?.introducedAt ?? Infinity);
+    const review = visits.get(key);
     words.push({
-      senseId,
-      word: card.word,
-      source: 'legacy',
-      status: dueAt <= asOf ? 'due' : 'scheduled',
-      dueAt,
-      idealDueAt: card.fsrs?.due ?? null,
-      firstSeenAt: card.introducedAt,
-      lastReviewAt: spelling.lastReviewAt,
-      reviewCount: legacyReviews.get(senseId)?.size ?? 0,
-      meaning: null,
+      senseId: flowSenseId(word),
+      word,
+      source: card || (!old?.fsrs && !scheduled && currentLearning.has(key)) ? 'flow' : 'legacy',
+      status: outstanding.has(key)
+        ? 'due'
+        : scheduled
+          ? 'scheduled'
+          : currentLearning.has(key)
+            ? 'learning'
+            : 'unmeasured',
+      ...(inReviewGroup.has(key) ? { inCurrentReview: true } : {}),
+      dueAt: scheduled?.dueAt ?? null,
+      idealDueAt: scheduled ? (card?.idealDueAt ?? old?.fsrs?.due ?? null) : null,
+      firstSeenAt: Number.isFinite(firstSeen) ? firstSeen : null,
+      lastReviewAt: review?.latest ?? null,
+      reviewCount: review?.ids.size ?? 0,
+      meaning,
       spelling,
     });
   }
@@ -152,7 +160,7 @@ function indexedWords(snapshot: MiniSnapshot, asOf: number) {
       a.word.spelling.localeCompare(b.word.spelling) ||
       a.senseId.localeCompare(b.senseId),
   );
-  return { words, completedWordCount, excludedLegacyCount };
+  return { words, completedWordCount: learned.size, excludedLegacyCount };
 }
 function notices(excludedLegacyCount: number) {
   return [
@@ -189,14 +197,23 @@ export function memoryOverview(
   asOf = swiftTime(new Date()),
 ) {
   const input = miniMemoryOverviewInputSchema.parse(raw);
-  const { words, completedWordCount, excludedLegacyCount } = indexedWords(snapshot, asOf);
+  const { words, completedWordCount, excludedLegacyCount } = indexedWords(
+    snapshot,
+    asOf,
+    input.timezone,
+  );
   const dates = calendar(input.timezone);
   const loads = new Map<string, number>();
-  for (const word of words)
-    if (word.dueAt !== null && word.dueAt >= input.from && word.dueAt <= input.to) {
-      const day = dates.day(word.dueAt);
-      loads.set(day, (loads.get(day) ?? 0) + 1);
-    }
+  const firstDay = dates.day(input.from),
+    lastDay = dates.day(input.to),
+    today = dates.day(asOf);
+  let overdueCount = 0;
+  for (const word of words) {
+    if (word.dueAt === null) continue;
+    const day = dates.day(word.dueAt);
+    if (word.status === 'due' && day < today) overdueCount++;
+    if (firstDay <= day && day <= lastDay) loads.set(day, (loads.get(day) ?? 0) + 1);
+  }
   return miniMemoryOverviewSchema.parse({
     schemaVersion: 1,
     revision: snapshot.revision,
@@ -210,6 +227,7 @@ export function memoryOverview(
       completedWordCount,
       excludedLegacyCount,
       measuredWordCount: words.filter((word) => word.meaning || word.spelling).length,
+      overdueCount,
       dueCount: words.filter((word) => word.status === 'due').length,
       scheduledCount: words.filter((word) => word.status === 'scheduled').length,
       learningCount: words.filter((word) => word.status === 'learning').length,
@@ -296,7 +314,7 @@ export function memoryDetail(
   asOf = swiftTime(new Date()),
 ) {
   const input = miniMemoryDetailInputSchema.parse(raw);
-  const indexed = indexedWords(snapshot, asOf);
+  const indexed = indexedWords(snapshot, asOf, input.timezone);
   const word = indexed.words.find((item) => item.senseId === input.senseId);
   if (!word)
     throw new LearningError('MINI_MEMORY_NOT_FOUND', '没有可显示的这个词的记忆记录。', 404);

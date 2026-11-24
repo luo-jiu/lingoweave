@@ -19,7 +19,7 @@ import {
 import { generatorParameters } from 'ts-fsrs';
 import { LearningError } from './learning-store.js';
 import { MiniStore } from './mini-store.js';
-import { calendarDue, currentTranslation, swiftTime } from './mini-study.js';
+import { calendarDue, currentTranslation, swiftTime, validateMiniFacts } from './mini-study.js';
 
 const apple: MiniWord = { spelling: 'apple', meaning: '苹果', phonetic: '' };
 const book: MiniWord = { spelling: 'book', meaning: '书', phonetic: '' };
@@ -93,25 +93,14 @@ function finishLearning(data: Awaited<ReturnType<typeof fixture>>, miss?: MiniWo
   );
   if (missing.length) data.act({ ...ctx, type: 'add_sentences', sentences: missing.map(example) });
   for (const word of day.learningWords) data.act({ ...ctx, type: 'mark_studied', word });
-  if (miss) {
-    data.act({
-      ...ctx,
-      type: 'submit_spelling',
-      session: 'learning',
-      word: miss,
-      answer: '  aplpe ',
-    });
-    data.act({
-      ...ctx,
-      type: 'submit_spelling',
-      session: 'learning',
-      word: miss,
-      answer: miss.spelling,
-    });
-  }
+  let answeredMiss = false;
   for (let guard = 0; guard < 30; guard += 1) {
     const word = lastDay(data).learning?.queue[0];
     if (!word) break;
+    if (!answeredMiss && miss && word.spelling === miss.spelling) {
+      data.act({ ...ctx, type: 'submit_spelling', session: 'learning', word, answer: '  aplpe ' });
+      answeredMiss = true;
+    }
     data.act({ ...ctx, type: 'submit_spelling', session: 'learning', word, answer: word.spelling });
   }
   data.act({ ...ctx, type: 'complete_learning' });
@@ -206,17 +195,15 @@ test('commands preserve first answers, revelations, complete batch rounds and qu
       .filter((attempt) => attempt.kind === 'first')
       .map((attempt) => [attempt.word.spelling, attempt.encounter, attempt.correct]),
     [
-      ['book', 1, false],
       ['apple', 1, true],
+      ['book', 1, false],
       ['book', 2, true],
       ['apple', 2, true],
     ],
   );
-  assert.equal(day.learning?.spellingAttempts[0]?.answer, '  aplpe ');
-  assert.equal(
-    day.learning?.spellingAttempts[0]?.revealedAnswerAt,
-    swiftTime(new Date('2026-11-01T04:00:00Z')),
-  );
+  const missed = day.learning?.spellingAttempts.find((item) => !item.correct);
+  assert.equal(missed?.answer, '  aplpe ');
+  assert.equal(missed?.revealedAnswerAt, swiftTime(new Date('2026-11-01T04:00:00Z')));
   assert.equal(
     day.scheduleUpdates.find((item) => item.word.spelling === 'book')?.dueAt,
     swiftTime(new Date('2026-11-01T16:00:00Z')),
@@ -257,7 +244,7 @@ test('due selection reuses canonical material and previous direction, review pro
     data.act({ ...ctx, type: 'choose_judgment', session: 'review', word, judgment: 'clear' });
     data.act({ ...ctx, type: 'advance_judgment', session: 'review', word });
   }
-  for (const word of next.reviewWords)
+  for (const word of lastDay(data).review?.queue ?? [])
     data.act({
       ...ctx,
       type: 'submit_spelling',
@@ -301,7 +288,7 @@ test('pause and drafts survive restart; stale words, days, versions and repeated
       }),
     hasCode('MINI_STATE_CONFLICT'),
   );
-  data.setDate('2026-11-03T04:00:00Z');
+  data.setDate('2026-11-01T11:00:00Z');
   data.act({ type: 'begin', target: 'daily', deck: [book], timezone });
   assert.deepEqual(lastDay(data).learningWords, [apple]);
   data.act({ ...ctx, type: 'pause', paused: false });
@@ -357,9 +344,9 @@ test('legacy standalone review preserves capped judgment repeats and later unass
       .length,
     3,
   );
+  data.act({ ...ctx, type: 'submit_spelling', word: book, answer: 'book' });
   data.act({ ...ctx, type: 'submit_spelling', word: apple, answer: 'aplpe' });
   data.act({ ...ctx, type: 'submit_spelling', word: apple, answer: 'apple' });
-  data.act({ ...ctx, type: 'submit_spelling', word: book, answer: 'book' });
   assert.equal(data.store.snapshot().reviewRecord?.session.queue[0]?.spelling, 'apple');
   data.act({ ...ctx, type: 'submit_spelling', word: apple, answer: 'apple' });
   data.act({ ...ctx, type: 'continue_to_learning' });
@@ -370,6 +357,54 @@ test('legacy standalone review preserves capped judgment repeats and later unass
     () => data.act({ ...ctx, type: 'pause', paused: true }),
     hasCode('MINI_STATE_CONFLICT'),
   );
+});
+
+test('a persisted pre-shuffle spelling round resumes in place and shuffles only the next eligible round', async (t) => {
+  const source = await fixture(t);
+  source.initialize();
+  const deck = [apple, book, water];
+  source.act({ type: 'begin', target: 'review', deck, timezone, flowVersion: 'memory-rounds-v1' });
+  const record = source.store.snapshot().reviewRecord;
+  assert.ok(record);
+  const ctx = { target: 'review' as const, recordId: record.id };
+  for (const word of deck) {
+    source.act({ ...ctx, type: 'choose_judgment', word, judgment: 'clear' });
+    source.act({ ...ctx, type: 'advance_judgment', word });
+  }
+
+  const old = source.store.snapshot().reviewRecord;
+  assert.ok(old);
+  delete old.session.spellingRounds;
+  old.session.queue = [...deck];
+  old.session.spellingDraft = 'ap';
+  const data = await fixture(t);
+  data.store.importLegacy({
+    requestId: randomUUID(),
+    reviewRecord: old,
+    ledger: { days: [] },
+    reviewHistory: [],
+    timezone,
+  });
+  assert.deepEqual(data.reopen().snapshot().reviewRecord, old);
+  for (const word of [apple, book]) {
+    data.act({ ...ctx, type: 'submit_spelling', word, answer: 'miss' });
+    data.act({ ...ctx, type: 'submit_spelling', word, answer: word.spelling });
+  }
+  const before = data.store.snapshot();
+  assert.deepEqual(before.reviewRecord?.session.queue, [water, apple, book]);
+  assert.equal(before.reviewRecord?.session.spellingRounds, undefined);
+  const cmd = { ...ctx, type: 'submit_spelling' as const, word: water, answer: water.spelling };
+  const id = randomUUID();
+  const second = data.act(cmd, id, before.revision);
+  assert.deepEqual(second.reviewRecord?.session.queue, [book, apple]);
+  assert.deepEqual(second.reviewRecord?.session.spellingRounds, [{ round: 2, order: [1, 0] }]);
+  assert.deepEqual(data.reopen().snapshot(), second);
+  assert.deepEqual(data.act(cmd, id, before.revision), second);
+  const broken = structuredClone(second);
+  const order = broken.reviewRecord?.session.spellingRounds?.[0]?.order;
+  assert.ok(order);
+  order[0] = 0;
+  assert.throws(() => validateMiniFacts(broken), hasCode('MINI_STATE_CONFLICT'));
 });
 
 test('legacy import validates associations and original results without erasing corrupt input or accepting invalid dates', async (t) => {
@@ -537,4 +572,37 @@ test('invalid preparation is atomic and does not consume a request identity or a
     hasCode('MINI_STATE_CONFLICT'),
   );
   assert.equal(lastDay(data).studiedWords.length, 0);
+});
+
+test('legacy fixed groups keep the original feedback and can submit a later translation revision', async (t) => {
+  const data = await fixture(t);
+  data.initialize();
+  data.act({ type: 'begin', target: 'daily', deck: [apple, book], timezone });
+  finishLearning(data);
+  const ctx = context(data);
+  const task = currentTranslation(lastDay(data));
+  assert.ok(task);
+  data.act({ ...ctx, type: 'submit_translation', taskId: task.id, answer: '第一版' });
+  const first = lastDay(data).translation[0];
+  assert.ok(first);
+  data.act({ ...ctx, type: 'record_feedback', attemptId: first.id, feedback });
+  data.act({ ...ctx, type: 'advance_translation', taskId: task.id });
+  const next = currentTranslation(lastDay(data));
+  assert.ok(next);
+  data.act({
+    ...ctx,
+    type: 'revise_translation',
+    taskId: task.id,
+    attemptId: first.id,
+    answer: '修改后',
+  });
+  const stored = lastDay(data).translation[0];
+  const revision = stored?.revisions?.at(-1);
+  assert.ok(revision);
+  assert.equal(currentTranslation(lastDay(data))?.id, next.id);
+  assert.equal(stored?.feedback?.comment, feedback.comment);
+  assert.equal(data.store.assessmentSource(revision.id)?.answer, '修改后');
+  assert.equal(data.store.assessmentSource(revision.id)?.attemptId, first.id);
+  data.reopen();
+  assert.equal(lastDay(data).translation[0]?.revisions?.length, 1);
 });

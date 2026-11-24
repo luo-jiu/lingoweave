@@ -1,10 +1,17 @@
 # LingoWeave 开发约定
 
-LingoWeave（语织）是面向个人英语读写学习的独立应用。当前先建设基础工程，再按 `docs/demo-plan.md` 推进学习流程。
+LingoWeave（语织）是面向个人英语读写学习的独立应用。日常学习使用 macOS mini，网页保留 D0 备课与学习原型。Node 服务保存学习事实。
+
+## 开发入口
+
+- 接手功能时从[维护交接](docs/agent/handoff.md)找到对应专题、代码入口和验证方式。
+- 评审改动时查阅[评审与验证](docs/agent/review-standard.md)，重点核对学习事实、窗口交互和恢复行为。
+- 改变用户操作、接口、存储或发布方式时，按[文档维护约定](docs/agent/documentation-standard.md)更新对应专题。完整目录见[文档导航](docs/README.md)。
 
 ## 项目组织
 
 - 使用一个 Git 仓库和 pnpm workspace。
+- `apps/macos`：SwiftUI 词卡、独立记忆曲线窗口、AppKit 桌面交互与本地服务客户端。
 - `apps/web`：React、TypeScript、Vite 前端。修改前阅读该目录的 `AGENTS.md`。
 - `apps/server`：Node.js、TypeScript、Fastify 后端。修改前阅读该目录的 `AGENTS.md`。
 - `packages/contracts`：前后端共用的接口结构与运行时校验，不能依赖浏览器或服务端框架。

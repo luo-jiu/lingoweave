@@ -195,7 +195,7 @@ for (const name of Object.keys(serverMetadata.dependencies)) {
   await symlink(relative(dirname(link), target), link);
 }
 await mkdir(join(destination, 'scripts'), { recursive: true });
-for (const file of ['mini-service.mjs', 'mini-tts-worker.py'])
+for (const file of ['mini-service.mjs', 'mini-reset.mjs', 'mini-tts-worker.py'])
   await cp(join(project, 'scripts', file), join(destination, 'scripts', file));
 await cp(join(project, 'skills'), join(destination, 'skills'), { recursive: true });
 // Keep the workspace path used by build fingerprinting and contracts exports.

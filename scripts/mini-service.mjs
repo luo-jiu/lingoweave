@@ -2,24 +2,29 @@ import { spawn, execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { access, mkdir, readFile, readdir, writeFile, open, rm, stat } from 'node:fs/promises';
 import { constants } from 'node:fs';
+import { createServer } from 'node:net';
 import { homedir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 
 const args = process.argv.slice(2);
-if (args.some((arg) => !['--dev', '--stop'].includes(arg))) {
-  throw new Error('Usage: node scripts/mini-service.mjs [--dev] [--stop]');
+const resetting = args.includes('--reset-study');
+if (
+  args.some((arg) => !['--dev', '--stop', '--reset-study', '--confirm'].includes(arg)) ||
+  new Set(args).size !== args.length ||
+  resetting !== args.includes('--confirm') ||
+  (resetting && args.includes('--stop'))
+) {
+  throw new Error(
+    'Usage: node scripts/mini-service.mjs [--dev] [--stop | --reset-study --confirm]',
+  );
 }
 const development = args.includes('--dev');
 const root = fileURLToPath(new URL('../', import.meta.url));
-const directory = join(
-  homedir(),
-  'Library',
-  'Application Support',
-  development ? 'com.lingoweave.mini.dev' : 'com.lingoweave.mini',
-  'service',
-);
+const library = join(homedir(), 'Library');
+const bundle = development ? 'com.lingoweave.mini.dev' : 'com.lingoweave.mini';
+const directory = join(library, 'Application Support', bundle, 'service');
 const tokenFile = join(directory, 'token');
 const metadataFile = join(directory, 'process.json');
 const entry = join(root, 'apps/server/dist/index.js');
@@ -88,6 +93,7 @@ async function buildFingerprint() {
     .update(codexBin)
     .update(JSON.stringify(proxies));
   hash.update(await readFile(fileURLToPath(import.meta.url)));
+  hash.update(await readFile(join(root, 'scripts/mini-reset.mjs')));
   hash.update(process.env.MINI_TTS_ROOT ?? join(homedir(), 'sdks/lingoweave-tts'));
   hash.update(await readFile(join(root, 'scripts/mini-tts-worker.py')));
   try {
@@ -270,7 +276,6 @@ async function withLauncherLock(operation) {
 
 async function start() {
   const fingerprint = await buildFingerprint();
-  if ((await ready()) && (await currentBuild(fingerprint))) return;
   return withLauncherLock(async () => {
     if ((await ready()) && (await currentBuild(fingerprint))) return;
     if (await ready()) {
@@ -321,8 +326,81 @@ async function start() {
   });
 }
 
+function macos(script, ...args) {
+  return execFileSync('/usr/bin/osascript', ['-l', 'JavaScript', '-e', script, bundle, ...args], {
+    encoding: 'utf8',
+    timeout: 5_000,
+  }).trim();
+}
+
+function guiCount(requestQuit = false) {
+  const count = macos(
+    `ObjC.import('AppKit');
+     function run(args) {
+       const apps = $.NSRunningApplication.runningApplicationsWithBundleIdentifier($(args[0]));
+       if (args[1] === 'quit') {
+         for (let i = 0; i < apps.count; i++) {
+           if (!apps.objectAtIndex(i).terminate) throw Error('请手动退出这个版本后再试。');
+         }
+       }
+       return String(apps.count);
+     }`,
+    requestQuit ? 'quit' : 'check',
+  );
+  if (!/^\d+$/.test(count)) throw new Error('无法确认应用是否已退出。');
+  return Number(count);
+}
+
+async function assertStopped() {
+  if (guiCount() !== 0) throw new Error('应用尚在运行，请先完全退出。');
+  // Acquiring the address proves it is free even when process.json or the token is missing.
+  const probe = createServer();
+  await new Promise((resolve, reject) => {
+    probe.once('error', () => reject(new Error(`端口 ${port} 未确认空闲，已中止重置。`)));
+    probe.listen({ port, host: '127.0.0.1', exclusive: true }, () =>
+      probe.close((error) => (error ? reject(error) : resolve())),
+    );
+  });
+}
+
+function resetPreferences() {
+  macos(`ObjC.import('Foundation');
+    function run(args) {
+      const key = $(args[0]), defaults = $.NSUserDefaults.standardUserDefaults;
+      const old = defaults.persistentDomainForName(key);
+      if (old.isNil()) return;
+      const keep = $.NSMutableDictionary.alloc.init;
+      const list = old.objectForKey($('customWordList'));
+      if (!list.isNil()) keep.setObjectForKey(list, $('customWordList'));
+      defaults.setPersistentDomainForName(keep, key);
+      if (!defaults.synchronize) throw Error('无法重置应用偏好。');
+    }`);
+}
+
+async function reset() {
+  if (process.platform !== 'darwin') throw new Error('仅支持在 macOS 上重置 Mini。');
+  const { validateResetPaths, resetStudyData } = await import('./mini-reset.mjs');
+  await validateResetPaths(library, bundle);
+  if (guiCount(true)) {
+    const deadline = Date.now() + 10_000;
+    while (guiCount() && Date.now() < deadline) await delay(200);
+    if (guiCount()) throw new Error('请手动退出这个版本后再试。');
+  }
+  await withLauncherLock(async () => {
+    await validateResetPaths(library, bundle);
+    if (guiCount()) throw new Error('应用重新打开，已中止重置。');
+    await stopUnlocked();
+    await assertStopped();
+    await resetStudyData({ library, bundle, assertStopped, resetPreferences });
+  });
+  process.stdout.write(
+    `${development ? 'Dev' : '正式版'}已重置。词书和自定义词表已保留，可重新打开应用。\n`,
+  );
+}
+
 try {
-  if (args.includes('--stop')) await withLauncherLock(stopUnlocked);
+  if (resetting) await reset();
+  else if (args.includes('--stop')) await withLauncherLock(stopUnlocked);
   else await start();
 } catch (error) {
   process.stderr.write(`${error instanceof Error ? error.message : 'Mini service failed.'}\n`);

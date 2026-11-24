@@ -13,9 +13,11 @@ import type {
   MiniTranslationTask,
   MiniWord,
 } from '@lingoweave/contracts';
+import { validateTranslationGrade } from './mini-translation-rubric.js';
 import { LearningError } from './learning-store.js';
 import { validateMiniWritingLinks } from './mini-teaching.js';
 import { orderMiniDue } from './mini-scheduler.js';
+import { startSpellingRound } from './mini-spelling.js';
 import {
   applyMiniWindowAction,
   beginMiniFlowLearning,
@@ -42,7 +44,7 @@ const intervals = [1, 3, 7, 14, 30];
 export function swiftTime(date: Date) {
   return date.getTime() / 1000 - appleEpoch;
 }
-function unixDate(time: number) {
+export function unixDate(time: number) {
   return new Date((time + appleEpoch) * 1000);
 }
 export function sameWord(a: MiniWord | undefined, b: MiniWord | undefined): boolean {
@@ -54,8 +56,69 @@ export function sameWord(a: MiniWord | undefined, b: MiniWord | undefined): bool
     a.phonetic === b.phonetic
   );
 }
+
+export function advancesCorrectSpelling(action: MiniAction): boolean {
+  return (
+    action.type === 'submit_spelling' &&
+    action.advanceAfterCorrect === true &&
+    action.answer.trim().toLowerCase() === action.word.spelling.toLowerCase()
+  );
+}
+
+export function spellingResultSession(
+  state: MiniSnapshot,
+  context: {
+    target: 'daily' | 'review';
+    dayId?: string;
+    recordId?: string;
+    session?: 'review' | 'learning';
+  },
+  word: MiniWord,
+  submittedAt: number,
+  answer?: string,
+) {
+  if (state.practice.activeDictationId) return undefined;
+  let session: MiniReviewSession | undefined;
+  if (context.target === 'daily') {
+    const day = state.ledger.days.find((item) => item.id === context.dayId);
+    if (!day || day.id !== state.planning.activeDayId || day.paused) return undefined;
+    if (context.session === 'review' && day.phase === 'review') session = day.review;
+    if (context.session === 'learning' && day.phase === 'learning') session = day.learning;
+  } else {
+    const record = state.reviewRecord;
+    if (
+      !record ||
+      record.id.toLowerCase() !== context.recordId?.toLowerCase() ||
+      record.paused ||
+      record.continuedToLearning
+    )
+      return undefined;
+    session = record.session;
+  }
+  const attempt = session?.spellingAttempts.at(-1);
+  if (
+    session?.spellingState !== 'awaitingFirst' ||
+    attempt?.correct !== true ||
+    attempt.submittedAt !== submittedAt ||
+    !sameWord(attempt.word, word) ||
+    (answer !== undefined && attempt.answer !== answer)
+  )
+    return undefined;
+  return session;
+}
 export function wordKey(word: MiniWord) {
   return JSON.stringify([word.spelling.trim().toLowerCase(), word.meaning.trim()]);
+}
+export function savedMiniSentence(state: MiniSnapshot, word: MiniWord) {
+  const match = (day: MiniDay) => day.sentences.find((sentence) => sameWord(sentence.word, word));
+  const activeDay = state.ledger.days.find((day) => day.id === state.planning.activeDayId);
+  const current = activeDay && match(activeDay);
+  if (current) return current;
+  for (let i = state.ledger.days.length - 1; i >= 0; i--) {
+    const day = state.ledger.days[i];
+    const saved = day && match(day);
+    if (saved) return saved;
+  }
 }
 export function currentLearningWord(day: MiniDay): MiniWord | undefined {
   if (day.flow) return currentMiniWindow(day)?.visit?.word ?? day.learning?.queue[0];
@@ -97,13 +160,21 @@ function check(condition: boolean, message?: string): asserts condition {
   if (!condition) invalid(message);
 }
 
+// A replay compares many instants in the same zone to find local midnight.
+let lastDayFormatter: { zone: string; formatter: Intl.DateTimeFormat } | undefined;
 export function localDay(date: Date, timezone: string): string {
-  const parts = new Intl.DateTimeFormat('en-CA', {
-    timeZone: timezone,
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-  }).formatToParts(date);
+  if (lastDayFormatter?.zone !== timezone) {
+    lastDayFormatter = {
+      zone: timezone,
+      formatter: new Intl.DateTimeFormat('en-CA', {
+        timeZone: timezone,
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+      }),
+    };
+  }
+  const parts = lastDayFormatter.formatter.formatToParts(date);
   const get = (name: string) => parts.find((part) => part.type === name)?.value ?? '';
   return `${get('year')}-${get('month')}-${get('day')}`;
 }
@@ -127,9 +198,10 @@ export function makeReview(
   fullBatchSpelling = false,
   retryErrors = false,
   flowV2 = false,
+  replay?: MiniReviewSession['spellingRounds'],
 ): MiniReviewSession {
   const distinct = unique(words);
-  return {
+  const session: MiniReviewSession = {
     words: distinct,
     queue: [...distinct],
     ...(fullBatchSpelling ? { fullBatchSpelling: true } : {}),
@@ -144,6 +216,8 @@ export function makeReview(
     spellingState: 'awaitingFirst',
     spellingDraft: '',
   };
+  if (fullBatchSpelling) startSpellingRound(session, distinct, 1, replay);
+  return session;
 }
 function makeMemoryRounds(words: MiniWord[]): MiniMemoryRounds {
   return {
@@ -241,7 +315,12 @@ function chooseJudgment(
   check(session.phase === 'judgment' && !!word && !pendingJudgment(session));
   session.judgmentEvents.push({ word, selected: judgment, selectedAt: at });
 }
-function advanceJudgment(session: MiniReviewSession, markWrong: boolean, at: number) {
+function advanceJudgment(
+  session: MiniReviewSession,
+  markWrong: boolean,
+  at: number,
+  replay?: MiniReviewSession['spellingRounds'],
+) {
   const event = pendingJudgment(session);
   const word = session.queue[0];
   check(!!event && !!word);
@@ -263,25 +342,27 @@ function advanceJudgment(session: MiniReviewSession, markWrong: boolean, at: num
   ) {
     (session.relearningWords ??= []).push(word);
   }
-  if (
-    session.queue.length === 0 &&
-    session.spellingPolicy === 'retry-errors-v2' &&
-    session.relearningWords?.length
-  ) {
+  if (session.queue.length === 0) finishMiniJudgments(session, at, replay);
+}
+
+export function finishMiniJudgments(
+  session: MiniReviewSession,
+  at: number,
+  replay?: MiniReviewSession['spellingRounds'],
+) {
+  check(session.phase === 'judgment' && session.queue.length === 0);
+  if (session.spellingPolicy === 'retry-errors-v2' && session.relearningWords?.length) {
     session.relearning = makeMiniWindow(session.relearningWords, at);
     return;
   }
-  if (session.queue.length === 0) {
-    session.phase = 'spelling';
-    session.queue = [...session.words];
-    session.spellingDraft = '';
-  }
+  startSpellingRound(session, session.words, 1, replay);
+  session.spellingPromptAt = at;
 }
 function submitSpelling(
   session: MiniReviewSession,
   raw: string,
   at: number,
-  help?: { answerRevealAt?: number; potentialHelpAt?: number },
+  help?: { answerRevealAt?: number; potentialHelpAt?: number; duringAttempt?: boolean },
 ) {
   const word = session.queue[0];
   const previous = lastSpelling(session);
@@ -289,7 +370,6 @@ function submitSpelling(
     session.phase === 'spelling' &&
       (session.spellingState === 'awaitingFirst' || session.spellingState === 'correcting') &&
       !!word &&
-      raw.trim().length > 0 &&
       raw !== previous?.answer,
   );
   const kind = session.spellingState === 'awaitingFirst' ? 'first' : 'correction';
@@ -315,6 +395,7 @@ function submitSpelling(
     submittedAt: at,
     ...(lastAnswerRevealAt === undefined ? {} : { lastAnswerRevealAt }),
     ...(help?.potentialHelpAt === undefined ? {} : { lastPotentialHelpAt: help.potentialHelpAt }),
+    ...(help?.duringAttempt ? { helpDuringAttempt: true as const } : {}),
     ...(kind === 'first' && !correct ? { revealedAnswerAt: at } : {}),
   });
   session.spellingDraft = raw;
@@ -332,7 +413,7 @@ function submitSpelling(
     session.spellingState = 'skipped';
   } else session.spellingState = correct ? 'readyToAdvance' : 'correcting';
 }
-function advanceSpelling(session: MiniReviewSession) {
+function advanceSpelling(session: MiniReviewSession, replay?: MiniReviewSession['spellingRounds']) {
   const attempt = lastSpelling(session);
   check(
     session.phase === 'spelling' &&
@@ -366,12 +447,30 @@ function advanceSpelling(session: MiniReviewSession) {
       session.spellingAttempts.some(
         (item) => item.encounter === attempt.encounter && item.kind === 'first' && !item.correct,
       )
-    )
-      session.queue = [...session.words];
+    ) {
+      // Old fixed-order batches restarted in the original group order; new batches
+      // shuffle the actual preceding round, including when it has just two words.
+      session.queue =
+        replay && !replay.some((item) => item.round === attempt.encounter + 1)
+          ? [...session.words]
+          : session.spellingAttempts
+              .filter((item) => item.kind === 'first' && item.encounter === attempt.encounter)
+              .map((item) => item.word);
+    }
   } else if (attempt.kind === 'correction') session.queue.push(attempt.word);
   session.spellingDraft = '';
   session.spellingState = 'awaitingFirst';
-  if (session.queue.length === 0) session.phase = 'finished';
+  const next = session.queue[0];
+  if (!next) session.phase = 'finished';
+  // Unseen first answers stay ahead of the retry tail. The round has ended exactly
+  // when the next queued word already has a first answer in this encounter.
+  else if (
+    session.spellingAttempts.some(
+      (item) =>
+        item.kind === 'first' && item.encounter === attempt.encounter && sameWord(item.word, next),
+    )
+  )
+    startSpellingRound(session, session.queue, attempt.encounter + 1, replay);
 }
 export function currentTranslation(day: MiniDay): MiniTranslationTask | undefined {
   if (day.phase !== 'translation') return undefined;
@@ -395,6 +494,13 @@ export function currentTranslation(day: MiniDay): MiniTranslationTask | undefine
   const sentence = day.sentences.find((item) => sameWord(item.word, word));
   return sentence && direction ? { id, sentence, direction } : undefined;
 }
+export function reachedTranslation(day: MiniDay, taskId: string): MiniTranslationTask | undefined {
+  if (day.phase !== 'translation') return undefined;
+  if (taskId === `${day.id}/${day.translationIndex}`) return currentTranslation(day);
+  const first = day.flow ? day.flow.translationWords.length - day.flow.groupWords.length : 0;
+  return day.translation.slice(first, day.translationIndex).find((item) => item.task.id === taskId)
+    ?.task;
+}
 function currentAttempt(day: MiniDay) {
   const task = currentTranslation(day);
   return task ? lastWhere(day.translation, (item) => item.task.id === task.id) : undefined;
@@ -415,11 +521,17 @@ function beginTranslation(day: MiniDay, at: number) {
   day.phase = 'translation';
   day.translationStartedAt = at;
 }
+/** Legacy group IDs start with the local study date. Older v2 groups could roll into a newer target date. */
+export function isMiniDayOnDate(day: MiniDay, date: string) {
+  return day.archivedAt === undefined && (day.flow?.targetDate ?? day.id.slice(0, 10)) === date;
+}
+
 export function miniCandidates(
   ledger: MiniLedger,
   deck: MiniWord[],
   at: number,
   scheduling?: MiniScheduling,
+  date?: string,
 ) {
   const schedules = new Map<string, MiniSchedule>();
   const canonical = new Map<string, MiniDay['sentences'][number]>();
@@ -434,25 +546,32 @@ export function miniCandidates(
     for (const item of day.translation)
       if (item.feedback) directions.set(wordKey(item.task.sentence.word), item.task.direction);
   }
-  const unfinishedFlowWords = new Set(
+  const currentDays = ledger.days.filter((day) =>
+    isMiniDayOnDate(day, date ?? localDay(unixDate(at), day.timezone ?? 'UTC')),
+  );
+  // An unfinished card can have genuine views and support attempts without being a learned word.
+  // Later confirmation in another group must immediately make that sense eligible for review.
+  const enrolled = new Set(schedules.keys());
+  for (const day of ledger.days) {
+    for (const word of day.reviewWords) enrolled.add(wordKey(word));
+    for (const completion of day.flow?.completed ?? []) enrolled.add(wordKey(completion.word));
+  }
+  const uncompleted = new Set(
     ledger.days.flatMap((day) =>
-      day.flow
-        ? day.learningWords
-            .filter(
-              (word) => !day.flow?.completed.some((item) => wordKey(item.word) === wordKey(word)),
-            )
-            .map(wordKey)
-        : [],
+      day.learningWords.map(wordKey).filter((key) => !enrolled.has(key)),
     ),
   );
-  const enrolled = new Set(
-    ledger.days.flatMap((day) => [...day.reviewWords, ...day.learningWords].map(wordKey)),
+  const currentLegacyWords = new Set(
+    currentDays.flatMap((day) => (day.flow ? [] : day.learningWords.map(wordKey))),
   );
   for (const card of scheduling?.cards ?? []) {
-    if (unfinishedFlowWords.has(wordKey(card.word))) continue;
-    // A standalone support exercise does not silently enroll a word in a course.
-    // Its pending probe remains available; explicit continuation can still teach it.
-    if (card.fsrs === null && !enrolled.has(wordKey(card.word))) continue;
+    const key = wordKey(card.word);
+    if (
+      !enrolled.has(key) &&
+      !currentLegacyWords.has(key) &&
+      (card.fsrs === null || uncompleted.has(key))
+    )
+      continue;
     schedules.set(wordKey(card.word), {
       word: card.word,
       dueAt: Math.min(card.dueAt, card.nextProbeAt ?? Infinity),
@@ -463,7 +582,7 @@ export function miniCandidates(
     });
   }
   for (const card of scheduling?.flow.cards ?? []) {
-    if (unfinishedFlowWords.has(wordKey(card.word))) continue;
+    if (uncompleted.has(wordKey(card.word))) continue;
     schedules.set(wordKey(card.word), {
       word: card.word,
       dueAt: card.dueAt,
@@ -475,7 +594,7 @@ export function miniCandidates(
   }
   const seen = new Set<string>();
   const reservedNew = new Set(
-    ledger.days
+    currentDays
       .filter((day) => day.phase !== 'finished')
       .flatMap((day) =>
         day.flow
@@ -490,7 +609,7 @@ export function miniCandidates(
       ),
   );
   const reservedReview = new Set(
-    ledger.days
+    currentDays
       .filter((day) => day.phase === 'review')
       .flatMap((day) => day.reviewWords.map(wordKey)),
   );
@@ -516,6 +635,45 @@ export function miniCandidates(
     due: scheduling ? orderMiniDue(due, scheduling, at) : due,
   };
 }
+export function historicalDeck(state: MiniSnapshot, deck: MiniWord[] = []) {
+  const all = [
+    ...deck,
+    ...state.scheduling.cards.map((card) => card.word),
+    ...state.scheduling.flow.cards.map((card) => card.word),
+    ...state.ledger.days.flatMap((day) => [...day.reviewWords, ...day.learningWords]),
+  ];
+  return [...new Map(all.map((word) => [wordKey(word), word])).values()];
+}
+export function miniReviewAvailability(
+  state: MiniSnapshot,
+  at: number,
+  date: string,
+  deck: MiniWord[] = [],
+) {
+  const words = historicalDeck(state, deck);
+  const available = miniCandidates(state.ledger, words, at, state.scheduling, date);
+  const pending = state.ledger.days
+    .filter(
+      (day) =>
+        isMiniDayOnDate(day, date) && day.phase === 'review' && day.reviewFinishedAt === undefined,
+    )
+    .flatMap((day) => day.reviewWords.map(wordKey));
+  return {
+    words,
+    schedules: available.schedules,
+    inReviewGroup: new Set(pending),
+    outstanding: new Set([...available.due.map((item) => wordKey(item.word)), ...pending]),
+  };
+}
+export function outstandingReviews(
+  state: MiniSnapshot,
+  at: number,
+  date: string,
+  deck: MiniWord[] = [],
+) {
+  return miniReviewAvailability(state, at, date, deck).outstanding;
+}
+
 function beginDaily(
   ledger: MiniLedger,
   deck: MiniWord[],
@@ -540,12 +698,13 @@ function beginDaily(
     canonical,
     directions,
     due: allDue,
-  } = miniCandidates(ledger, deck, at, scheduling);
+  } = miniCandidates(ledger, deck, at, scheduling, date);
   const limits = options?.limits ?? { wordLimit: 10, newWordLimit: 5 };
   if (options?.flow) {
-    const reviewWords = allDue.map((item) => item.word);
+    const group = allDue.slice(0, options.flow.groupSize);
+    const reviewWords = group.map((item) => item.word);
     const flow = makeMiniFlow(
-      candidates.filter((word) => !schedules.has(wordKey(word))),
+      options.writingRequired ? candidates.filter((word) => !schedules.has(wordKey(word))) : [],
       options.flow,
       at,
       timezone,
@@ -558,7 +717,7 @@ function beginDaily(
       ...(options.writingRequired === false ? { writingRequired: false } : {}),
       reviewWords,
       learningWords: [],
-      reviewSteps: allDue.map((item) => item.schedule.step),
+      reviewSteps: group.map((item) => item.schedule.step),
       directions: [],
       ...(reviewWords.length ? { review: makeReview(reviewWords, false, false, true) } : {}),
       flow,
@@ -676,6 +835,7 @@ export function applyMiniAction(
     dayId?: string;
     flow?: MiniFlowOptions;
   },
+  requestId?: string,
 ): void {
   if (
     action.type === 'create_focus' ||
@@ -724,6 +884,7 @@ export function applyMiniAction(
     action.type === 'reveal_probe' ||
     action.type === 'end_probe' ||
     action.type === 'record_probe_help' ||
+    action.type === 'record_browse_views' ||
     action.type === 'hide_card'
   )
     invalid();
@@ -817,6 +978,13 @@ export function applyMiniAction(
           attempt.id.toLowerCase() === action.attemptId.toLowerCase() &&
           !attempt.feedback,
       );
+      if (action.feedback.expressionGrade) {
+        validateTranslationGrade(
+          attempt.task.direction,
+          action.feedback.expressionGrade,
+          action.feedback.improvements,
+        );
+      }
       attempt.feedback = action.feedback;
       attempt.gradedAt = at;
       // Qualitative AI feedback is teaching evidence, never a scheduling input.
@@ -831,8 +999,9 @@ export function applyMiniAction(
       case 'window_choose':
       case 'window_correct':
       case 'window_advance':
+      case 'window_familiar':
       case 'window_draft':
-        applyMiniWindowAction(day, action, at);
+        applyMiniWindowAction(day, action, at, requestId);
         return;
       case 'memory_advance':
       case 'memory_reveal':
@@ -895,8 +1064,21 @@ export function applyMiniAction(
       case 'complete_review': {
         check(day.phase === 'review' && day.review?.phase === 'finished');
         if (day.flow) {
+          const reviewOnlyEntry = state.planning.sessions.some(
+            (session) =>
+              session.dayId === action.dayId &&
+              session.endedAt === undefined &&
+              session.intent === 'review',
+          );
+          const deferLearning =
+            day.writingRequired !== false &&
+            (reviewOnlyEntry ||
+              outstandingReviews(state, at, day.flow.targetDate).size > day.reviewWords.length);
           day.reviewFinishedAt = at;
-          beginMiniFlowLearning(day, at);
+          // A mixed run keeps its prepared material while the remaining review groups run.
+          // Its new-word window is opened by resumeMiniFlow once the final group has settled.
+          if (deferLearning) day.phase = 'learning';
+          else beginMiniFlowLearning(day, at);
           return;
         }
         for (const [index, word] of day.reviewWords.entries()) {
@@ -994,6 +1176,25 @@ export function applyMiniAction(
         day.translationDraft = '';
         return;
       }
+      case 'revise_translation': {
+        const task = reachedTranslation(day, action.taskId);
+        const attempt = task && day.translation.find((item) => item.task.id === task.id);
+        check(!!attempt, '只能修改当前组已经提交的译文。');
+        const latest = attempt.revisions?.at(-1) ?? attempt;
+        check(latest.id.toLowerCase() === action.attemptId, '这份译文已有新版本，请查看后再修改。');
+        if (latest.answer.trim() === action.answer) return;
+        check(
+          at >= Math.max(latest.submittedAt, attempt.confirmedAt ?? attempt.submittedAt),
+          '改译时间不能早于上一版译文。',
+        );
+        (attempt.revisions ??= []).push({
+          id: randomUUID(),
+          answer: action.answer,
+          submittedAt: at,
+          ...(action.aiSelection && { aiSelection: action.aiSelection }),
+        });
+        return;
+      }
       case 'advance_translation':
         if (day.flow) {
           const attempt = currentAttempt(day);
@@ -1083,21 +1284,42 @@ export function applyMiniAction(
               ? item.dayId === day.id && item.session === action.session
               : item.recordId === state.reviewRecord?.id),
         );
-        const answerRevealAt = helpful
-          .filter((item) => item.kind === 'answerReveal')
-          .reduce<number | undefined>(
-            (latest, item) => (latest === undefined ? item.at : Math.max(latest, item.at)),
-            undefined,
-          );
+        // A lookup or a visible English card can belong to another session or
+        // sense of the same spelling. Its letters still expose this answer.
+        const spellingViews = state.scheduling.views.filter(
+          (view) =>
+            view.at <= at &&
+            view.word.spelling.trim().toLowerCase() === action.word.spelling.trim().toLowerCase(),
+        );
+        const answerRevealAt = [
+          ...spellingViews,
+          ...helpful.filter((item) => item.kind === 'answerReveal'),
+        ].reduce<number | undefined>(
+          (latest, item) => (latest === undefined ? item.at : Math.max(latest, item.at)),
+          undefined,
+        );
         const potentialHelpAt = helpful.reduce<number | undefined>(
           (latest, item) => (latest === undefined ? item.at : Math.max(latest, item.at)),
           undefined,
         );
-        submitSpelling(session, action.answer, at, { answerRevealAt, potentialHelpAt });
+        const openedAt = session.spellingPromptAt;
+        const duringAttempt =
+          (openedAt !== undefined &&
+            spellingViews.some((view) => view.lookup && view.at >= openedAt)) ||
+          helpful.some(
+            (item) =>
+              item.spellingAttemptHelp &&
+              item.beforeAttemptCount === session.spellingAttempts.length,
+          );
+        submitSpelling(session, action.answer, at, {
+          answerRevealAt,
+          potentialHelpAt,
+          duringAttempt,
+        });
       }
       if (
-        action.advanceOnCorrect &&
-        session.spellingPolicy !== 'retry-errors-v2' &&
+        (action.advanceAfterCorrect ||
+          (action.advanceOnCorrect && session.spellingPolicy !== 'retry-errors-v2')) &&
         session.spellingState === 'readyToAdvance'
       )
         advanceSpelling(session);
@@ -1146,7 +1368,6 @@ export function validateMiniFacts(snapshot: MiniSnapshot): void {
     for (const item of session.spellingAttempts) {
       check(
         session.words.some((word) => sameWord(word, item.word)) &&
-          item.answer.trim().length > 0 &&
           item.correct === (item.answer.trim().toLowerCase() === item.word.spelling.toLowerCase()),
         '拼写事实与原答不一致。',
       );
@@ -1166,17 +1387,19 @@ export function validateMiniFacts(snapshot: MiniSnapshot): void {
         '拼写状态缺少原答。',
       );
     // Reconstruct the queue solely from original events. A serialized status cannot invent a pass.
+    const roundOrders = session.spellingRounds ?? [];
     const replayed = makeReview(
       session.words,
       session.fullBatchSpelling === true,
       session.spellingPolicy === 'retry-errors-v1',
       session.spellingPolicy === 'retry-errors-v2',
+      roundOrders,
     );
     for (const event of session.judgmentEvents) {
       check(sameWord(replayed.queue[0], event.word), '自评事实与当前目标不一致。');
       chooseJudgment(replayed, event.selected, event.selectedAt);
       if (event.final !== undefined && event.finalizedAt !== undefined)
-        advanceJudgment(replayed, event.final !== event.selected, event.finalizedAt);
+        advanceJudgment(replayed, event.final !== event.selected, event.finalizedAt, roundOrders);
     }
     if (session.spellingPolicy === 'retry-errors-v2') {
       check(
@@ -1189,7 +1412,7 @@ export function validateMiniFacts(snapshot: MiniSnapshot): void {
         '复习重学状态缺失。',
       );
       if (session.relearning) {
-        validateMiniWindow(session.relearning, session.relearningWords ?? []);
+        validateMiniWindow(session.relearning, session.relearningWords ?? [], 'review');
         const completed = new Set(
           session.relearning.events
             .filter((event) => event.remembered && event.stage === 2)
@@ -1209,8 +1432,7 @@ export function validateMiniFacts(snapshot: MiniSnapshot): void {
             session.relearning.members.length === 0 && session.relearning.visit === null,
             '重学结束队列不一致。',
           );
-          replayed.phase = 'spelling';
-          replayed.queue = [...session.words];
+          startSpellingRound(replayed, session.words, 1, roundOrders);
         } else
           check(
             session.relearning.members.length > 0 && session.relearning.visit !== null,
@@ -1221,11 +1443,12 @@ export function validateMiniFacts(snapshot: MiniSnapshot): void {
     }
     for (const attempt of session.spellingAttempts) {
       if (replayed.spellingState === 'readyToAdvance' || replayed.spellingState === 'skipped')
-        advanceSpelling(replayed);
+        advanceSpelling(replayed, roundOrders);
       check(sameWord(replayed.queue[0], attempt.word), '拼写事实与当前目标不一致。');
       submitSpelling(replayed, attempt.answer, attempt.submittedAt, {
         answerRevealAt: attempt.lastAnswerRevealAt,
         potentialHelpAt: attempt.lastPotentialHelpAt,
+        duringAttempt: attempt.helpDuringAttempt,
       });
     }
     if (
@@ -1236,8 +1459,10 @@ export function validateMiniFacts(snapshot: MiniSnapshot): void {
       (replayed.spellingState === 'readyToAdvance' &&
         (session.phase === 'finished' || session.spellingState === 'awaitingFirst'))
     )
-      advanceSpelling(replayed);
+      advanceSpelling(replayed, roundOrders);
     replayed.spellingDraft = session.spellingDraft;
+    // Advancing off a green answer has no separate timestamp in the spelling attempt.
+    replayed.spellingPromptAt = session.spellingPromptAt;
     // Legacy JSON can encode an explicit false as well as omit this optional flag.
     replayed.fullBatchSpelling = session.fullBatchSpelling;
     replayed.clearedJudgments = session.clearedJudgments;
@@ -1249,10 +1474,31 @@ export function validateMiniFacts(snapshot: MiniSnapshot): void {
   };
   const ids = new Set<string>();
   const materialIds = new Set<string>();
+  const answerIds = new Set(
+    snapshot.ledger.days.flatMap((day) => day.translation.map((item) => item.id.toLowerCase())),
+  );
   let unfinished = 0;
   for (const day of snapshot.ledger.days) {
     check(!ids.has(day.id), '每日记录身份重复。');
     ids.add(day.id);
+    for (const attempt of day.translation) {
+      let previous: Pick<typeof attempt, 'answer' | 'submittedAt'> = attempt;
+      for (const revision of attempt.revisions ?? []) {
+        check(
+          !answerIds.has(revision.id) &&
+            revision.submittedAt >= previous.submittedAt &&
+            revision.answer.trim() !== previous.answer.trim(),
+          '改译版本身份、内容或时间无效。',
+        );
+        answerIds.add(revision.id);
+        previous = revision;
+      }
+    }
+    if (day.archivedAt !== undefined)
+      check(
+        day.paused && day.phase !== 'finished' && day.archivedAt >= day.startedAt,
+        '归档组必须保留原阶段并停止学习。',
+      );
     if (day.phase !== 'finished' && !day.paused) unfinished += 1;
     const words = [...day.reviewWords, ...day.learningWords];
     if (day.flow) {

@@ -8,25 +8,13 @@ import { ZodError } from 'zod';
 import { LearningError } from './learning-store.js';
 import { registerLearningRoutes } from './learning-routes.js';
 import type { PreparationService } from './preparation-service.js';
-import type { MiniAiService } from './mini-ai-service.js';
-import type { MiniAudioService } from './mini-audio-service.js';
-import type { MiniStore } from './mini-store.js';
-import { registerMiniRoutes } from './mini-routes.js';
-import type { MiniVocabularyStore } from './mini-vocabulary-store.js';
-import type { MiniAssessmentService } from './mini-assessment-service.js';
+import { registerMiniRoutes, type MiniRouteOptions } from './mini-routes.js';
 
 export interface AppOptions {
   logger?: boolean;
   staticRoot?: string;
   learning?: PreparationService;
-  mini?: {
-    store: MiniStore;
-    token: string;
-    ai?: MiniAiService;
-    audio?: MiniAudioService;
-    vocabulary?: MiniVocabularyStore;
-    assessment?: MiniAssessmentService;
-  };
+  mini?: MiniRouteOptions;
 }
 
 function errorBody(code: string, message: string, requestId: string): ApiError {
@@ -110,16 +98,7 @@ export function buildApp(options: AppOptions = {}) {
   });
 
   if (options.learning) registerLearningRoutes(app, options.learning);
-  if (options.mini)
-    registerMiniRoutes(
-      app,
-      options.mini.store,
-      options.mini.token,
-      options.mini.ai,
-      options.mini.audio,
-      options.mini.vocabulary,
-      options.mini.assessment,
-    );
+  if (options.mini) registerMiniRoutes(app, options.mini);
 
   if (options.staticRoot) {
     app.register(fastifyStatic, { root: options.staticRoot });

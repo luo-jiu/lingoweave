@@ -21,11 +21,19 @@ async function fixture(t: TestContext, scenario = 'success', turnTimeoutMs = 1_0
       switch(m.method) {
         case 'initialize': result={userAgent:'Codex/0.153.4 test'}; break;
         case 'account/read': result={account:scenario==='login'?null:{type:'chatgpt',email:'private@example.invalid'},requiresOpenaiAuth:true}; break;
-        case 'model/list': result={data:[{id:'test-id',model:'test-model',displayName:'Test model',isDefault:true}],nextCursor:null}; break;
+        case 'model/list':
+          if (scenario === 'fail-first-probe') {
+            const fs = require('node:fs');
+            if (!fs.existsSync('attempted')) {
+              fs.writeFileSync('attempted', '');
+              send({id:m.id,error:{code:-32603,message:'catalog temporarily unavailable'}}); return;
+            }
+          }
+          result={data:[{id:'test-id',model:'test-model',displayName:'Test model',isDefault:true}],nextCursor:null}; break;
         case 'config/read': result={config:{mcp_servers:{unrelated:{enabled:true,token:'private'}},plugins:{external:{enabled:true}}}}; break;
         case 'thread/start':
           if(m.params.config.mcp_servers.unrelated.enabled !== false || m.params.config.plugins.external.enabled !== false) throw Error('scope not isolated');
-          result={thread:{id:'thread-1'},model:m.params.model,approvalPolicy:'never',sandbox:{type:'readOnly'}};break;
+          result={thread:{id:'thread-1'},model:scenario==='substitute'?'other-model':m.params.model,approvalPolicy:'never',sandbox:{type:'readOnly'}};break;
         case 'mcpServerStatus/list': result={data:[{name:'lingoweave',runtimeStatus:'connected',tools:{learning_get_context:{},learning_publish_materials:{}}}, {name:'unrelated',runtimeStatus:scenario==='foreign'?'connected':'disabled',tools:{}}],nextCursor:null};break;
         case 'turn/start':
           result={turn:{id:'turn-1'}};
@@ -80,6 +88,20 @@ test('status exposes only runtime availability and model metadata, with a shared
   assert.strictEqual(await bridge.status(), first);
 });
 
+test('concurrent callers share a failed status probe but the next caller can recover immediately', async (t) => {
+  const bridge = await fixture(t, 'fail-first-probe');
+  const first = bridge.status();
+  assert.strictEqual(bridge.status(), first);
+  assert.equal((await first).available, false);
+
+  const retry = bridge.status();
+  assert.strictEqual(bridge.status(), retry);
+  const recovered = await retry;
+  assert.equal(recovered.available, true);
+  assert.equal(recovered.models[0]?.id, 'test-model');
+  assert.strictEqual(await bridge.status(), recovered);
+});
+
 test('logged-out Codex reports a usable action and never starts a preparation turn', async (t) => {
   const bridge = await fixture(t, 'login');
   const status = await bridge.status();
@@ -111,6 +133,10 @@ test('foreign active MCP servers stop preparation before model execution', async
 test('unavailable model, failed turn and timeout are distinguishable safe errors', async (t) => {
   const bridge = await fixture(t);
   await assert.rejects(bridge.prepare({ ...options(), model: 'not-available' }), {
+    code: 'CODEX_MODEL_UNAVAILABLE',
+  });
+  const substituted = await fixture(t, 'substitute');
+  await assert.rejects(substituted.prepare({ ...options(), model: 'test-model' }), {
     code: 'CODEX_MODEL_UNAVAILABLE',
   });
   const failed = await fixture(t, 'failed');

@@ -15,7 +15,6 @@ import {
   type MiniAudioRequest,
   type MiniAudioResult,
   type MiniAudioTarget,
-  type MiniAudioVoice,
   type MiniCommand,
   type MiniReviewSession,
   type MiniWord,
@@ -28,11 +27,13 @@ import {
   currentLearningWord,
   currentMiniWindow,
   currentTranslation,
+  reachedTranslation,
   sameWord,
+  savedMiniSentence,
+  spellingResultSession,
   swiftTime,
 } from './mini-study.js';
 
-const voices: MiniAudioVoice[] = ['ryan', 'aiden', 'serena'];
 const normalize = (value: string) => value.normalize('NFKC').trim().replace(/\s+/g, ' ');
 function hasSpellingResult(session: MiniReviewSession | undefined, word: MiniWord) {
   return (
@@ -284,7 +285,6 @@ export class MiniAudioService {
           input,
           existing.targetKey,
           generation(input.target, existing.profile),
-          existing.voice,
           existing,
         ).result;
       }
@@ -296,20 +296,14 @@ export class MiniAudioService {
     }
     const material = generation(input.target, status.profile),
       targetKey = keyFor(material),
-      current = await this.currentAsset(input.target, status.profile);
-    const existing = current;
-    const random = this.options.random?.() ?? Math.random(),
-      voice =
-        input.voice ??
-        voices[Math.min(2, Math.max(0, Math.floor(random * voices.length)))] ??
-        'ryan';
+      existing = await this.currentAsset(input.target, status.profile);
     beforeCommit?.();
     const result = this.store.request(
       input,
       input.operation === 'ensure' && existing ? existing.targetKey : targetKey,
       material,
-      voice,
       existing,
+      this.options.random,
     );
     if (result.dispatch) this.drain();
     return result.result;
@@ -412,10 +406,12 @@ export class MiniAudioService {
   }
   private actual(context?: MiniAudioContext) {
     const state = this.study.snapshot();
+    const taskId = context?.target === 'daily' ? context.taskId : undefined;
     const practice = state.practice.dictations.find(
       (item) => item.id === state.practice.activeDictationId && item.closedAt === undefined,
     );
     if (practice) {
+      if (taskId) throw new LearningError('AUDIO_TARGET_CHANGED', '当前正在草稿拼写。');
       let expected: MiniAudioContext;
       if (practice.target === 'review') {
         if (!practice.recordId)
@@ -451,14 +447,7 @@ export class MiniAudioService {
         knownSentence: undefined,
       };
     }
-    const savedSentence = (word: MiniWord) =>
-      state.ledger.days
-        .find((day) => day.id === state.planning.activeDayId)
-        ?.sentences.find((sentence) => sameWord(sentence.word, word)) ??
-      [...state.ledger.days]
-        .reverse()
-        .flatMap((day) => day.sentences)
-        .find((sentence) => sameWord(sentence.word, word));
+    const savedSentence = (word: MiniWord) => savedMiniSentence(state, word);
     if (context?.target === 'review') {
       const record = state.reviewRecord;
       if (
@@ -495,6 +484,9 @@ export class MiniAudioService {
     )
       throw new LearningError('AUDIO_TARGET_CHANGED', '当前词卡已变化，未播放旧音频。');
     if (day && day.id === state.planning.activeDayId && day.phase !== 'finished') {
+      const translation = taskId ? reachedTranslation(day, taskId) : currentTranslation(day);
+      if (taskId && !translation)
+        throw new LearningError('AUDIO_TARGET_CHANGED', '这道翻译题不在当前可回看的范围内。');
       const unseen = day.learningWords.find(
         (word) => !day.studiedWords.some((item) => sameWord(item.word, word)),
       );
@@ -503,7 +495,7 @@ export class MiniAudioService {
           ? (currentMiniWindow(day)?.visit?.word ?? day.review?.queue[0])
           : day.phase === 'learning'
             ? currentLearningWord(day)
-            : currentTranslation(day)?.sentence.word;
+            : translation?.sentence.word;
       if (
         context?.target === 'daily' &&
         context.session !== undefined &&
@@ -536,9 +528,14 @@ export class MiniAudioService {
           context: {
             target: 'daily' as const,
             dayId: day.id,
+            ...(taskId ? { taskId } : {}),
             ...(day.phase === 'translation' ? {} : { session: day.phase }),
           },
           word,
+          englishSourcePrompt:
+            day.phase === 'translation' && translation?.direction === 'englishToChinese'
+              ? translation.sentence.english
+              : undefined,
           automatic:
             !day.paused &&
             (spellingResult ||
@@ -548,8 +545,7 @@ export class MiniAudioService {
                   : day.review?.phase === 'judgment'
                 : visit !== undefined || fullLearningCard)),
           automaticWord: !visit || visit.stage !== 1 || visit.initial !== undefined,
-          knownSentence:
-            day.phase === 'translation' ? currentTranslation(day)?.sentence : savedSentence(word),
+          knownSentence: day.phase === 'translation' ? translation?.sentence : savedSentence(word),
           sentence:
             !day.paused && (fullLearningCard || fullReviewCard || visit?.stage === 1)
               ? savedSentence(word)
@@ -599,7 +595,52 @@ export class MiniAudioService {
       throw new LearningError('AUDIO_PROBE_ACTIVE', '请先结束独立检验，再试听答案音频。');
     const asset = this.store.asset(input.assetId);
     validateDuration(asset.target, asset.durationSeconds);
+    if (input.spellingSubmissionId) {
+      const result = this.study.spellingSubmission(input.spellingSubmissionId);
+      if (
+        input.mode !== 'automatic' ||
+        input.context ||
+        !result ||
+        asset.target.kind !== 'word' ||
+        !sameWord(asset.target.word, result.action.word) ||
+        !spellingResultSession(
+          state,
+          result.action,
+          result.action.word,
+          result.occurredAt,
+          result.action.answer,
+        )
+      )
+        throw new LearningError('AUDIO_TARGET_CHANGED', '这条拼写结果已变化，未播放旧音频。');
+      const { target, dayId, recordId, session, word } = result.action;
+      return this.authorizeCommand(input, {
+        requestId: stableId(`${input.requestId}:audio-help`),
+        expectedRevision: state.revision,
+        action: {
+          type: 'record_exposure',
+          target,
+          dayId,
+          recordId,
+          session,
+          word,
+          kind: 'potentialHelp',
+          source: 'audio',
+          audioKind: 'word',
+          spellingResultAt: result.occurredAt,
+          focusIds: [],
+        },
+      });
+    }
     let actual = this.actual(input.context);
+    if (
+      input.context?.target === 'daily' &&
+      input.context.taskId &&
+      asset.target.kind === 'sentence' &&
+      (!actual?.knownSentence ||
+        !sameWord(asset.target.sentence.word, actual.word) ||
+        normalize(asset.target.sentence.english) !== normalize(actual.knownSentence.english))
+    )
+      throw new LearningError('AUDIO_TARGET_CHANGED', '音频与当前翻译题不匹配。');
     const matchesCurrent =
       actual &&
       (spokenContains(asset.text, actual.word.spelling) ||
@@ -644,10 +685,20 @@ export class MiniAudioService {
             kind: 'potentialHelp',
             source: 'audio',
             audioKind: asset.target.kind,
+            ...('englishSourcePrompt' in actual &&
+            actual.englishSourcePrompt &&
+            (asset.target.kind === 'sentence'
+              ? normalize(asset.text) === normalize(actual.englishSourcePrompt)
+              : spokenContains(actual.englishSourcePrompt, asset.text))
+              ? { translationPromptAudio: true as const }
+              : {}),
             focusIds: [],
           },
         }
       : null;
+    return this.authorizeCommand(input, command);
+  }
+  private authorizeCommand(input: MiniAudioPlayback, command: MiniCommand | null) {
     this.store.prepareAuthorization(input, command);
     const revision = command ? this.study.aiCommand(command).revision : null;
     return this.store.confirmAuthorization(input.requestId, revision);

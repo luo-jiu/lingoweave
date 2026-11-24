@@ -27,6 +27,8 @@ const scenario = ${JSON.stringify(scenario)};
 const miniTools = ${JSON.stringify(expectedTools)};
 const log = ${JSON.stringify(log)};
 const send = value => process.stdout.write(JSON.stringify(value)+'\\n');
+let accountReads = 0;
+let lateAccountRequest;
 readline.createInterface({input:process.stdin}).on('line', line => {
   const message = JSON.parse(line);
   if(message.id===undefined)return;
@@ -34,7 +36,19 @@ readline.createInterface({input:process.stdin}).on('line', line => {
   let result = {};
   switch(message.method) {
     case 'initialize': result = {userAgent:'Codex/0.153.4 test'}; break;
-    case 'account/read': result = {account:{type:'chatgpt'},requiresOpenaiAuth:true}; break;
+    case 'account/read':
+      accountReads++;
+      if (scenario === 'account-persistent' || (scenario === 'account-transient' && accountReads === 1)) {
+        send({id:message.id,error:{code:-32603,message:'temporary workspace error'}}); return;
+      }
+      if (scenario === 'account-forbidden') {
+        send({id:message.id,error:{code:-32602,message:'invalid account parameters'}}); return;
+      }
+      if (scenario === 'account-timeout') {
+        if (accountReads === 1) { lateAccountRequest = message.id; return; }
+        send({id:lateAccountRequest,result:{account:null,requiresOpenaiAuth:true}});
+      }
+      result = {account:{type:'chatgpt'},requiresOpenaiAuth:true}; break;
     case 'model/list': result = {data:[
       {id:'default-id',model:'default-model',displayName:'Default',isDefault:true,supportedReasoningEfforts:[{reasoningEffort:'medium'}]},
       {id:'selected-id',model:'gpt-6.1-sol',displayName:'Selected',isDefault:false,hidden:scenario==='hidden-model',supportedReasoningEfforts:scenario==='no-effort-metadata'?undefined:[{reasoningEffort:'high'}, {reasoningEffort:'xhigh'}],defaultReasoningEffort:'high'}
@@ -52,6 +66,9 @@ readline.createInterface({input:process.stdin}).on('line', line => {
       break;
     }
     case 'turn/start':
+      if (scenario === 'turn-rejected') {
+        send({id:message.id,error:{code:-32603,message:'failed to start turn'}}); return;
+      }
       send({id:message.id,result:{turn:{id:'mini-turn'}}});
       send({method:'turn/completed',params:{threadId:'mini-thread',turn:{id:'mini-turn',status:'completed'}}});
       return;
@@ -94,6 +111,40 @@ function options(): PrepareOptions {
     signal: new AbortController().signal,
   };
 }
+
+test('account read recovers once per child during status and preparation', async (t) => {
+  const data = await fixture(t, 'account-transient');
+  assert.equal((await data.bridge.status()).authenticated, true);
+  assert.equal((await data.bridge.prepare(options())).threadId, 'mini-thread');
+  const methods = (await data.calls()).map((call) => call.method);
+  assert.equal(methods.filter((method) => method === 'account/read').length, 4);
+  assert.equal(methods.filter((method) => method === 'initialize').length, 2);
+  assert.equal(methods.filter((method) => method === 'turn/start').length, 1);
+});
+
+test('a late account response cannot override a successful retry in the same child', async (t) => {
+  const data = await fixture(t, 'account-timeout');
+  assert.equal((await data.bridge.status()).authenticated, true);
+  assert.deepEqual(
+    (await data.calls()).map((call) => call.method),
+    ['initialize', 'account/read', 'account/read', 'model/list'],
+  );
+});
+
+test('persistent account errors stop at the bound and other rejections are not replayed', async (t) => {
+  for (const [scenario, rpcCode, retries, turns] of [
+    ['account-persistent', -32603, 1, 0],
+    ['account-forbidden', -32602, 0, 0],
+    ['turn-rejected', -32603, 0, 1],
+  ] as const) {
+    const data = await fixture(t, scenario);
+    await assert.rejects(data.bridge.prepare(options()), { code: 'CODEX_REQUEST_FAILED', rpcCode });
+    const methods = (await data.calls()).map((call) => call.method);
+    assert.equal(methods.filter((method) => method === 'initialize').length, 1);
+    assert.equal(methods.filter((method) => method === 'account/read').length, 1 + retries);
+    assert.equal(methods.filter((method) => method === 'turn/start').length, turns);
+  }
+});
 
 test('mini adapter forwards the chosen model and effort while isolating exactly its four tools', async (t) => {
   const data = await fixture(t);

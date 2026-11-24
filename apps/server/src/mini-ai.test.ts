@@ -18,9 +18,11 @@ import {
   type RuntimeStatus,
 } from '@lingoweave/contracts';
 import { LearningError } from './learning-store.js';
+import { CodexError } from './codex/transport.js';
 import { buildApp } from './app.js';
 import { MiniAiService } from './mini-ai-service.js';
 import { MiniAiStore } from './mini-ai-store.js';
+import { miniAiActionOptions } from './mini-ai-policy.js';
 import { MiniStore } from './mini-store.js';
 import {
   currentMiniWindow,
@@ -86,13 +88,13 @@ function initialize(study: MiniStore) {
     timezone,
   });
 }
-function fixture(t: TestContext, deck: MiniWord[] = [apple]) {
-  const study = new MiniStore(':memory:', { now, timezone });
+function fixture(t: TestContext, deck: MiniWord[] = [apple], clock = now) {
+  const study = new MiniStore(':memory:', { now: clock, timezone });
   initialize(study);
-  const ai = new MiniAiStore(':memory:', now);
+  const ai = new MiniAiStore(':memory:', clock);
   ai.importLegacy({ requestId: randomUUID(), conversations: [] });
   const runtime = new FakeRuntime();
-  const service = new MiniAiService(study, ai, runtime);
+  const service = new MiniAiService(study, ai, runtime, undefined, undefined, undefined, 5);
   service.setBaseUrl('http://127.0.0.1:12345');
   t.after(async () => {
     await service.close();
@@ -147,7 +149,7 @@ function prepareWriting(data: Fixture) {
   });
   for (const word of data.day().learningWords)
     data.act({ type: 'mark_studied', target: 'daily', dayId, word });
-  for (const word of data.day().learningWords)
+  for (const word of data.day().learning?.queue ?? [])
     data.act({
       type: 'submit_spelling',
       target: 'daily',
@@ -256,6 +258,199 @@ test('failed advisor retries retain the original user message and publish the fi
   assert.equal(data.runtime.calls.length, 2);
 });
 
+function practiceStartFrame(study: MiniStore) {
+  study.practicePattern({
+    requestId: randomUUID(),
+    timezone,
+    batchId: study.patterns(timezone).batchId,
+    patternId: 'a1-need',
+    answer: 'I need a pen.',
+    usedHint: false,
+  });
+}
+
+test('English scene starts without inventing a learner message, reads only practiced content, and closes on actual dialogue reflection', async (t) => {
+  const data = fixture(t, [apple, book]);
+  const conversationId = `dialogue:${randomUUID()}`;
+  const open = startInput({ kind: 'dialogue', conversationId, message: undefined });
+  assert.throws(() => data.service.start(open), hasCode('DIALOGUE_NOT_READY'));
+  data.begin();
+  const dayId = data.day().id;
+  data.act({
+    type: 'add_sentences',
+    target: 'daily',
+    dayId,
+    sentences: [example(apple), example(book)],
+  });
+  data.act({ type: 'mark_studied', target: 'daily', dayId, word: apple });
+  practiceStartFrame(data.study);
+  const before = data.study.snapshot();
+  const practicedBefore = data.study.patternContext();
+  const schema = z
+    .object({
+      mode: z.enum(['open', 'reply', 'reflect']),
+      allowedActions: z.array(z.string()),
+      practicedPatterns: z.array(z.object({ id: z.string() })),
+      encounteredWords: z.array(z.object({ spelling: z.string() })),
+      messages: z.array(z.object({ role: z.string(), text: z.string() })),
+    })
+    .strict();
+  const seen: z.infer<typeof schema>[] = [];
+  data.runtime.behavior = async (options) => {
+    assert.deepEqual(options.tools, ['learning_get_context']);
+    assert.equal(options.skill?.name, 'mini-dialogue');
+    for (const action of ['history', 'word', 'audio_request', 'commit'])
+      assert.throws(() => data.tool(options, action), hasCode('AI_ACTION_FORBIDDEN'));
+    const c = schema.parse(data.tool(options, 'context'));
+    seen.push(c);
+    assert.deepEqual(c.allowedActions, []);
+    assert.deepEqual(
+      c.practicedPatterns.map((p) => p.id),
+      ['a1-need'],
+    );
+    assert.deepEqual(
+      c.encounteredWords.map((w) => w.spelling),
+      ['apple'],
+    );
+    options.onText(
+      c.mode === 'open'
+        ? 'Hello! Can I help you?'
+        : c.mode === 'reply'
+          ? 'Here you are.'
+          : 'You asked clearly for a pen.',
+    );
+  };
+  const run = async (input: MiniAiStart) => {
+    const job = data.service.start(input);
+    assert.equal((await settled(data, job.id)).status, 'completed');
+    return job;
+  };
+  const other = startInput({
+    kind: 'dialogue',
+    conversationId: `dialogue:${randomUUID()}`,
+    message: 'A bag.',
+  });
+  assert.throws(() => data.service.start(other), hasCode('DIALOGUE_NOT_OPEN'));
+  const opening = await run(open);
+  assert.equal(data.service.start(open).id, opening.id);
+  assert.throws(
+    () => data.service.start({ ...open, requestId: randomUUID() }),
+    hasCode('DIALOGUE_EXISTS'),
+  );
+  assert.equal(data.ai.userMessage(opening.id), undefined);
+  assert.equal(
+    miniAiStartSchema.safeParse({ ...open, kind: 'advisor', message: 'hi' }).success,
+    false,
+  );
+  assert.equal(miniAiStartSchema.safeParse({ ...open, conversationId: 'advisor' }).success, false);
+  const reflect = { ...open, requestId: randomUUID(), dialogueStep: 'reflect' as const };
+  assert.throws(() => data.service.start(reflect), hasCode('DIALOGUE_NO_REPLY'));
+  const reply = { ...open, requestId: randomUUID(), message: 'I need a pen.' };
+  await run(reply);
+  const end = await run(reflect);
+  assert.equal(end.dialogueStep, 'reflect');
+  assert.throws(
+    () => data.service.start({ ...reply, requestId: randomUUID() }),
+    hasCode('DIALOGUE_NOT_OPEN'),
+  );
+  assert.deepEqual(
+    seen.map((c) => c.mode),
+    ['open', 'reply', 'reflect'],
+  );
+  assert.deepEqual(
+    seen.map((c) => c.messages.map((m) => m.role)),
+    [[], ['assistant', 'user'], ['assistant', 'user', 'assistant']],
+  );
+  assert.deepEqual(
+    data.ai.messages(conversationId).map((m) => m.role),
+    ['assistant', 'user', 'assistant', 'assistant'],
+  );
+  assert.deepEqual(data.study.snapshot(), before);
+  assert.deepEqual(data.study.patternContext(), practicedBefore);
+});
+
+test('unread or non-English model output never appears as an English scene turn; retry preserves identity', async (t) => {
+  const data = fixture(t);
+  practiceStartFrame(data.study);
+  const conversationId = `dialogue:${randomUUID()}`;
+  const input = startInput({ kind: 'dialogue', conversationId, message: undefined });
+  data.runtime.behavior = async (options) => {
+    options.onText('Hello.');
+  };
+  const job = data.service.start(input);
+  assert.equal((await settled(data, job.id)).status, 'failed');
+  data.runtime.behavior = async (options) => {
+    data.tool(options, 'context');
+    options.onText('你好');
+  };
+  data.service.retry({ requestId: randomUUID(), jobId: job.id });
+  assert.equal((await settled(data, job.id)).text, '');
+  assert.deepEqual(data.ai.messages(conversationId), []);
+  data.runtime.behavior = async (options) => {
+    data.tool(options, 'context');
+    options.onText('Hello!');
+  };
+  data.service.retry({ requestId: randomUUID(), jobId: job.id });
+  assert.equal((await settled(data, job.id)).status, 'completed');
+  assert.deepEqual(
+    data.ai.messages(conversationId).map((m) => m.text),
+    ['Hello!'],
+  );
+});
+
+test('preparation and independent writing may reuse practiced frames but never expose the untouched catalog', async (t) => {
+  const data = fixture(t);
+  data.begin();
+  practiceStartFrame(data.study);
+  const readCurriculum = z.object({
+    curriculum: z.object({
+      practicedPatterns: z.array(z.object({ id: z.string() })),
+      patternGuidance: z.string(),
+    }),
+  });
+  for (const kind of ['prepare', 'writing'] as const) {
+    let checked = false;
+    data.runtime.behavior = async (options) => {
+      const { curriculum } = readCurriculum.parse(data.tool(options, 'context'));
+      assert.deepEqual(
+        curriculum.practicedPatterns.map((p) => p.id),
+        ['a1-need'],
+      );
+      assert.match(curriculum.patternGuidance, /No quota/);
+      checked = true;
+    };
+    const job = data.service.start(startInput({ kind, dayId: data.day().id, message: undefined }));
+    await settled(data, job.id);
+    assert.ok(checked);
+  }
+});
+
+test('long scene context keeps the opening and recent actual messages; a different scene sees none of them', (t) => {
+  const store = new MiniAiStore(':memory:', now);
+  t.after(() => store.close());
+  store.importLegacy({ requestId: randomUUID(), conversations: [] });
+  const scene = `dialogue:${randomUUID()}`;
+  for (let n = 0; n < 10; n++) {
+    const { job } = store.start(
+      startInput({
+        kind: 'dialogue',
+        conversationId: scene,
+        message: n ? `Reply ${n}` : undefined,
+      }),
+    );
+    store.update(job.id, (job) => {
+      job.text = n ? `Turn ${n}` : 'Welcome to the shop.';
+    });
+    store.finish(job.id, 'completed');
+  }
+  const messages = store.messages(scene);
+  assert.equal(messages.length, 12);
+  assert.equal(messages[0]?.text, 'Welcome to the shop.');
+  assert.equal(messages.at(-2)?.text, 'Reply 9');
+  assert.equal(messages.at(-1)?.text, 'Turn 9');
+  assert.deepEqual(store.messages(`dialogue:${randomUUID()}`), []);
+});
+
 test('chat retries preserve one actual support exposure without blocking the final reply', async (t) => {
   const data = fixture(t);
   data.begin();
@@ -274,6 +469,41 @@ test('chat retries preserve one actual support exposure without blocking the fin
   assert.equal(data.study.snapshot().teaching.exposures.length, 1);
   assert.equal(data.ai.job(job.id).text, '重试后的完整讲解');
   assert.deepEqual(data.day().studiedWords, []);
+});
+
+test('chat on an earlier translation reads that answer and records help against its word', async (t) => {
+  const data = fixture(t, [apple, book]);
+  data.begin();
+  const first = prepareWriting(data);
+  const dayId = data.day().id;
+  data.act({
+    type: 'record_feedback',
+    target: 'daily',
+    dayId,
+    attemptId: first.id,
+    feedback: { comment: '意思清楚。', tip: '', usefulPhrase: '' },
+  });
+  data.act({ type: 'advance_translation', target: 'daily', dayId, taskId: first.task.id });
+  assert.equal(data.day().translationIndex, 1);
+  data.runtime.behavior = async (options) => {
+    const context = z
+      .object({
+        currentTask: z.object({ id: z.string() }),
+        day: z.object({ attempt: z.object({ id: z.uuid(), answer: z.string() }) }),
+      })
+      .parse(data.tool(options, 'context'));
+    assert.equal(context.currentTask.id, first.task.id);
+    assert.equal(context.day.attempt.answer, first.answer);
+    options.onText('可以一起看看上一句的意思。');
+  };
+  const job = data.service.start(
+    startInput({ dayId, word: apple, attemptId: first.id, message: '再看看这句。' }),
+  );
+  assert.equal((await settled(data, job.id)).status, 'completed');
+  const exposure = data.study.snapshot().teaching.exposures.at(-1);
+  assert.equal(exposure?.source, 'chat');
+  assert.equal(exposure?.taskId, first.task.id);
+  assert.deepEqual(exposure?.word, apple);
 });
 
 test('advisor text records actual support for the current standalone legacy review card', async (t) => {
@@ -669,28 +899,186 @@ test('a saved primary result stays completed when the runtime fails afterwards',
   assert.equal(data.day().sentences.length, 1);
 });
 
-test('partially saved preparation remains retryable until every target has material', async (t) => {
+test('a disconnected lesson retries only the missing targets and retires its old turn token', async (t) => {
   const data = fixture(t, [apple, book]);
   data.begin();
   const dayId = data.day().id;
   let runs = 0;
   data.runtime.behavior = async (options) => {
     runs += 1;
+    if (runs === 2) {
+      assert.deepEqual(
+        data.day().sentences.map((sentence) => sentence.word),
+        [apple],
+      );
+      const previous = data.runtime.calls[0];
+      assert.ok(previous);
+      assert.throws(() => data.read(previous), hasCode('AI_TASK_EXPIRED'));
+    }
     data.commit(options, {
       type: 'add_sentences',
       target: 'daily',
       dayId,
       sentences: [example(runs === 1 ? apple : book)],
     });
-    if (runs === 1) throw new Error('only one target prepared');
+    if (runs === 1) throw new CodexError('CODEX_DISCONNECTED', '连接中断');
+  };
+  const job = data.service.start(startInput({ kind: 'prepare', dayId, message: undefined }));
+  assert.equal((await settled(data, job.id)).status, 'completed');
+  assert.equal(runs, 2);
+  assert.equal(data.ai.job(job.id).receipts.length, 2);
+  assert.equal(data.day().sentences.length, 2);
+});
+
+test('lesson retries stop after three timeouts, leave recoverable work, and respect cancellation', async (t) => {
+  const data = fixture(t);
+  data.begin();
+  const dayId = data.day().id;
+  data.runtime.behavior = async () => {
+    throw new CodexError('CODEX_TIMEOUT', '暂时超时');
   };
   const job = data.service.start(startInput({ kind: 'prepare', dayId, message: undefined }));
   assert.equal((await settled(data, job.id)).status, 'failed');
-  assert.equal(data.day().sentences.length, 1);
-  assert.equal(data.ai.job(job.id).receipts.length, 1);
+  assert.equal(data.runtime.calls.length, 4);
+  assert.deepEqual(data.day().sentences, []);
+  data.service.retry({ requestId: randomUUID(), jobId: job.id });
+  await setImmediate();
+  assert.match(data.ai.job(job.id).progress, /自动重试/);
+  data.service.cancel({ requestId: randomUUID(), jobId: job.id });
+  assert.equal((await settled(data, job.id)).status, 'cancelled');
+  assert.equal(data.runtime.calls.length, 5);
+  data.runtime.behavior = async (options) => {
+    data.commit(options, {
+      type: 'add_sentences',
+      target: 'daily',
+      dayId,
+      sentences: [example(apple)],
+    });
+  };
   data.service.retry({ requestId: randomUUID(), jobId: job.id });
   assert.equal((await settled(data, job.id)).status, 'completed');
-  assert.equal(data.day().sentences.length, 2);
+  assert.equal(data.runtime.calls.length, 6);
+});
+
+test('a configuration failure waits for explicit repair without repeating the model request', async (t) => {
+  const data = fixture(t);
+  data.begin();
+  data.runtime.behavior = async () => {
+    throw new CodexError('CODEX_LOGIN_REQUIRED', '需要登录');
+  };
+  const job = data.service.start(
+    startInput({ kind: 'prepare', dayId: data.day().id, message: undefined }),
+  );
+  assert.equal((await settled(data, job.id)).status, 'failed');
+  assert.equal(data.runtime.calls.length, 1);
+});
+
+test('rollover retires a running lesson before its next write and replays earlier receipts without a new model turn', async (t) => {
+  let clock = now();
+  const data = fixture(t, [apple], () => clock);
+  data.begin();
+  const dayId = data.day().id;
+  const input = startInput({ kind: 'prepare', dayId, message: undefined });
+  data.runtime.behavior = async () => {
+    throw new Error('first turn interrupted');
+  };
+  const job = data.service.start(input);
+  assert.equal((await settled(data, job.id)).status, 'failed');
+  data.runtime.behavior = async (options) => {
+    await new Promise<void>((resolve) =>
+      options.signal.addEventListener('abort', () => resolve(), { once: true }),
+    );
+  };
+  const retry = { requestId: randomUUID(), jobId: job.id };
+  data.service.retry(retry);
+  await setImmediate();
+  const turn = data.runtime.calls.at(-1);
+  assert.ok(turn);
+  const current = data.read(turn);
+  clock = new Date('2026-11-14T04:00:00Z');
+  const before = data.study.snapshot();
+  assert.throws(
+    () =>
+      data.tool(turn, 'commit', {
+        requestId: randomUUID(),
+        expectedRevision: current.revision,
+        action: { type: 'add_sentences', target: 'daily', dayId, sentences: [example(apple)] },
+      }),
+    hasCode('AI_TARGET_EXPIRED'),
+  );
+  assert.equal((await settled(data, job.id)).status, 'cancelled');
+  assert.equal(turn.signal.aborted, true);
+  assert.deepEqual(data.study.snapshot(), before);
+  assert.equal(data.service.start(input).id, job.id);
+  assert.equal(data.service.retry(retry).id, job.id);
+  for (const kind of ['prepare', 'writing'] as const)
+    assert.throws(
+      () => data.service.start(startInput({ kind, dayId })),
+      hasCode('AI_TARGET_EXPIRED'),
+    );
+  assert.throws(
+    () => data.service.retry({ requestId: randomUUID(), jobId: job.id }),
+    hasCode('AI_TARGET_EXPIRED'),
+  );
+  assert.equal(data.ai.jobs().length, 1);
+  assert.equal(data.runtime.calls.length, 2);
+});
+
+test('a stale timeout never reruns the lesson after midnight', async (t) => {
+  let clock = now();
+  const data = fixture(t, [apple], () => clock);
+  data.begin();
+  const input = startInput({ kind: 'prepare', dayId: data.day().id, message: undefined });
+  data.runtime.behavior = async () => {
+    clock = new Date('2026-11-14T04:00:00Z');
+    throw new CodexError('CODEX_TIMEOUT', '模型超时');
+  };
+  assert.equal((await settled(data, data.service.start(input).id)).status, 'cancelled');
+  assert.equal(data.runtime.calls.length, 1);
+});
+
+test('the next lesson can start when both worker slots belonged to the previous day', async (t) => {
+  let clock = now();
+  const data = fixture(t, [apple], () => clock);
+  data.begin();
+  const yesterday = data.day().id;
+  data.runtime.behavior = async (options) => {
+    if (data.ai.input(options.jobId).dayId === yesterday) {
+      await new Promise<void>((resolve) =>
+        options.signal.addEventListener('abort', () => resolve(), { once: true }),
+      );
+      return;
+    }
+    data.commit(options, {
+      type: 'add_sentences',
+      target: 'daily',
+      dayId: data.day().id,
+      sentences: data.day().learningWords.map(example),
+    });
+  };
+  const lesson = data.service.start(startInput({ kind: 'prepare', dayId: yesterday }));
+  const writing = data.service.start(startInput({ kind: 'writing', dayId: yesterday }));
+  await setImmediate();
+  assert.equal(data.runtime.calls.length, 2);
+  clock = new Date('2026-11-14T04:00:00Z');
+  data.act({
+    type: 'begin',
+    target: 'daily',
+    deck: [book],
+    timezone,
+    flowVersion: 'sliding-window-v2',
+  });
+  assert.notEqual(data.day().id, yesterday);
+  const fresh = data.service.start(startInput({ kind: 'prepare', dayId: data.day().id }));
+  assert.equal((await settled(data, fresh.id)).status, 'completed');
+  assert.equal(data.ai.job(lesson.id).status, 'cancelled');
+  assert.equal(data.ai.job(writing.id).status, 'cancelled');
+  assert.equal(data.runtime.calls.length, 3);
+  assert.deepEqual(
+    data.study.snapshot().ledger.days.find((day) => day.id === yesterday)?.sentences,
+    [],
+  );
+  assert.equal(data.day().sentences.length, 1);
 });
 
 test('writing retries complete independent prompts without duplicating partially published work', async (t) => {
@@ -751,12 +1139,14 @@ test('chat text claiming success never substitutes for a real primary publicatio
   assert.deepEqual(data.ai.job(job.id).receipts, []);
 });
 
-test('feedback may explain only its saved original attempt without grading or replacing user answers', async (t) => {
-  const data = fixture(t);
+test('new teaching feedback requires a display grade for its assigned answer and preserves scheduling', async (t) => {
+  let clock = now();
+  const data = fixture(t, [apple], () => clock);
   data.begin();
   const attempt = prepareWriting(data);
   const dayId = data.day().id;
   const feedback = {
+    expressionGrade: 'natural' as const,
     comment: '意思表达清楚。',
     tip: '留意表达。',
     usefulPhrase: 'an apple',
@@ -767,6 +1157,7 @@ test('feedback may explain only its saved original attempt without grading or re
   };
   const original = structuredClone(attempt);
   const originalSchedule = data.day().scheduleUpdates;
+  clock = new Date('2026-11-14T04:00:00Z');
   data.runtime.behavior = async (options) => {
     const context = data.read(options);
     assert.throws(
@@ -784,13 +1175,27 @@ test('feedback may explain only its saved original attempt without grading or re
         }),
       hasCode('AI_TARGET_INVALID'),
     );
-    data.commit(options, {
-      type: 'qualitative_feedback',
-      target: 'daily',
+    const requestId = randomUUID();
+    const action = {
+      type: 'qualitative_feedback' as const,
+      target: 'daily' as const,
       dayId,
       attemptId: attempt.id,
       feedback,
-    });
+    };
+    const incomplete = { ...action, feedback: { ...feedback, expressionGrade: undefined } };
+    const toolSchema = z.union(miniAiActionOptions('feedback'));
+    assert.equal(toolSchema.safeParse(incomplete).success, false);
+    assert.equal(toolSchema.safeParse(action).success, true);
+    assert.throws(() => data.commit(options, incomplete, requestId), z.ZodError);
+    assert.throws(
+      () =>
+        data.study.aiCommand({ requestId, expectedRevision: context.revision, action: incomplete }),
+      z.ZodError,
+    );
+    assert.equal(data.study.commandReceipt(requestId), null);
+    assert.deepEqual(data.ai.pendingTools(), []);
+    data.commit(options, action, requestId);
   };
   const job = data.service.start(
     startInput({ kind: 'feedback', dayId, attemptId: attempt.id, message: undefined }),
@@ -1043,6 +1448,64 @@ test('restart reconciles a committed command without an AI receipt and interrupt
   assert.equal(runtime.calls.length, 0);
 });
 
+test('restart recovers an original gradeless teaching receipt without rewriting its answer or calling the model', async (t) => {
+  const f = fixture(t);
+  f.begin();
+  const attempt = prepareWriting(f);
+  const dayId = f.day().id;
+  const directory = await mkdtemp(join(tmpdir(), 'lingoweave-old-feedback-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const path = join(directory, 'mini-ai.sqlite');
+  let ai = new MiniAiStore(path, now);
+  ai.importLegacy({ requestId: randomUUID(), conversations: [] });
+  const job = ai.start(
+    startInput({ kind: 'feedback', dayId, attemptId: attempt.id, message: undefined }),
+  ).job;
+  ai.update(job.id, (row) => {
+    row.status = 'running';
+  });
+  const old: MiniCommand = {
+    requestId: randomUUID(),
+    expectedRevision: f.study.snapshot().revision,
+    action: {
+      type: 'qualitative_feedback',
+      target: 'daily',
+      dayId,
+      attemptId: attempt.id,
+      feedback: {
+        comment: '旧点评',
+        tip: '',
+        usefulPhrase: '',
+        strengths: [],
+        improvements: [],
+        keyPoints: [],
+        referenceTranslation: attempt.answer,
+      },
+    },
+  };
+  ai.toolCommand(job.id, 'learning_commit', old);
+  // Seed the formerly accepted wire body and its receipt using the legacy client path.
+  const beforeRestart = f.study.command(old);
+  ai.close();
+  ai = new MiniAiStore(path, now);
+  const runtime = new FakeRuntime();
+  const restored = new MiniAiService(f.study, ai, runtime);
+  t.after(() => restored.close());
+  assert.equal(ai.job(job.id).status, 'completed');
+  assert.deepEqual(
+    ai.job(job.id).receipts.map((row) => row.requestId),
+    [old.requestId],
+  );
+  assert.deepEqual(ai.pendingTools(), []);
+  assert.deepEqual(
+    f.study.aiCommand(old),
+    beforeRestart,
+    'a historical receipt is checked before new-AI grading rules',
+  );
+  assert.equal(f.day().translation[0]?.feedback?.expressionGrade, undefined);
+  assert.equal(runtime.calls.length, 0);
+});
+
 test('restart and clear include tasks older than the fifty-task UI snapshot', async (t) => {
   const study = new MiniStore(':memory:', { now, timezone });
   initialize(study);
@@ -1147,13 +1610,12 @@ test('v2 preparation covers reserves and later groups receive only their missing
   const preparation = data.service.start(
     startInput({ kind: 'prepare', dayId: target.dayId, message: undefined }),
   );
-  assert.equal(
-    (await settled(data, preparation.id)).status,
-    'failed',
-    'window-only material cannot falsely complete reserve preparation',
-  );
-  data.service.retry({ requestId: randomUUID(), jobId: preparation.id });
   assert.equal((await settled(data, preparation.id)).status, 'completed');
+  assert.equal(
+    preparationCalls,
+    2,
+    'automatic recovery fills the reserve material missing from the first turn',
+  );
   assert.equal(data.day().sentences.length, 7);
   assert.equal(
     data.day().learningWords.length,

@@ -131,7 +131,7 @@ test('third-round retry preserves out-of-order ready words and resumes from thei
     data.day().studiedWords.map((item) => item.word),
     [book, apple],
   );
-  assert.deepEqual(data.day().learning?.queue, [apple, book]);
+  assert.deepEqual(data.day().learning?.queue, [book, apple]);
   assert.equal(data.day().learning?.spellingAttempts.length, 0);
   const ready = data.store.snapshot();
   data.reopen();
@@ -218,40 +218,37 @@ test('three rounds preserve per-word progress, drafts, reveals, undo and exact r
 test('only failed first answers repeat and correct answers wait for explicit advance', async (t) => {
   const data = await fixture(t);
   data.finishMemory();
-  data.spell(apple, '  APPLE  ');
+  const queue = data.day().learning?.queue;
+  assert.ok(queue);
+  const [first, missed, third] = queue;
+  assert.ok(first && missed && third);
+  const original = '  ' + first.spelling.toUpperCase() + '  ';
+  data.spell(first, original);
   assert.equal(data.day().learning?.spellingState, 'readyToAdvance');
-  assert.equal(data.day().learning?.queue[0]?.spelling, 'apple');
-  expectConflict(() => data.spell(apple, 'apple'));
-  data.advanceSpelling(apple);
-  data.spell(book, 'bok');
+  assert.deepEqual(data.day().learning?.queue[0], first);
+  expectConflict(() => data.spell(first, first.spelling));
+  data.advanceSpelling(first);
+  data.spell(missed, 'wrong');
   assert.equal(data.day().learning?.spellingState, 'correcting');
-  expectConflict(() => data.advanceSpelling(book));
-  data.spell(book, 'book');
-  data.advanceSpelling(book);
-  data.spell(cup, 'cup');
-  data.advanceSpelling(cup);
-  assert.deepEqual(
-    data.day().learning?.queue.map((word) => word.spelling),
-    ['book'],
-  );
-  data.spell(book, 'BOOK');
-  data.advanceSpelling(book);
+  expectConflict(() => data.advanceSpelling(missed));
+  data.spell(missed, missed.spelling);
+  data.advanceSpelling(missed);
+  data.spell(third, third.spelling);
+  data.advanceSpelling(third);
+  assert.deepEqual(data.day().learning?.queue, [missed]);
+  data.spell(missed, missed.spelling.toUpperCase());
+  data.advanceSpelling(missed);
   const session = data.day().learning;
   assert.ok(session);
   assert.equal(session.phase, 'finished');
   assert.deepEqual(
-    session.spellingAttempts.map((item) => [
-      item.word.spelling,
-      item.encounter,
-      item.kind,
-      item.answer,
-    ]),
+    session.spellingAttempts.map((item) => [item.word, item.encounter, item.kind, item.answer]),
     [
-      ['apple', 1, 'first', '  APPLE  '],
-      ['book', 1, 'first', 'bok'],
-      ['book', 1, 'correction', 'book'],
-      ['cup', 1, 'first', 'cup'],
-      ['book', 2, 'first', 'BOOK'],
+      [first, 1, 'first', original],
+      [missed, 1, 'first', 'wrong'],
+      [missed, 1, 'correction', missed.spelling],
+      [third, 1, 'first', third.spelling],
+      [missed, 2, 'first', missed.spelling.toUpperCase()],
     ],
   );
   data.reopen();
@@ -261,15 +258,13 @@ test('only failed first answers repeat and correct answers wait for explicit adv
 test('a fifth failed first answer skips immediately, persists its priority and never invents a rating', async (t) => {
   const data = await fixture(t, [apple, book]);
   data.finishMemory();
+  data.spell(book, 'book');
+  data.advanceSpelling(book);
   for (let round = 1; round <= 5; round += 1) {
     data.spell(apple, `aple-${round}`);
     if (round === 5) break;
     data.spell(apple, 'apple');
     data.advanceSpelling(apple);
-    if (round === 1) {
-      data.spell(book, 'book');
-      data.advanceSpelling(book);
-    }
   }
   const session = data.day().learning;
   assert.ok(session);
@@ -453,15 +448,13 @@ test('skip priority schedules additional practice while preserving an existing F
     .snapshot()
     .scheduling.cards.find((card) => card.word.spelling === 'apple');
   assert.ok(before?.fsrs);
+  data.spell(book, 'book');
+  data.advanceSpelling(book);
   for (let round = 1; round <= 5; round += 1) {
     data.spell(apple, `aple-${round}`);
     if (round === 5) break;
     data.spell(apple, 'apple');
     data.advanceSpelling(apple);
-    if (round === 1) {
-      data.spell(book, 'book');
-      data.advanceSpelling(book);
-    }
   }
   const after = data.store
     .snapshot()

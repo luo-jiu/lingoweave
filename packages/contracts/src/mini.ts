@@ -1,5 +1,6 @@
 import { z } from 'zod';
-import { miniAssessmentSourceSchema } from './mini-assessment.js';
+import { miniAssessmentSourceSchema, miniExpressionGradeSchema } from './mini-assessment.js';
+import { miniAiSelectionSchema } from './mini-ai-selection.js';
 import {
   miniFlowSchedulingSchema,
   miniFlowScheduleCardSchema,
@@ -55,6 +56,7 @@ const spellingAttemptSchema = z
     submittedAt: timestamp,
     lastAnswerRevealAt: timestamp.optional(),
     lastPotentialHelpAt: timestamp.optional(),
+    helpDuringAttempt: z.literal(true).optional(),
     revealedAnswerAt: timestamp.optional(),
   })
   .strict();
@@ -72,6 +74,7 @@ export const miniWindowVisitSchema = z
   })
   .strict();
 export const miniWindowEventSchema = miniWindowVisitSchema.extend({
+  selfReportedFamiliar: z.literal(true).optional(),
   remembered: z.boolean(),
   confirmedAt: timestamp,
   sequence: z.number().int().positive(),
@@ -108,11 +111,23 @@ export const miniReviewSessionSchema = z
     queue: z.array(miniWordSchema),
     fullBatchSpelling: z.boolean().optional(),
     spellingPolicy: z.enum(['retry-errors-v1', 'retry-errors-v2']).optional(),
+    spellingRounds: z
+      .array(
+        z
+          .object({
+            round: z.number().int().positive(),
+            order: z.array(z.number().int().nonnegative()).min(2),
+          })
+          .strict(),
+      )
+      .min(1)
+      .optional(),
     relearning: miniWindowSchema.optional(),
     relearningWords: z.array(miniWordSchema).optional(),
     phase: z.enum(['judgment', 'spelling', 'finished']),
     judgmentEvents: z.array(judgmentEventSchema),
     spellingAttempts: z.array(spellingAttemptSchema),
+    spellingPromptAt: timestamp.optional(),
     spellingState: z.enum(['awaitingFirst', 'correcting', 'readyToAdvance', 'skipped']),
     spellingDraft: text,
     spellingSkips: z
@@ -166,6 +181,7 @@ export type MiniSentence = z.infer<typeof miniSentenceSchema>;
 export const miniFeedbackSchema = z
   .object({
     outcome: z.enum(['correct', 'partial', 'incorrect']).optional(),
+    expressionGrade: miniExpressionGradeSchema.optional(),
     comment: text,
     tip: text,
     usefulPhrase: text,
@@ -184,6 +200,20 @@ export const miniQualitativeFeedbackSchema = miniFeedbackSchema
     referenceTranslation: text,
   })
   .strict();
+// Older persisted tool commands and their receipts replay this original action shape.
+const qualitativeFeedbackAction = z
+  .object({
+    type: z.literal('qualitative_feedback'),
+    target: z.literal('daily'),
+    dayId: z.string(),
+    attemptId: z.uuid(),
+    feedback: miniQualitativeFeedbackSchema,
+  })
+  .strict();
+export const miniNewFeedbackActionSchema = qualitativeFeedbackAction.extend({
+  feedback: miniQualitativeFeedbackSchema.required({ expressionGrade: true }),
+});
+
 export const miniWritingPromptInputSchema = z
   .object({
     id: teachingId,
@@ -215,6 +245,18 @@ export const miniTranslationAttemptSchema = z
     feedback: miniFeedbackSchema.optional(),
     gradedAt: timestamp.optional(),
     confirmedAt: timestamp.optional(),
+    revisions: z
+      .array(
+        z
+          .object({
+            id: teachingId,
+            answer: z.string().trim().min(1).max(4000),
+            submittedAt: timestamp,
+            aiSelection: miniAiSelectionSchema.optional(),
+          })
+          .strict(),
+      )
+      .optional(),
   })
   .strict();
 export const miniScheduleSchema = z
@@ -271,6 +313,8 @@ export const miniFlowSchema = z
     version: z.literal('sliding-window-v2'),
     targetDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
     dailyNewGoal: z.number().int().min(0).max(200),
+    // One explicitly requested group on targetDate. The plan's daily goal stays unchanged.
+    extraGroupTarget: z.number().int().positive().optional(),
     completedBeforeRun: z.number().int().nonnegative(),
     groupSize: z.number().int().min(1).max(50),
     candidates: z.array(miniWordSchema).max(100_000),
@@ -318,6 +362,7 @@ export const miniDaySchema = z
       ),
     startedAt: timestamp,
     timezone: miniTimezoneSchema.optional(),
+    archivedAt: timestamp.optional(),
     writingRequired: z.boolean().optional(),
     reviewWords: z.array(miniWordSchema).max(100_000),
     learningWords: z.array(miniWordSchema).max(100_000),
@@ -421,7 +466,10 @@ export const miniPlanSessionSchema = z
     servedWords: z.array(miniWordSchema).max(100000),
     newWords: z.array(miniWordSchema).max(100000).optional(),
     source: z.enum(['default', 'today', 'session', 'recovery']).optional(),
+    intent: z.enum(['review', 'learn']).optional(),
     overrideRest: z.boolean().optional(),
+    // Original mixed run to return to after a temporary rest-day study traverses review groups.
+    restStudyDayId: z.string().optional(),
     endedAt: timestamp.optional(),
     pauseReason: z.enum(['manual', 'budget', 'rest', 'ended']).optional(),
   })
@@ -501,6 +549,11 @@ export const miniExposureSchema = z
     kind: z.enum(['potentialHelp', 'answerReveal', 'focusView']),
     source: z.enum(['chat', 'ui', 'feedback', 'audio']),
     audioKind: z.enum(['word', 'sentence']).optional(),
+    taskId: z.string().min(1).max(200).optional(),
+    visibleSentence: z.object({ english: text, chinese: text }).strict().optional(),
+    reviewPrompt: z.literal(true).optional(),
+    spellingAttemptHelp: z.literal(true).optional(),
+    translationPromptAudio: z.literal(true).optional(),
     focusIds: z.array(teachingId).max(2),
     sourceMessageId: z.string().min(1).max(200).optional(),
     beforeAttemptCount: z.number().int().nonnegative(),
@@ -509,6 +562,21 @@ export const miniExposureSchema = z
   })
   .strict()
   .superRefine((exposure, context) => {
+    if (
+      exposure.reviewPrompt &&
+      (exposure.source !== 'ui' ||
+        exposure.kind !== 'potentialHelp' ||
+        exposure.session !== 'review' ||
+        exposure.visibleSentence !== undefined ||
+        exposure.focusIds.length > 0 ||
+        exposure.sourceMessageId !== undefined ||
+        exposure.taskId !== undefined)
+    )
+      context.addIssue({
+        code: 'custom',
+        path: ['reviewPrompt'],
+        message: 'reviewPrompt requires the bare word on a review judgment card',
+      });
     if (exposure.audioKind !== undefined && exposure.source !== 'audio')
       context.addIssue({
         code: 'custom',
@@ -547,6 +615,7 @@ export const miniMemoryCardSchema = z
     lastServedAt: timestamp.nullable(),
     exposureKnown: z.boolean(),
     lastAnswerExposureAt: timestamp.nullable(),
+    lastMeaningExposureAt: timestamp.nullable().optional(),
     state: z.enum(['introduced', 'learning', 'review', 'relearning']),
     fsrs: miniFsrsCardSchema.nullable(),
   })
@@ -619,8 +688,19 @@ export const miniSchedulingSchema = z
     probes: z.array(miniProbeSchema),
     activeProbeId: teachingId.nullable(),
     visibleWord: miniWordSchema.nullable().default(null),
+    visibleTranslationPrompt: z.string().optional(),
     views: z
-      .array(z.object({ id: teachingId, word: miniWordSchema, at: timestamp }).strict())
+      .array(
+        z
+          .object({
+            id: teachingId,
+            word: miniWordSchema,
+            at: timestamp,
+            translationPrompt: z.string().optional(),
+            lookup: z.literal(true).optional(),
+          })
+          .strict(),
+      )
       .default([]),
     servedCount: z.number().int().nonnegative(),
   })
@@ -717,7 +797,22 @@ export const miniPlanContextSchema = z
       })
       .strict(),
     completedNewCount: z.number().int().nonnegative().optional(),
+    wordProgress: z
+      .object({
+        lifetime: z.number().int().nonnegative(),
+        bookId: z.string().nullable(),
+        completed: z.number().int().nonnegative(),
+        total: z.number().int().nonnegative(),
+      })
+      .strict()
+      .optional(),
     remainingNewCount: z.number().int().nonnegative().optional(),
+    todayCompleted: z.boolean(),
+    canStartReview: z.boolean().optional(),
+    canStartLearning: z.boolean().optional(),
+    canStartExtraGroup: z.boolean(),
+    extraGroupWordCount: z.number().int().min(0).max(50),
+    activeExtraGroupWordCount: z.number().int().min(1).max(50).optional(),
     hasDueReviews: z.boolean().optional(),
     todayOverride: miniDailyPlanSchema.nullable(),
     dueCount: z.number().int().nonnegative(),
@@ -814,6 +909,7 @@ export const miniActivitySummarySchema = z
     firstSpellingAttempts: z.number().int().nonnegative(),
     translationAttempts: z.number().int().nonnegative(),
     memoryRoundAdvances: z.number().int().nonnegative().optional(),
+    familiarityDeclarations: z.number().int().nonnegative().optional(),
     skippedSpellingWords: z.number().int().nonnegative().optional(),
     highPriorityWords: z.number().int().nonnegative().optional(),
     coverage: z.literal('recorded_events_only'),
@@ -900,9 +996,11 @@ export const miniActionSchema = z
         timezone: miniTimezoneSchema,
         startIndex: z.number().int().nonnegative().optional(),
         dayId: z.string().optional(),
+        intent: z.enum(['review', 'learn']).optional(),
         recovery: z.boolean().optional(),
         overrideRest: z.boolean().optional(),
         newGroup: z.boolean().optional(),
+        extraGroupForDate: planDate.optional(),
         flowVersion: z.enum(['memory-rounds-v1', 'sliding-window-v2']).optional(),
       })
       .strict(),
@@ -979,12 +1077,42 @@ export const miniActionSchema = z
         kind: z.enum(['potentialHelp', 'answerReveal', 'focusView']),
         source: z.enum(['chat', 'ui', 'feedback', 'audio']),
         audioKind: z.enum(['word', 'sentence']).optional(),
+        spellingResultAt: timestamp.optional(),
+        translationPromptAudio: z.literal(true).optional(),
+        taskId: z.string().min(1).max(200).optional(),
         focusIds: z.array(teachingId).max(2).default([]),
         sourceMessageId: z.string().min(1).max(200).optional(),
       })
       .strict(),
     contextual.extend({ type: z.literal('end_session') }).strict(),
-    contextual.extend({ type: z.literal('record_card_view'), word: miniWordSchema }).strict(),
+    contextual
+      .extend({
+        type: z.literal('record_card_view'),
+        word: miniWordSchema,
+        taskId: z.string().min(1).max(200).optional(),
+        visibleSentence: miniSentenceSchema.optional(),
+      })
+      .strict(),
+    z
+      .object({
+        type: z.literal('record_browse_views'),
+        target: z.literal('daily'),
+        words: z
+          .array(miniWordSchema)
+          .min(1)
+          .max(64)
+          .refine(
+            (words) =>
+              words.every((word) => word.spelling.trim().length > 0) &&
+              new Set(
+                words.map((word) =>
+                  JSON.stringify([word.spelling.trim().toLowerCase(), word.meaning.trim()]),
+                ),
+              ).size === words.length,
+            'Expected distinct visible word senses',
+          ),
+      })
+      .strict(),
     z
       .object({ type: z.literal('hide_card'), target: z.literal('daily'), word: miniWordSchema })
       .strict(),
@@ -1059,6 +1187,18 @@ export const miniActionSchema = z
         word: miniWordSchema,
         visitId: teachingId,
         remembered: z.boolean().optional(),
+        markWrong: z.boolean().optional(),
+        draft: text.optional(),
+      })
+      .strict(),
+    z
+      .object({
+        type: z.literal('window_familiar'),
+        target: z.literal('daily'),
+        dayId: z.string(),
+        session: z.literal('learning'),
+        word: miniWordSchema,
+        visitId: teachingId,
         draft: text.optional(),
       })
       .strict(),
@@ -1126,6 +1266,7 @@ export const miniActionSchema = z
         word: miniWordSchema,
         answer: text,
         advanceOnCorrect: z.boolean().default(true),
+        advanceAfterCorrect: z.literal(true).optional(),
       })
       .strict(),
     contextual.extend({ type: z.literal('advance_spelling'), word: miniWordSchema }).strict(),
@@ -1158,6 +1299,17 @@ export const miniActionSchema = z
         answer: z.string().max(4000),
       })
       .strict(),
+    z
+      .object({
+        type: z.literal('revise_translation'),
+        target: z.literal('daily'),
+        dayId: z.string(),
+        taskId: z.string(),
+        attemptId: teachingId,
+        answer: z.string().trim().min(1).max(4000),
+        aiSelection: miniAiSelectionSchema.optional(),
+      })
+      .strict(),
     contextual
       .extend({
         type: z.literal('record_feedback'),
@@ -1173,16 +1325,14 @@ export const miniActionSchema = z
         prompts: z.array(miniWritingPromptInputSchema).min(1).max(10),
       })
       .strict(),
-    z
-      .object({
-        type: z.literal('qualitative_feedback'),
-        target: z.literal('daily'),
-        dayId: z.string(),
-        attemptId: z.uuid(),
-        feedback: miniQualitativeFeedbackSchema,
+    qualitativeFeedbackAction,
+    contextual
+      .extend({
+        type: z.literal('advance_translation'),
+        taskId: z.string(),
+        aiSelection: miniAiSelectionSchema.optional(),
       })
       .strict(),
-    contextual.extend({ type: z.literal('advance_translation'), taskId: z.string() }).strict(),
     contextual.extend({ type: z.literal('continue_to_learning') }).strict(),
   ])
   .superRefine((action, ctx) => {
@@ -1198,6 +1348,27 @@ export const miniActionSchema = z
       });
     if (action.type === 'begin' && action.newGroup && action.dayId)
       ctx.addIssue({ code: 'custom', message: 'newGroup cannot resume dayId' });
+    if (
+      action.type === 'begin' &&
+      action.intent !== undefined &&
+      (action.target !== 'daily' ||
+        action.flowVersion !== 'sliding-window-v2' ||
+        action.newGroup ||
+        action.overrideRest ||
+        (action.intent === 'review' && action.extraGroupForDate !== undefined))
+    )
+      ctx.addIssue({ code: 'custom', message: 'invalid options for the selected study entry' });
+    if (
+      action.type === 'begin' &&
+      action.extraGroupForDate !== undefined &&
+      (action.target !== 'daily' ||
+        action.flowVersion !== 'sliding-window-v2' ||
+        action.newGroup ||
+        action.dayId !== undefined ||
+        action.overrideRest ||
+        action.recovery)
+    )
+      ctx.addIssue({ code: 'custom', message: 'extra practice requires the normal daily flow' });
     if (action.target === 'daily' && 'recordId' in action && action.recordId !== undefined)
       ctx.addIssue({ code: 'custom', message: 'recordId is not valid for a daily action' });
     if (action.target === 'review' && 'dayId' in action && action.dayId !== undefined)
@@ -1217,6 +1388,7 @@ export const miniActionSchema = z
       action.type === 'end_probe' ||
       action.type === 'record_probe_help' ||
       action.type === 'record_card_view' ||
+      action.type === 'record_browse_views' ||
       action.type === 'hide_card'
     )
       return;

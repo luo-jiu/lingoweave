@@ -13,29 +13,40 @@ import {
   miniVocabularyImportSchema,
   miniVocabularyActivateSchema,
   miniAssessmentRetrySchema,
+  miniTranslationReviewQuerySchema,
   miniMemoryOverviewInputSchema,
   miniMemoryDetailInputSchema,
+  miniPatternQuerySchema,
+  miniPatternPracticeSchema,
+  miniPatternViewSchema,
+  miniPhraseQuerySchema,
 } from '@lingoweave/contracts';
 import type { FastifyInstance } from 'fastify';
 import { LearningError } from './learning-store.js';
 import type { MiniStore } from './mini-store.js';
 import type { MiniAiService } from './mini-ai-service.js';
 import type { MiniAudioService } from './mini-audio-service.js';
-import type { MiniVocabularyStore } from './mini-vocabulary-store.js';
+import { pendingMeaningComment } from './mini-translation-review.js';
+import { miniWordProgress, type MiniVocabularyStore } from './mini-vocabulary-store.js';
 import type { MiniAssessmentService } from './mini-assessment-service.js';
 import { z } from 'zod';
 import { withoutMiniPlanMinutes } from './mini-plan-migration.js';
 import { memoryOverview, memoryDetail } from './mini-memory.js';
+import { miniDataOverview } from './mini-data-overview.js';
 
-export function registerMiniRoutes(
-  app: FastifyInstance,
-  store: MiniStore,
-  token: string,
-  ai?: MiniAiService,
-  audio?: MiniAudioService,
-  vocabulary?: MiniVocabularyStore,
-  assessment?: MiniAssessmentService,
-) {
+export interface MiniRouteOptions {
+  store: MiniStore;
+  token: string;
+  ai?: MiniAiService;
+  audio?: MiniAudioService;
+  vocabulary?: MiniVocabularyStore;
+  assessment?: MiniAssessmentService;
+  dataDirectory?: string;
+  serviceLog?: string;
+}
+
+export function registerMiniRoutes(app: FastifyInstance, options: MiniRouteOptions) {
+  const { store, token, ai, audio, vocabulary, assessment, dataDirectory, serviceLog } = options;
   if (token.length < 32) throw new Error('The mini API token must contain at least 32 characters.');
   app.addHook('onClose', async () => {
     if (assessment) await assessment.close();
@@ -81,7 +92,27 @@ export function registerMiniRoutes(
       if (actual.length !== expected.length || !timingSafeEqual(actual, expected))
         throw new LearningError('UNAUTHORIZED', '缺少或无效的 mini 学习服务身份。', 401);
     });
+    mini.get('/api/mini/translations/review', async (request) => {
+      const query = miniTranslationReviewQuerySchema.parse(request.query);
+      const report = store.translationReview(
+        query,
+        (id) => assessment?.store.translationReview(id) ?? null,
+      );
+      return (
+        assessment?.expressions.display(report) ?? {
+          ...report,
+          entries: report.entries.map(pendingMeaningComment),
+        }
+      );
+    });
     if (assessment) {
+      mini.post('/api/mini/translations/review/grade-missing', async (request) => {
+        const query = miniTranslationReviewQuerySchema.parse(request.body);
+        const report = store.translationReview(query, (id) =>
+          assessment.store.translationReview(id),
+        );
+        return assessment.expressions.enqueue(report, (id) => store.translationModel(id));
+      });
       mini.get('/api/mini/assessments/snapshot', async () => assessment.snapshot());
       mini.get('/api/mini/assessments/:id', async (request) =>
         assessment.detail(z.object({ id: z.uuid().toLowerCase() }).parse(request.params).id),
@@ -153,10 +184,47 @@ export function registerMiniRoutes(
     mini.post('/api/mini/memory/detail', async (request) =>
       memoryDetail(store.snapshot(), miniMemoryDetailInputSchema.parse(request.body)),
     );
+    if (dataDirectory)
+      mini.get('/api/mini/data-overview', async (_request, reply) => {
+        reply.header('cache-control', 'private, no-store');
+        return miniDataOverview({
+          store,
+          dataDirectory,
+          serviceLog,
+          ai: ai?.store,
+          audio: audio?.store,
+          assessment: assessment?.store,
+          vocabulary,
+        });
+      });
     mini.get('/api/mini/snapshot', async () => store.snapshot());
-    mini.post('/api/mini/plan-preview', async (request) =>
-      store.planPreview(miniPlanPreviewInputSchema.parse(request.body)),
+    mini.get('/api/mini/phrases', async (request, reply) => {
+      reply.header('cache-control', 'private, no-store');
+      const query = miniPhraseQuerySchema.parse(request.query);
+      return store.phrases(
+        query,
+        query.kind === 'pattern' ? undefined : audio?.store.heardSentences(),
+      );
+    });
+    mini.post('/api/mini/patterns/view', async (request) =>
+      store.viewPattern(miniPatternViewSchema.parse(request.body)),
     );
+    mini.get('/api/mini/patterns', async (request) =>
+      store.patterns(miniPatternQuerySchema.parse(request.query).timezone),
+    );
+    mini.post('/api/mini/patterns/practice', async (request) =>
+      store.practicePattern(miniPatternPracticeSchema.parse(request.body)),
+    );
+    mini.post('/api/mini/plan-preview', async (request) => {
+      const input = miniPlanPreviewInputSchema.parse(request.body);
+      const preview = store.planPreview(input);
+      preview.planContext.wordProgress = miniWordProgress(
+        preview.ledger,
+        input.deck,
+        vocabulary?.activeBookIndex(),
+      );
+      return preview;
+    });
     mini.post('/api/mini/import', async (request) =>
       store.importLegacy(miniImportSchema.parse(request.body)),
     );

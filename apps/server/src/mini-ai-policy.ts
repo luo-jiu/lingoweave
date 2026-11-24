@@ -1,6 +1,12 @@
-import { miniActionSchema, miniAiKindSchema, type MiniAction } from '@lingoweave/contracts';
+import {
+  miniActionSchema,
+  miniAiKindSchema,
+  miniNewFeedbackActionSchema,
+  type MiniAction,
+} from '@lingoweave/contracts';
 
 export function miniAiTools(kind: ReturnType<typeof miniAiKindSchema.parse>, audioEnabled = false) {
+  if (kind === 'dialogue') return ['learning_get_context'];
   const names = [
     'learning_get_context',
     'learning_get_history',
@@ -16,6 +22,7 @@ export const miniAiActions: Record<
   ReturnType<typeof miniAiKindSchema.parse>,
   MiniAction['type'][]
 > = {
+  dialogue: [],
   prepare: ['add_sentences', 'create_focus', 'update_focus'],
   writing: ['publish_writing', 'create_focus', 'update_focus'],
   feedback: ['qualitative_feedback', 'create_focus', 'update_focus'],
@@ -33,7 +40,9 @@ export const miniAiActions: Record<
 };
 
 export function miniAiActionOptions(kind: ReturnType<typeof miniAiKindSchema.parse>) {
-  return miniActionSchema.options.filter((option) =>
-    miniAiActions[kind].includes(option.shape.type.value),
-  );
+  return miniActionSchema.options
+    .filter((option) => miniAiActions[kind].includes(option.shape.type.value))
+    .map((option) =>
+      option.shape.type.value === 'qualitative_feedback' ? miniNewFeedbackActionSchema : option,
+    );
 }

@@ -18,10 +18,14 @@ import type {
 } from '@lingoweave/contracts';
 import { classifyMeasurement, defaultMeasurementRules } from './measurement.js';
 import { LearningError } from './learning-store.js';
+import { flowRetrievability } from './mini-flow-scheduler.js';
 import {
+  advancesCorrectSpelling,
   currentLearningWord,
   currentMiniWindow,
+  currentTranslation,
   sameWord,
+  savedMiniSentence,
   swiftTime,
   wordKey,
 } from './mini-study.js';
@@ -94,9 +98,13 @@ function introduce(
   }
   return card;
 }
-function expose(state: MiniSnapshot, word: MiniWord, at: number) {
+function expose(state: MiniSnapshot, word: MiniWord, at: number, spellingOnly = false) {
   const card = introduce(state, word, at, true);
   card.exposureKnown = true;
+  if (spellingOnly && card.lastMeaningExposureAt === undefined)
+    card.lastMeaningExposureAt = card.lastAnswerExposureAt;
+  if (!spellingOnly && card.lastMeaningExposureAt !== undefined)
+    card.lastMeaningExposureAt = Math.max(card.lastMeaningExposureAt ?? -Infinity, at);
   card.lastAnswerExposureAt = Math.max(card.lastAnswerExposureAt ?? -Infinity, at);
 }
 function serve(state: MiniSnapshot, word: MiniWord, at: number) {
@@ -151,7 +159,8 @@ export function initializeMiniScheduling(state: MiniSnapshot) {
     for (const skip of record?.session.spellingSkips ?? [])
       prioritizePractice(state, skip.word, skip.at);
   }
-  for (const item of state.teaching.exposures) expose(state, item.word, item.at);
+  for (const item of state.teaching.exposures)
+    expose(state, item.word, item.at, item.translationPromptAudio);
   const legacy = new Map<string, { dueAt: number; recordedAt: number }>();
   for (const day of state.ledger.days)
     for (const item of day.scheduleUpdates) {
@@ -176,15 +185,29 @@ function closeVisible(state: MiniSnapshot, at: number, expected?: MiniWord) {
     -Infinity,
   );
   if (at < latestVisibleAt) return;
-  state.scheduling.views.push({ id: randomUUID(), word, at });
-  if (miniMemory(state, word)) expose(state, word, at);
+  const translationPrompt = state.scheduling.visibleTranslationPrompt;
+  state.scheduling.views.push({
+    id: randomUUID(),
+    word,
+    at,
+    ...(translationPrompt ? { translationPrompt } : {}),
+  });
+  if (miniMemory(state, word)) expose(state, word, at, translationPrompt !== undefined);
   state.scheduling.visibleWord = null;
+  delete state.scheduling.visibleTranslationPrompt;
 }
-function showVisible(state: MiniSnapshot, word: MiniWord, at: number) {
+function showVisible(state: MiniSnapshot, word: MiniWord, at: number, translationPrompt?: string) {
   if (state.scheduling.visibleWord && !sameWord(state.scheduling.visibleWord, word))
     closeVisible(state, at);
-  state.scheduling.views.push({ id: randomUUID(), word, at });
+  state.scheduling.views.push({
+    id: randomUUID(),
+    word,
+    at,
+    ...(translationPrompt ? { translationPrompt } : {}),
+  });
   state.scheduling.visibleWord = word;
+  if (translationPrompt) state.scheduling.visibleTranslationPrompt = translationPrompt;
+  else delete state.scheduling.visibleTranslationPrompt;
 }
 function closePractice(state: MiniSnapshot, at: number) {
   const current = state.practice.dictations.find(
@@ -265,15 +288,81 @@ function currentContext(
       : currentLearningWord(day);
   return { day, session, word, record: undefined };
 }
+function sentenceIsVisible(context: ReturnType<typeof currentContext>, word: MiniWord) {
+  const { day, session } = context;
+  const visit = day && currentMiniWindow(day)?.visit;
+  if (visit) return visit.stage < 2 || visit.revealedAt !== undefined;
+  if (day?.phase === 'learning' && !day.flow) {
+    if (day.memory) return day.memory.round <= 3 && (day.memory.round < 3 || day.memory.revealed);
+    return (
+      !!day.retainedLearningWord ||
+      day.learningWords.some((w) => !day.studiedWords.some((s) => sameWord(s.word, w)))
+    );
+  }
+  const judgment = session?.judgmentEvents.at(-1);
+  return (
+    session?.phase === 'judgment' && judgment?.final === undefined && sameWord(judgment?.word, word)
+  );
+}
 export function applyMiniMeasurementAction(
   state: MiniSnapshot,
   action: MiniAction,
   at: number,
   receivedAt: number,
+  requestId?: string,
 ): boolean {
   const active = activeMiniProbe(state);
+  if (action.type === 'record_browse_views') {
+    // A viewport is an exposure, not an invitation to create cards or change the active card.
+    const seenAt = Math.min(at, receivedAt);
+    for (const word of action.words) {
+      state.scheduling.views.push({ id: randomUUID(), word, at: seenAt, lookup: true });
+      if (miniMemory(state, word)) expose(state, word, seenAt);
+      if (
+        active &&
+        word.spelling.trim().toLowerCase() === active.word.spelling.trim().toLowerCase()
+      ) {
+        expose(state, active.word, seenAt);
+        if (seenAt >= active.openedAt && active.submittedAt === undefined) {
+          active.helpAt ??= seenAt;
+          if (!active.helpSources.includes('ui')) active.helpSources.push('ui');
+        }
+      }
+    }
+    return true;
+  }
   if (action.type === 'hide_card') {
     closeVisible(state, at, action.word);
+    return true;
+  }
+  if (action.type === 'record_card_view' && action.taskId !== undefined) {
+    const day = state.ledger.days.find((item) => item.id === action.dayId);
+    const task = day && currentTranslation(day);
+    requireFact(
+      action.target === 'daily' &&
+        !active &&
+        !action.visibleSentence &&
+        !action.session &&
+        day &&
+        day.id === state.planning.activeDayId &&
+        !day.paused &&
+        day.phase === 'translation' &&
+        task?.id === action.taskId &&
+        task.direction === 'englishToChinese' &&
+        sameWord(task.sentence.word, action.word) &&
+        !day.translation.some((item) => item.task.id === task.id),
+      '题面必须对应当前尚未提交的英译中原题。',
+    );
+    const seenAt = Math.min(at, receivedAt);
+    if (state.scheduling.views.some((view) => view.at > seenAt))
+      state.scheduling.views.push({
+        id: randomUUID(),
+        word: action.word,
+        at: seenAt,
+        translationPrompt: task.id,
+      });
+    else showVisible(state, action.word, seenAt, task.id);
+    expose(state, action.word, seenAt, true);
     return true;
   }
   if (
@@ -286,6 +375,7 @@ export function applyMiniMeasurementAction(
       'complete_review',
       'complete_learning',
       'submit_translation',
+      'revise_translation',
       'advance_translation',
       'begin',
       'memory_advance',
@@ -294,6 +384,7 @@ export function applyMiniMeasurementAction(
       'window_choose',
       'window_correct',
       'window_advance',
+      'window_familiar',
       'window_draft',
     ].includes(action.type)
   )
@@ -302,6 +393,7 @@ export function applyMiniMeasurementAction(
     action.type === 'record_card_view' &&
     ((action.target === 'daily' && action.dayId === undefined) || active)
   ) {
+    requireFact(!action.visibleSentence, '例句必须对应当前学习或复习词卡。');
     showVisible(state, action.word, receivedAt);
     const card = miniMemory(state, action.word);
     if (card) expose(state, action.word, receivedAt);
@@ -334,7 +426,7 @@ export function applyMiniMeasurementAction(
     const card = introduce(state, action.word, at, !previouslyKnown);
     for (const view of state.scheduling.views)
       if (view.word.spelling.trim().toLowerCase() === action.word.spelling.trim().toLowerCase())
-        expose(state, action.word, view.at);
+        expose(state, action.word, view.at, view.translationPrompt !== undefined);
     const probe: MiniProbe = {
       id: randomUUID(),
       word: action.word,
@@ -548,8 +640,34 @@ export function applyMiniMeasurementAction(
       return true;
     }
     if (action.type === 'record_card_view') {
-      showVisible(state, action.word, receivedAt);
-      expose(state, action.word, receivedAt);
+      const shown = action.visibleSentence;
+      if (shown) {
+        const saved = savedMiniSentence(state, action.word);
+        requireFact(
+          sentenceIsVisible(context, action.word) &&
+            saved &&
+            sameWord(shown.word, action.word) &&
+            shown.english === saved.english &&
+            shown.chinese === saved.chinese,
+          '例句必须是当前词卡实际展示的已保存例句。',
+        );
+      }
+      const seenAt = Math.min(at, receivedAt);
+      // A queued card view still counts at the moment it appeared. A newer view
+      // or hide already describes the current screen, even when this receipt arrives last.
+      if (state.scheduling.views.some((view) => view.at > seenAt)) {
+        state.scheduling.views.push({ id: randomUUID(), word: action.word, at: seenAt });
+      } else {
+        showVisible(state, action.word, seenAt);
+      }
+      expose(state, action.word, seenAt);
+      const reviewJudgment =
+        (context.day?.phase === 'review' || context.record !== undefined) &&
+        context.session?.phase === 'judgment';
+      // Seeing the English question is exposure to its spelling. It gives no
+      // Chinese answer before the initial choice. The full card can omit a sentence.
+      const reviewPrompt =
+        reviewJudgment && !windowVisit && !shown && !sentenceIsVisible(context, action.word);
       state.teaching.exposures.push({
         id: randomUUID(),
         target: action.target,
@@ -563,8 +681,11 @@ export function applyMiniMeasurementAction(
         kind: 'potentialHelp',
         source: 'ui',
         focusIds: [],
+        ...(reviewPrompt ? { reviewPrompt: true } : {}),
+        ...(reviewJudgment ? { beforeJudgmentCount: context.session?.judgmentEvents.length } : {}),
+        ...(shown ? { visibleSentence: { english: shown.english, chinese: shown.chinese } } : {}),
         beforeAttemptCount: context.session?.spellingAttempts.length ?? 0,
-        at: receivedAt,
+        at: seenAt,
       });
       return true;
     }
@@ -577,15 +698,17 @@ export function applyMiniMeasurementAction(
       '请先完成当前卡片的自评。',
     );
     closePractice(state, at);
-    closeVisible(state, receivedAt);
+    // The client can already display the draft and collect input while open is queued.
+    const openedAt = requestId === undefined ? receivedAt : Math.min(at, receivedAt);
+    closeVisible(state, openedAt);
     const item = {
-      id: randomUUID(),
+      id: requestId ?? randomUUID(),
       target: action.target,
       ...(action.dayId ? { dayId: action.dayId } : {}),
       ...(action.recordId ? { recordId: action.recordId.toLowerCase() } : {}),
       session: action.session ?? (context.day?.phase === 'learning' ? 'learning' : 'review'),
       word: action.word,
-      openedAt: receivedAt,
+      openedAt,
       attempts: [],
     };
     state.practice.dictations.push(item);
@@ -616,24 +739,28 @@ export function applyMiniMeasurementAction(
       closePractice(state, at);
       return true;
     }
+    // The reference can already be visible before either acknowledgement. Its
+    // click time must precede a subsequent formal spelling on the same word.
+    const seenAt =
+      requestId === undefined ? receivedAt : Math.max(item.openedAt, Math.min(at, receivedAt));
     if (action.type === 'reveal_dictation') {
       if (item.revealedAt === undefined) {
-        item.revealedAt = receivedAt;
-        dictationExposure(state, item, receivedAt, 'answerReveal');
-        showVisible(state, item.word, receivedAt);
+        item.revealedAt = seenAt;
+        dictationExposure(state, item, seenAt, 'answerReveal');
+        showVisible(state, item.word, seenAt);
       }
       return true;
     }
     requireFact(at >= item.openedAt && at <= receivedAt, '单卡默写作答时间无效。');
     item.attempts.push({
-      id: randomUUID(),
+      id: requestId ?? randomUUID(),
       answer: action.answer,
       correct: action.answer.trim().toLowerCase() === item.word.spelling.trim().toLowerCase(),
       submittedAt: at,
     });
-    item.revealedAt ??= receivedAt;
-    dictationExposure(state, item, receivedAt, 'answerReveal');
-    showVisible(state, item.word, receivedAt);
+    item.revealedAt ??= seenAt;
+    dictationExposure(state, item, seenAt, 'answerReveal');
+    showVisible(state, item.word, seenAt);
     serve(state, item.word, at);
     return true;
   }
@@ -641,10 +768,31 @@ export function applyMiniMeasurementAction(
 }
 
 export function observeMiniLearningCommand(state: MiniSnapshot, action: MiniAction, at: number) {
+  if (
+    (action.type === 'submit_spelling' && advancesCorrectSpelling(action)) ||
+    action.type === 'advance_spelling' ||
+    action.type === 'advance_judgment' ||
+    action.type === 'window_advance' ||
+    action.type === 'window_familiar'
+  ) {
+    const day =
+      action.target === 'daily'
+        ? state.ledger.days.find((item) => item.id === action.dayId)
+        : undefined;
+    const session =
+      action.target === 'review'
+        ? state.reviewRecord?.session
+        : action.session === 'review'
+          ? day?.review
+          : day?.learning;
+    if (session?.phase === 'spelling' && session.spellingState === 'awaitingFirst')
+      session.spellingPromptAt = at;
+  }
   if (action.type === 'memory_undo') closeVisible(state, at);
   if (
     action.type === 'memory_advance' ||
     action.type === 'window_advance' ||
+    action.type === 'window_familiar' ||
     action.type === 'advance_judgment' ||
     action.type === 'submit_spelling' ||
     (action.type === 'mark_studied' && !action.remainOnCard)
@@ -654,7 +802,7 @@ export function observeMiniLearningCommand(state: MiniSnapshot, action: MiniActi
     expose(state, action.word, at);
     if (action.type === 'memory_advance') serve(state, action.word, at);
   }
-  if (action.type === 'window_advance') {
+  if (action.type === 'window_advance' || action.type === 'window_familiar') {
     expose(state, action.word, at);
     serve(state, action.word, at);
   }
@@ -669,7 +817,8 @@ export function observeMiniLearningCommand(state: MiniSnapshot, action: MiniActi
     expose(state, action.word, at);
     serve(state, action.word, at);
   }
-  if (action.type === 'record_exposure') expose(state, action.word, at);
+  if (action.type === 'record_exposure')
+    expose(state, action.word, at, action.translationPromptAudio);
   if (action.type === 'choose_judgment') expose(state, action.word, at);
   if (action.type === 'submit_spelling') {
     serve(state, action.word, at);
@@ -701,6 +850,7 @@ export function observeMiniLearningCommand(state: MiniSnapshot, action: MiniActi
       'window_choose',
       'window_correct',
       'window_advance',
+      'window_familiar',
       'mark_studied',
       'submit_spelling',
       'complete_review',
@@ -717,6 +867,7 @@ export function observeMiniLearningCommand(state: MiniSnapshot, action: MiniActi
       'window_choose',
       'window_correct',
       'window_advance',
+      'window_familiar',
       'advance_judgment',
       'complete_review',
       'advance_translation',
@@ -817,28 +968,48 @@ export function orderMiniDue<T extends { word: MiniWord; schedule: { dueAt: numb
   state: MiniSnapshot['scheduling'],
   at: number,
 ): T[] {
-  const remaining = [...entries],
-    result: T[] = [];
-  const memory = (item: T) => state.cards.find((card) => card.senseId === senseId(item.word));
-  const waiting = (item: T) =>
-    Math.max(item.schedule.dueAt, memory(item)?.lastServedAt ?? -Infinity);
-  const recall = (item: T) => {
-    const card = memory(item);
-    return card ? miniRetrievability(card, at) : null;
-  };
-  while (remaining.length) {
-    const fairness = (state.servedCount + result.length) % 5 === 4;
-    const ordered = [...remaining].sort(
-      (a, b) =>
-        (fairness ? 0 : (memory(b)?.practicePriority ?? 0) - (memory(a)?.practicePriority ?? 0)) ||
-        (fairness ? waiting(a) - waiting(b) : (recall(a) ?? Infinity) - (recall(b) ?? Infinity)) ||
-        waiting(a) - waiting(b) ||
-        wordKey(a.word).localeCompare(wordKey(b.word)),
-    );
-    const selected = ordered[0];
-    if (!selected) break;
-    result.push(selected);
-    remaining.splice(remaining.indexOf(selected), 1);
+  const cards = new Map(state.cards.map((card) => [card.senseId, card]));
+  const flowCards = new Map(state.flow.cards.map((card) => [card.senseId, card]));
+  const ranked = entries.map((entry) => {
+    const id = senseId(entry.word);
+    const card = cards.get(id);
+    const current = flowCards.get(id);
+    const recall = current
+      ? Math.min(
+          flowRetrievability(current.meaning, at) ?? Infinity,
+          flowRetrievability(current.spelling, at) ?? Infinity,
+        )
+      : ((card && miniRetrievability(card, at)) ?? Infinity);
+    return {
+      entry,
+      key: wordKey(entry.word),
+      priority: card?.practicePriority ?? 0,
+      waiting: Math.max(entry.schedule.dueAt, card?.lastServedAt ?? -Infinity),
+      recall,
+    };
+  });
+  type Candidate = (typeof ranked)[number];
+  const byWaiting = (a: Candidate, b: Candidate) =>
+    a.waiting - b.waiting || a.key.localeCompare(b.key);
+  const urgent = [...ranked].sort(
+    (a, b) => b.priority - a.priority || a.recall - b.recall || byWaiting(a, b),
+  );
+  const oldest = ranked.sort(byWaiting);
+  // Both rankings remain fixed at this instant. Merge their next unserved entries,
+  // taking the longest-waiting word every fifth turn.
+  const used = new Set<Candidate>();
+  const result: T[] = [];
+  let urgentIndex = 0;
+  let oldestIndex = 0;
+  while (result.length < entries.length) {
+    const fair = (state.servedCount + result.length) % 5 === 4;
+    let next: Candidate | undefined;
+    do {
+      next = fair ? oldest[oldestIndex++] : urgent[urgentIndex++];
+    } while (next && used.has(next));
+    if (!next) break;
+    used.add(next);
+    result.push(next.entry);
   }
   return result;
 }

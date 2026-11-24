@@ -101,6 +101,7 @@ export const miniAudioContextSchema = z.discriminatedUnion('target', [
       target: z.literal('daily'),
       dayId: z.string().min(1),
       session: z.enum(['review', 'learning']).optional(),
+      taskId: z.string().min(1).max(200).optional(),
     })
     .strict(),
   z
@@ -119,6 +120,7 @@ export const miniAudioPlaybackSchema = z
     visitId: uuid,
     mode: z.enum(['automatic', 'manual']),
     context: miniAudioContextSchema.optional(),
+    spellingSubmissionId: uuid.optional(),
   })
   .strict();
 export type MiniAudioPlayback = z.infer<typeof miniAudioPlaybackSchema>;

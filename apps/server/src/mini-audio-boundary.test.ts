@@ -319,6 +319,13 @@ test('inflected sentence audio follows all three v2 pages and reuses its cached 
     sentence: { ...sentence, targetForms: ['GAVE'] },
   });
   assert.equal(cached.id, audio.id, 'Display metadata does not regenerate identical speech');
+  const phrases = () =>
+    data.study.phrases({ q: 'gave', offset: 0, limit: 50 }, data.store.heardSentences());
+  assert.equal(
+    phrases().total,
+    0,
+    'Prefetching the word, sentence or audio never records a visit.',
+  );
   const play = (asset: MiniAudioAsset) =>
     data.service.authorize({
       requestId: randomUUID(),
@@ -328,7 +335,29 @@ test('inflected sentence audio follows all three v2 pages and reuses its cached 
       context,
     });
   assert.equal(play(wordAudio).status, 'authorized');
-  assert.equal(play(audio).status, 'authorized');
+  const authorized = play(audio);
+  assert.equal(authorized.status, 'authorized');
+  assert.equal(phrases().total, 0, 'An audio authorization may never start playing.');
+  data.service.started({
+    requestId: randomUUID(),
+    playbackId: authorized.id,
+    occurredAt: swiftTime(data.now()),
+  });
+  assert.equal(
+    phrases().items[0]?.expression,
+    sentence.english,
+    'A real playback records the exact historical sentence before the learner answers.',
+  );
+  assert.throws(() =>
+    data.act({
+      ...context,
+      type: 'record_card_view',
+      word,
+      visibleSentence: { ...sentence, english: 'A different sentence.' },
+    }),
+  );
+  data.act({ ...context, type: 'record_card_view', word, visibleSentence: sentence });
+  assert.equal(phrases().total, 1, 'The same audible and visible example is listed only once.');
   const advance = () => {
     const visit = data.day().flow?.window.visit;
     assert.ok(visit);
@@ -349,6 +378,10 @@ test('inflected sentence audio follows all three v2 pages and reuses its cached 
   data.act({ ...context, type: 'window_choose', word, visitId: visit.id, remembered: true });
   advance();
   assert.equal(data.day().flow?.window.visit?.stage, 2);
+  assert.throws(
+    () => data.act({ ...context, type: 'record_card_view', word, visibleSentence: sentence }),
+    /实际展示/,
+  );
   assert.equal(play(wordAudio).status, 'authorized');
   assert.throws(() => play(audio), hasCode('AUDIO_AUTOPLAY_FORBIDDEN'));
 });
@@ -452,6 +485,85 @@ function beginV2Review(data: Awaited<ReturnType<typeof fixture>>) {
   return review;
 }
 
+test('manual audio follows the displayed translation when reviewing an earlier question', async (t) => {
+  const data = await fixture(t);
+  data.begin([apple, book], 'sliding-window-v2');
+  const daily = { target: 'daily' as const, dayId: data.day().id };
+  const learning = { ...daily, session: 'learning' as const };
+  for (let i = 0; i < 2; i++) {
+    const visit = data.day().flow?.window.visit;
+    assert.ok(visit);
+    data.act({ ...learning, type: 'window_familiar', word: visit.word, visitId: visit.id });
+  }
+  for (let i = 0; i < 2; i++) {
+    const word = data.day().learning?.queue[0];
+    assert.ok(word);
+    data.act({
+      ...learning,
+      type: 'submit_spelling',
+      word,
+      answer: word.spelling,
+      advanceOnCorrect: false,
+    });
+    data.act({ ...learning, type: 'advance_spelling', word });
+  }
+  const words = data.day().flow?.groupWords;
+  assert.ok(words);
+  data.act({
+    ...daily,
+    type: 'publish_writing',
+    prompts: words.map((word, index) => ({
+      id: randomUUID(),
+      direction: index === 0 ? 'englishToChinese' : 'chineseToEnglish',
+      focusIds: [],
+      sentence: {
+        word,
+        english: `Please bring my ${word.spelling}.`,
+        chinese: `请带来我的${word.meaning}。`,
+      },
+    })),
+  });
+  data.act({ ...daily, type: 'complete_learning' });
+  const first = currentTranslation(data.day());
+  assert.ok(first);
+  data.act({
+    ...daily,
+    type: 'submit_translation',
+    taskId: first.id,
+    answer: first.sentence.chinese,
+  });
+  data.act({ ...daily, type: 'advance_translation', taskId: first.id });
+  const second = currentTranslation(data.day());
+  assert.ok(second);
+  const asset = await data.ready({ kind: 'sentence', sentence: first.sentence });
+  const play = (taskId: string, mode: 'manual' | 'automatic' = 'manual') =>
+    data.service.authorize({
+      requestId: randomUUID(),
+      visitId: randomUUID(),
+      mode,
+      assetId: asset.id,
+      context: { ...daily, taskId },
+    });
+  assert.throws(() => play(second.id), hasCode('AUDIO_TARGET_CHANGED'));
+  assert.throws(() => play(daily.dayId + '/2'), hasCode('AUDIO_TARGET_CHANGED'));
+  assert.throws(() => play(first.id, 'automatic'), hasCode('AUDIO_AUTOPLAY_FORBIDDEN'));
+  play(first.id);
+  const exposure = data.study.snapshot().teaching.exposures.at(-1);
+  assert.equal(exposure?.taskId, first.id);
+  assert.equal(exposure?.translationPromptAudio, true);
+  assert.deepEqual(exposure?.word, first.sentence.word);
+  assert.equal(currentTranslation(data.day())?.id, second.id);
+  const englishAnswer = await data.ready({ kind: 'sentence', sentence: second.sentence });
+  data.service.authorize({
+    requestId: randomUUID(),
+    visitId: randomUUID(),
+    mode: 'manual',
+    assetId: englishAnswer.id,
+    context: { ...daily, taskId: second.id },
+  });
+  assert.equal(data.study.snapshot().teaching.exposures.at(-1)?.translationPromptAudio, undefined);
+});
+
 test('spelling result autoplay follows committed answers in learning and both review contexts', async (t) => {
   for (const scope of ['learning', 'daily-review', 'legacy-review'] as const) {
     await t.test(scope, async (current) => {
@@ -522,6 +634,65 @@ test('spelling result autoplay follows committed answers in learning and both re
       assert.throws(() => automatic(), hasCode('AUDIO_AUTOPLAY_FORBIDDEN'));
     });
   }
+});
+
+test('automatic next-card spelling pronounces only the latest saved answer in its original group', async (t) => {
+  const data = await fixture(t);
+  data.begin([apple, book], 'sliding-window-v2');
+  const context = { target: 'daily' as const, dayId: data.day().id, session: 'learning' as const };
+  for (let i = 0; i < 2; i++) {
+    const visit = data.day().flow?.window.visit;
+    assert.ok(visit);
+    data.act({ ...context, type: 'window_familiar', visitId: visit.id, word: visit.word });
+  }
+  const [first, second] = data.day().learning?.queue ?? [];
+  assert.ok(first && second);
+  const firstAsset = await data.ready({ kind: 'word', word: first });
+  const secondAsset = await data.ready({ kind: 'word', word: second });
+  const submit = (word: MiniWord, answer: string) => {
+    const requestId = randomUUID();
+    data.study.command(
+      miniCommandSchema.parse({
+        requestId,
+        expectedRevision: data.study.snapshot().revision,
+        action: {
+          ...context,
+          type: 'submit_spelling',
+          word,
+          answer,
+          advanceOnCorrect: false,
+          advanceAfterCorrect: true,
+        },
+      }),
+    );
+    return requestId;
+  };
+  const resultAudio = (asset: MiniAudioAsset, spellingSubmissionId: string) =>
+    data.service.authorize({
+      requestId: randomUUID(),
+      assetId: asset.id,
+      visitId: randomUUID(),
+      mode: 'automatic',
+      spellingSubmissionId,
+    });
+  assert.throws(() => resultAudio(firstAsset, randomUUID()), hasCode('AUDIO_TARGET_CHANGED'));
+  const id = submit(first, first.spelling);
+  assert.deepEqual(data.day().learning?.queue, [second]);
+  assert.throws(() => resultAudio(secondAsset, id), hasCode('AUDIO_TARGET_CHANGED'));
+  const receipt = resultAudio(firstAsset, id);
+  assert.equal(receipt.status, 'authorized');
+  const exposure = data.study.snapshot().teaching.exposures.at(-1);
+  assert.deepEqual(exposure?.word, first);
+  assert.equal(exposure?.dayId, context.dayId);
+  assert.equal(exposure?.beforeAttemptCount, 1);
+  assert.equal(exposure?.spellingAttemptHelp, undefined);
+  assert.equal(data.day().learning?.spellingAttempts[0]?.lastPotentialHelpAt, undefined);
+
+  const finalId = submit(second, second.spelling);
+  assert.equal(data.day().learning?.phase, 'finished');
+  assert.equal(data.day().learning?.spellingAttempts[1]?.lastPotentialHelpAt, undefined);
+  assert.throws(() => resultAudio(firstAsset, id), hasCode('AUDIO_TARGET_CHANGED'));
+  assert.equal(resultAudio(secondAsset, finalId).status, 'authorized');
 });
 
 test('v2 review card relearning authorizes its actual word and sentence after the judgment queue empties', async (t) => {
@@ -681,7 +852,7 @@ test('browsing an answer word or another target sentence containing it still rec
   for (const kind of ['word', 'sentence'] as const) {
     await t.test(kind, async (subtest) => {
       const data = await fixture(subtest);
-      data.begin([apple, book]);
+      data.begin([book, apple]);
       for (const word of data.day().learningWords)
         data.act({ type: 'mark_studied', target: 'daily', dayId: data.day().id, word });
       const target: MiniAudioTarget =
@@ -876,8 +1047,8 @@ test('new-word automatic sequences follow the memory target and require a full v
   advance(apple, 3);
   advance(book, 3);
   assert.equal(data.day().memory?.round, 4);
-  assert.throws(() => automatic(wordAsset), hasCode('AUDIO_AUTOPLAY_FORBIDDEN'));
-  assert.throws(() => automatic(sentenceAsset), hasCode('AUDIO_AUTOPLAY_FORBIDDEN'));
+  assert.throws(() => automatic(bookAsset), hasCode('AUDIO_AUTOPLAY_FORBIDDEN'));
+  assert.throws(() => automatic(sentenceAsset), hasCode('AUDIO_TARGET_CHANGED'));
 });
 
 test('review sentence autoplay requires a selected judgment and the exact displayed saved example', async (t) => {

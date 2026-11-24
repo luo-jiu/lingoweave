@@ -1,4 +1,5 @@
 import { mkdir } from 'node:fs/promises';
+import { setTimeout as delay } from 'node:timers/promises';
 import type { RuntimeStatus } from '@lingoweave/contracts';
 import { z } from 'zod';
 import { CodexError, CodexTransport, cancelledError } from './transport.js';
@@ -116,7 +117,7 @@ export class CodexBridge {
     if (this.pendingStatus) return this.pendingStatus;
     this.pendingStatus = this.inspect()
       .then((value) => {
-        this.statusCache = { value, expiresAt: Date.now() + 10_000 };
+        this.statusCache = value.available ? { value, expiresAt: Date.now() + 10_000 } : null;
         return value;
       })
       .finally(() => {
@@ -136,9 +137,7 @@ export class CodexBridge {
       if (options.signal.aborted) throw cancelledError();
       options.onProgress('正在连接本机 Codex…');
       await this.initialize(process);
-      const account = accountSchema.parse(
-        await process.request('account/read', { refreshToken: false }),
-      );
+      const account = await this.readAccount(process);
       if (!account.account && account.requiresOpenaiAuth)
         throw new CodexError('CODEX_LOGIN_REQUIRED', '请先在本机 Codex 完成登录，再准备学习材料。');
       const models = await this.models(process);
@@ -178,6 +177,11 @@ export class CodexBridge {
           developerInstructions: options.instructions,
         }),
       );
+      if (options.model && started.model !== selected.model)
+        throw new CodexError(
+          'CODEX_MODEL_UNAVAILABLE',
+          '运行时返回了不同的模型，请刷新模型列表后重试。',
+        );
       await this.verifyTools(process, started.thread.id, options.tools);
       if (options.signal.aborted) throw cancelledError();
       const result = { threadId: started.thread.id, model: started.model };
@@ -237,6 +241,23 @@ export class CodexBridge {
     return value.userAgent.match(/\/(\d+\.\d+\.\d+)/)?.[1] ?? null;
   }
 
+  private async readAccount(process: CodexTransport) {
+    const read = () => process.request('account/read', { refreshToken: false });
+    let response: unknown;
+    try {
+      response = await read();
+    } catch (error) {
+      if (
+        !(error instanceof CodexError) ||
+        (error.code !== 'CODEX_TIMEOUT' && error.rpcCode !== -32603)
+      )
+        throw error;
+      await delay(250);
+      response = await read();
+    }
+    return accountSchema.parse(response);
+  }
+
   private async models(process: CodexTransport) {
     const models: z.infer<typeof modelPageSchema>['data'] = [];
     let cursor: string | null = null;
@@ -262,9 +283,7 @@ export class CodexBridge {
     try {
       process = await this.createProcess();
       version = await this.initialize(process);
-      const account = accountSchema.parse(
-        await process.request('account/read', { refreshToken: false }),
-      );
+      const account = await this.readAccount(process);
       const authenticated = account.account !== null || !account.requiresOpenaiAuth;
       const models = authenticated ? await this.models(process) : [];
       return {

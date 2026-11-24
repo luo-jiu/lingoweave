@@ -12,7 +12,7 @@
   "scripts": {
     "dev": "pnpm --filter @lingoweave/contracts build && concurrently --kill-others --names contracts,server,web \"pnpm --filter @lingoweave/contracts dev\" \"pnpm --filter @lingoweave/server dev\" \"pnpm --filter @lingoweave/web dev\"",
     "dev:mini": "./apps/macos/build-app.sh --dev --open",
-    "test:mini": "pnpm --filter @lingoweave/contracts build && pnpm --filter @lingoweave/server build && node scripts/test-mini-service.mjs",
+    "test:mini": "pnpm --filter @lingoweave/contracts build && pnpm --filter @lingoweave/server build && node --test scripts/test-mini-reset.mjs && node scripts/test-mini-service.mjs",
     "build": "pnpm --filter @lingoweave/contracts build && pnpm --parallel --filter './apps/*' build",
     "start": "node --import ./scripts/production-env.mjs apps/server/dist/index.js",
     "typecheck": "pnpm --filter @lingoweave/contracts build && pnpm -r typecheck",

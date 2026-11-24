@@ -6,48 +6,64 @@ struct MiniWindowCommands {
     let correct: () -> Void
     let advance: (Bool?) -> Void
     let saveDraft: () -> Void
+    var markFamiliar: (() -> Void)? = nil
 }
 
 struct MiniWindowControls: View {
     let visit: MiniMemoryWindow.Visit
-    let saving: Bool
     let commands: MiniWindowCommands?
 
     var body: some View {
         HStack(spacing: 10) {
             if visit.stage == 0 {
-                Button("记住了") {
+                if let markFamiliar = commands?.markFamiliar {
+                    MiniStudyIconButton(title: "已认识", systemImage: "book.closed") {
+                        guard visit.initial == nil else { return }
+                        markFamiliar()
+                    }
+                    .help("已认识 · 直接加入本组拼写，之后仍要翻译")
+                    .accessibilityHint("直接加入本组拼写，之后仍要翻译")
+                    .accessibilityIdentifier("windowFamiliar")
+                }
+                MiniStudyIconButton(title: "记住了", systemImage: "checkmark", prominent: true) {
                     guard visit.initial == nil else { return }
-                    commands?.choose(true)
+                    commands?.advance(true)
                 }
                 .keyboardShortcut(.return, modifiers: [])
+                .accessibilityIdentifier("windowRemember")
             } else if visit.awaitingConfirmation {
                 if visit.initial == true {
-                    Button("记错了") {
+                    MiniStudyIconButton(title: "记错了", systemImage: "arrow.uturn.backward") {
                         guard visit.canCorrect else { return }
                         commands?.correct()
                     }
                     .accessibilityIdentifier("windowCorrect")
                 }
-                Button("下一个") {
+                MiniStudyIconButton(title: "下一个", systemImage: "arrow.right", prominent: true) {
                     guard !visit.advancesAutomatically else { return }
                     commands?.advance(nil)
                 }
                 .keyboardShortcut(.return, modifiers: [])
                 .accessibilityIdentifier("windowConfirm")
             } else {
-                Button("想不起来") { commands?.choose(false) }
-                Button("想起来了") { commands?.choose(true) }
+                recallButton("Forgot", remembered: false)
+                    .accessibilityIdentifier("windowForgot")
+                recallButton("Got it", remembered: true)
                     .accessibilityIdentifier("windowRecall")
             }
         }
-        .allowsHitTesting(!saving && !visit.advancesAutomatically)
-        .task(id: visit.advancesAutomatically && !saving ? visit.id : nil) {
-            guard visit.advancesAutomatically, !saving else { return }
-            do { try await Task.sleep(for: .milliseconds(300)) }
-            catch { return }
-            guard !Task.isCancelled else { return }
-            commands?.advance(nil)
+        .allowsHitTesting(!visit.advancesAutomatically)
+    }
+
+    private func recallButton(_ title: String, remembered: Bool) -> some View {
+        let description = remembered ? "想起来了" : "想不起来"
+        return Button {
+            commands?.choose(remembered)
+        } label: {
+            Text(title).frame(width: 52, height: 16)
         }
+        .miniStudyButton(prominent: remembered)
+        .help(description)
+        .accessibilityLabel(description)
     }
 }

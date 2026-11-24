@@ -12,6 +12,8 @@ import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import {
   miniCommandSchema,
+  miniActionSchema,
+  miniNewFeedbackActionSchema,
   miniImportSchema,
   miniSnapshotSchema,
   defaultMiniPlanning,
@@ -28,27 +30,64 @@ import {
   type MiniHistoryInput,
   type MiniHistoryItem,
   type MiniWordContextInput,
+  miniAiSelectionSchema,
+  defaultMiniAiSelection,
   miniAssessmentSourceSchema,
   miniAssessmentApplicationSchema,
   miniAssessmentReceiptSchema,
+  miniAssessmentResultSchema,
   type MiniAssessmentSource,
   type MiniAssessmentApplication,
   type MiniAssessmentReceipt,
   type MiniWord,
   type MiniDay,
+  type MiniTranslationReviewQuery,
+  miniTranslationAttemptSchema,
   miniWordSchema,
+  miniPatternQuerySchema,
+  type MiniPatternPractice,
+  type MiniPatternView,
+  type MiniPhraseQuery,
+  type MiniSentence,
+  type MiniPatternLevel,
 } from '@lingoweave/contracts';
 import { z } from 'zod';
+import {
+  migrateMiniPatterns,
+  miniPatternSnapshot,
+  practiceMiniPattern,
+  recordMiniPatternView,
+  practicedPatternContext,
+} from './mini-patterns.js';
+import {
+  collectMiniPatternPhrases,
+  collectMiniPhrases,
+  searchMiniPhrases,
+} from './mini-phrases.js';
+import { translationReview, type TranslationAssessment } from './mini-translation-review.js';
 import { legacyTimedPauseIds, withoutMiniPlanMinutes } from './mini-plan-migration.js';
+import { groupPendingMiniReviews } from './mini-review-groups.js';
+import { markLegacyMiniReviewPrompts } from './mini-review-prompt-migration.js';
 import { LearningError } from './learning-store.js';
-import { swiftTime, validateMiniFacts, sameWord } from './mini-study.js';
+import {
+  isMiniDayOnDate,
+  localDay,
+  swiftTime,
+  unixDate,
+  validateMiniFacts,
+  sameWord,
+} from './mini-study.js';
 import {
   applyFlowAssessment,
+  flowMemory,
   observeMiniFlowScheduling,
+  rebuildMiniFlowDueSchedules,
+  repairMiniReviewPromptSchedules,
   validateMiniFlowScheduling,
 } from './mini-flow-scheduler.js';
 import {
   applyMiniPlannedAction,
+  currentMiniPlanSession,
   enforceMiniDueGate,
   miniPlanContext,
   resumeMiniTimePause,
@@ -112,6 +151,7 @@ const receiptRow = z.object({ fingerprint: z.string() });
 const assessmentDraftSchema = miniAssessmentSourceSchema.omit({
   confirmedAt: true,
   discussion: true,
+  aiSelection: true,
 });
 function fingerprint(value: unknown) {
   return createHash('sha256').update(JSON.stringify(value)).digest('hex');
@@ -133,6 +173,11 @@ function emptySnapshot(): MiniSnapshot {
 }
 
 export class MiniStore {
+  private phrasesCache?: {
+    changes: number;
+    audio?: { sentence: MiniSentence; at: number }[];
+    entries: ReturnType<typeof collectMiniPhrases>;
+  };
   private readonly db: DatabaseSync;
   private readonly releaseLock: () => void;
   private readonly now: () => Date;
@@ -162,7 +207,7 @@ export class MiniStore {
       const version = z
         .object({ user_version: z.number() })
         .parse(this.db.prepare('PRAGMA user_version').get()).user_version;
-      if (version > 8)
+      if (version > 13)
         throw new Error('This mini database was created by a newer LingoWeave version.');
       if (version === 0)
         this.db.exec(`
@@ -209,7 +254,7 @@ export class MiniStore {
       validateMiniPlanning(initial);
       validateMiniTeaching(initial);
       validateMiniScheduling(initial);
-      validateMiniFlowScheduling(initial);
+      validateMiniFlowScheduling(initial, undefined, { allowArchivedDueDates: version < 13 });
       if (version < 8 || JSON.stringify(initial) !== JSON.stringify(this.snapshot()))
         this.atomic(() => {
           this.save(initial);
@@ -224,7 +269,49 @@ export class MiniStore {
                   .run(cleaned, row.seq);
             }
           }
-          this.db.exec('PRAGMA user_version = 8');
+          if (version < 8) this.db.exec('PRAGMA user_version = 8');
+        });
+      if (version < 9)
+        this.atomic(() => {
+          migrateMiniPatterns(this.db);
+          this.db.exec('PRAGMA user_version = 9');
+        });
+      if (version < 10)
+        this.atomic(() => {
+          this.db.exec(`
+            CREATE TABLE IF NOT EXISTS mini_pattern_views (
+              pattern_id TEXT NOT NULL, batch_id TEXT NOT NULL, at_ms INTEGER NOT NULL,
+              PRIMARY KEY (pattern_id,batch_id)
+            );
+            PRAGMA user_version = 10;
+          `);
+        });
+      if (version < 11)
+        this.atomic(() => {
+          const current = this.snapshot();
+          if (groupPendingMiniReviews(current, swiftTime(this.now()), this.timezone)) {
+            validateMiniFacts(current);
+            validateMiniPlanning(current);
+            validateMiniTeaching(current);
+            current.revision += 1;
+            this.save(current);
+          }
+          this.db.exec('PRAGMA user_version = 11');
+        });
+      if (version < 13)
+        this.atomic(() => {
+          const current = this.snapshot();
+          const at = swiftTime(this.now());
+          const marked = version < 12 ? markLegacyMiniReviewPrompts(this.db, current) : 0;
+          if (marked > 0) repairMiniReviewPromptSchedules(current, at);
+          const rebuilt = rebuildMiniFlowDueSchedules(current, at);
+          if (marked > 0 || rebuilt) {
+            validateMiniTeaching(current);
+            validateMiniFlowScheduling(current);
+            current.revision += 1;
+            this.save(current);
+          }
+          this.db.exec('PRAGMA user_version = 13');
         });
       validateMiniFacts(this.snapshot());
       validateMiniPlanning(this.snapshot());
@@ -245,6 +332,19 @@ export class MiniStore {
       ),
     );
   }
+  dataMetrics() {
+    const events = z
+      .object({ count: z.number().int().nonnegative() })
+      .parse(this.db.prepare('SELECT COUNT(*) AS count FROM mini_events').get()).count;
+    const completedAssessmentIds = this.db
+      .prepare('SELECT source_id FROM mini_assessment_records')
+      .all()
+      .map((row) => z.object({ source_id: z.string() }).parse(row).source_id);
+    return { events, completedAssessmentIds };
+  }
+  isCurrentStudyDay(day: MiniDay) {
+    return isMiniDayOnDate(day, localDay(this.now(), day.timezone ?? this.timezone));
+  }
   planPreview(raw: MiniPlanPreviewInput): MiniPlanPreview {
     const input = miniPlanPreviewInputSchema.parse(raw);
     const snapshot = this.snapshot();
@@ -252,6 +352,52 @@ export class MiniStore {
   }
   aiContext(raw: MiniAIContextInput) {
     return miniAIContext(this.snapshot(), raw, swiftTime(this.now()));
+  }
+  private patternLevel(): MiniPatternLevel {
+    const row = this.db
+      .prepare(
+        `SELECT json_extract(m.value,'$.value') AS preference
+      FROM mini_state s, json_each(s.body,'$.teaching.memories') m
+      WHERE s.id=1 AND json_extract(m.value,'$.key')='english_level' ORDER BY m.key DESC LIMIT 1`,
+      )
+      .get();
+    const level =
+      row &&
+      z
+        .string()
+        .parse(row.preference)
+        .match(/\b(A1|A2|B1|B2|C1|C2)\b/i)?.[1]
+        ?.toUpperCase();
+    return !level || level === 'A1' ? 'A1' : 'A2';
+  }
+  patterns(timezone: string) {
+    miniPatternQuerySchema.parse({ timezone });
+    return miniPatternSnapshot(this.db, timezone, this.now(), this.patternLevel());
+  }
+  patternContext() {
+    return practicedPatternContext(this.db, this.patternLevel());
+  }
+  practicePattern(input: MiniPatternPractice) {
+    return this.atomic(() => practiceMiniPattern(this.db, input, this.now(), this.patternLevel()));
+  }
+  viewPattern(input: MiniPatternView) {
+    return this.atomic(() =>
+      recordMiniPatternView(this.db, input, this.now(), this.patternLevel()),
+    );
+  }
+  phrases(query: MiniPhraseQuery, audio?: { sentence: MiniSentence; at: number }[]) {
+    if (query.kind === 'pattern')
+      return searchMiniPhrases(collectMiniPatternPhrases(this.db), query);
+    // The store exclusively owns this database. Search and pagination can reuse
+    // one read-only projection until a real write on this connection changes it.
+    const changes = z.number().parse(this.db.prepare('SELECT total_changes() AS n').get()?.n);
+    if (this.phrasesCache?.changes !== changes || this.phrasesCache?.audio !== audio)
+      this.phrasesCache = {
+        changes,
+        audio,
+        entries: collectMiniPhrases(this.db, this.snapshot(), audio),
+      };
+    return searchMiniPhrases(this.phrasesCache.entries, query);
   }
   history(raw: MiniHistoryInput) {
     const events: MiniHistoryItem[] = [];
@@ -303,6 +449,51 @@ export class MiniStore {
   assessmentSource(id: string): MiniAssessmentSource | undefined {
     return this.snapshot().assessmentSources.find((source) => source.id === id.toLowerCase());
   }
+  translationModel(id: string) {
+    const row = this.db
+      .prepare(
+        "SELECT json_extract(application, '$.trace.model') AS model,json_extract(application, '$.trace.effort') AS effort FROM mini_assessment_records WHERE source_id=?",
+      )
+      .get(id);
+    if (row) return miniAiSelectionSchema.parse(row);
+    return this.assessmentSource(id)?.aiSelection ?? defaultMiniAiSelection;
+  }
+  translationReview(
+    query: MiniTranslationReviewQuery,
+    findJob: (id: string) => TranslationAssessment | null,
+  ) {
+    // Read only submissions near the requested day. The calendar projection below
+    // handles the exact IANA day boundary, including daylight-saving transitions.
+    const midnight = swiftTime(new Date(query.date + 'T00:00:00Z'));
+    const rows = this.db
+      .prepare(
+        `
+      SELECT json_extract(day.value, '$.id') AS id, attempt.value AS body
+      FROM mini_state, json_each(body, '$.ledger.days') day, json_each(day.value, '$.translation') attempt
+      WHERE mini_state.id=1 AND json_extract(attempt.value, '$.submittedAt') BETWEEN ? AND ?
+    `,
+      )
+      .all(midnight - 86400, midnight + 2 * 86400);
+    const days = rows.map((row) => ({
+      id: z.string().parse(row.id),
+      translation: [miniTranslationAttemptSchema.parse(JSON.parse(stateRow.parse(row).body))],
+    }));
+    const recorded = this.db.prepare(
+      "SELECT json_extract(application, '$.result') AS body FROM mini_assessment_records WHERE source_id=?",
+    );
+    const frozen = this.db.prepare(
+      "SELECT 1 FROM mini_state, json_each(body, '$.assessmentSources') source WHERE mini_state.id=1 AND json_extract(source.value, '$.id')=? LIMIT 1",
+    );
+    return translationReview(days, query, (id) => {
+      const row = recorded.get(id);
+      if (row)
+        return {
+          status: 'completed',
+          result: miniAssessmentResultSchema.parse(JSON.parse(stateRow.parse(row).body)),
+        };
+      return findJob(id) ?? (frozen.get(id) ? { status: 'queued', result: null } : null);
+    });
+  }
   applyAssessment(raw: MiniAssessmentApplication): MiniAssessmentReceipt {
     const application = miniAssessmentApplicationSchema.parse(raw);
     const hash = fingerprint(application);
@@ -331,7 +522,20 @@ export class MiniStore {
           'MINI_ASSESSMENT_CONFLICT',
           '评价必须对应已保存的原题、原答和固定证据。',
         );
-      const receipt = applyFlowAssessment(state, application, swiftTime(this.now()));
+      // The first submission is the scheduling evidence. Later versions receive
+      // independent teaching feedback even when their jobs finish out of order.
+      const due = flowMemory(state, source.word)?.dueAt ?? null;
+      const receipt: MiniAssessmentReceipt =
+        source.id === source.attemptId
+          ? applyFlowAssessment(state, application, swiftTime(this.now()))
+          : {
+              requestId: application.requestId,
+              sourceId: source.id,
+              revision: state.revision + 1,
+              disposition: 'partially_adopted',
+              reason: '已保存修改稿的点评，复习排期沿用首次作答的证据。',
+              scheduling: { beforeDueAt: due, afterDueAt: due, affectedEvents: 0 },
+            };
       state.revision += 1;
       validateMiniFlowScheduling(state, [source.word]);
       this.save(state);
@@ -380,6 +584,10 @@ export class MiniStore {
         ...(item.review?.relearning?.events ?? []),
       ])
       .filter((event) => sameWord(event.word, word) && event.confirmedAt <= at);
+    const familiar = day.flow?.window.events.find(
+      (event) =>
+        event.selfReportedFamiliar && sameWord(event.word, word) && event.confirmedAt <= at,
+    );
     const views = state.scheduling.views.filter(
       (event) => sameWord(event.word, word) && event.at <= at,
     );
@@ -406,9 +614,28 @@ export class MiniStore {
             ]
           : [];
       });
-    const projected = state.scheduling.cards.find((item) =>
-      sameWord(item.word, word),
-    )?.lastAnswerExposureAt;
+    const card = state.scheduling.cards.find((item) => sameWord(item.word, word));
+    const readingEnglish = attempt.task.direction === 'englishToChinese';
+    const projected =
+      readingEnglish && card?.lastMeaningExposureAt !== undefined
+        ? card.lastMeaningExposureAt
+        : card?.lastAnswerExposureAt;
+    const openedAt = Math.max(
+      day.translationStartedAt ?? -Infinity,
+      ...day.translation.flatMap((other) =>
+        other.id !== attempt.id && other.confirmedAt !== undefined && other.confirmedAt <= at
+          ? [other.confirmedAt]
+          : [],
+      ),
+    );
+    const taskHelp =
+      (Number.isFinite(openedAt) && views.some((view) => view.lookup && view.at >= openedAt)) ||
+      exposures.some(
+        (event) =>
+          event.dayId === day.id &&
+          event.taskId === attempt.task.id &&
+          !event.translationPromptAudio,
+      );
     const lastReveal = Math.max(
       -Infinity,
       ...events.flatMap((event) => [
@@ -420,8 +647,12 @@ export class MiniStore {
         ...(item.revealedAnswerAt === undefined ? [] : [item.revealedAnswerAt]),
       ]),
       ...confirmations.map((event) => event.at),
-      ...views.map((event) => event.at),
-      ...exposures.map((event) => event.at),
+      ...views
+        .filter((event) => !readingEnglish || !event.translationPrompt)
+        .map((event) => event.at),
+      ...exposures
+        .filter((event) => !readingEnglish || !event.translationPromptAudio)
+        .map((event) => event.at),
       ...(projected !== undefined && projected !== null && projected <= at ? [projected] : []),
     );
     const intervening =
@@ -431,14 +662,24 @@ export class MiniStore {
             !sameWord(event.word, word) && event.submittedAt > lastReveal && event.submittedAt < at,
         ),
       ) ||
-      state.ledger.days.some((item) =>
-        [...(item.flow?.window.events ?? []), ...(item.review?.relearning?.events ?? [])].some(
-          (event) =>
-            !sameWord(event.word, word) && event.confirmedAt > lastReveal && event.confirmedAt < at,
-        ),
+      state.ledger.days.some(
+        (item) =>
+          item.translation.some(
+            (other) =>
+              !sameWord(other.task.sentence.word, word) &&
+              other.submittedAt > lastReveal &&
+              other.submittedAt < at,
+          ) ||
+          [...(item.flow?.window.events ?? []), ...(item.review?.relearning?.events ?? [])].some(
+            (event) =>
+              !sameWord(event.word, word) &&
+              event.confirmedAt > lastReveal &&
+              event.confirmedAt < at,
+          ),
       );
     const eligible =
       capturedAtSubmission &&
+      !taskHelp &&
       !(projected !== undefined && projected !== null && projected > at) &&
       Number.isFinite(lastReveal) &&
       at - lastReveal >= (intervening ? 60 : 300);
@@ -482,6 +723,9 @@ export class MiniStore {
       learningEvidence: z.record(z.string(), z.json()).parse({
         flowVersion: day.flow?.version ?? null,
         capturedAtSubmission,
+        ...(familiar
+          ? { selfReportedFamiliar: { id: familiar.id, at: familiar.confirmedAt } }
+          : {}),
         windowEvents: events.slice(-100),
         spellingAttempts: spelling.slice(-100),
         spellingConfirmations: confirmations.slice(-100),
@@ -546,6 +790,7 @@ export class MiniStore {
         eligibility: {
           meaning: eligible,
           spelling: eligible && attempt.task.direction === 'chineseToEnglish',
+          taskHelp,
           lastAnswerExposureAt: Number.isFinite(lastReveal) ? lastReveal : null,
           reason: !capturedAtSubmission
             ? '旧作答缺少提交时的固定证据，不反推独立回忆资格。'
@@ -566,7 +811,7 @@ export class MiniStore {
       .prepare('INSERT OR IGNORE INTO mini_assessment_drafts(attempt_id,body) VALUES (?,?)')
       .run(attempt.id.toLowerCase(), JSON.stringify(draft));
   }
-  private freezeAssessments(state: MiniSnapshot) {
+  private freezeAssessments(state: MiniSnapshot, action: MiniCommand['action']) {
     for (const day of state.ledger.days) {
       if (!day.flow) continue;
       for (const attempt of day.translation) {
@@ -593,6 +838,13 @@ export class MiniStore {
         const source = miniAssessmentSourceSchema.parse({
           ...draft,
           confirmedAt: attempt.confirmedAt,
+          ...(action.type === 'advance_translation' &&
+          action.target === 'daily' &&
+          action.dayId === day.id &&
+          action.taskId === attempt.task.id &&
+          action.aiSelection
+            ? { aiSelection: action.aiSelection }
+            : {}),
           discussion:
             this.discussionProvider?.(
               attempt.task.sentence.word,
@@ -603,6 +855,56 @@ export class MiniStore {
         state.assessmentSources.push(source);
       }
     }
+  }
+  private freezeTranslationRevision(
+    state: MiniSnapshot,
+    action: MiniCommand['action'],
+    at: number,
+  ) {
+    if (
+      (action.type !== 'revise_translation' && action.type !== 'advance_translation') ||
+      action.target !== 'daily'
+    )
+      return;
+    const day = state.ledger.days.find((item) => item.id === action.dayId);
+    if (!day) return;
+    const index = day.translation.findIndex((item) => item.task.id === action.taskId);
+    const attempt = day.translation[index];
+    const revision = attempt?.revisions?.at(-1);
+    if (
+      !attempt ||
+      !revision ||
+      index >= day.translationIndex ||
+      state.assessmentSources.some((source) => source.id === revision.id)
+    )
+      return;
+    if (at < revision.submittedAt)
+      throw new LearningError('MINI_STATE_CONFLICT', '确认时间不能早于当前译文的提交时间。');
+    // The first answer has its own immutable scheduling evidence. Edits share
+    // that history but are distinct commentary jobs, including on old fixed groups.
+    const firstSource = state.assessmentSources.find(
+      (source) => source.id === attempt.id.toLowerCase(),
+    );
+    const original = firstSource ?? this.assessmentDraft(state, day, attempt, false);
+    const aiSelection = revision.aiSelection ?? firstSource?.aiSelection;
+    const source = miniAssessmentSourceSchema.parse({
+      ...original,
+      id: revision.id,
+      answer: revision.answer,
+      submittedAt: revision.submittedAt,
+      confirmedAt: at,
+      ...(aiSelection ? { aiSelection } : {}),
+      learningEvidence: {
+        ...original.learningEvidence,
+        revisionOf: attempt.id.toLowerCase(),
+        originalAnswer: attempt.answer,
+        originalSubmittedAt: attempt.submittedAt,
+        eligibility: { meaning: false, spelling: false, reason: '改译用于点评，首答单独结算。' },
+      },
+      discussion:
+        this.discussionProvider?.(attempt.task.sentence.word, revision.submittedAt, at) ?? [],
+    });
+    state.assessmentSources.push(source);
   }
   commandReceipt(requestId: string): { requestId: string; revision: number } | null {
     z.uuid().parse(requestId);
@@ -615,6 +917,28 @@ export class MiniStore {
           revision: z.object({ revision: z.number().int().nonnegative() }).parse(row).revision,
         }
       : null;
+  }
+  spellingSubmission(requestId: string) {
+    const row = this.db
+      .prepare(
+        `SELECT body FROM mini_events AS submitted
+         WHERE submitted.request_id = ? AND NOT EXISTS (
+           SELECT 1 FROM mini_events AS newer
+           WHERE newer.seq > submitted.seq AND json_extract(newer.body, '$.action.type') = 'submit_spelling'
+         )`,
+      )
+      .get(z.uuid().parse(requestId).toLowerCase());
+    if (!row) return null;
+    const event = z
+      .object({ action: miniActionSchema, occurredAt: z.number(), actor: z.literal('user') })
+      .safeParse(JSON.parse(z.object({ body: z.string() }).parse(row).body));
+    if (
+      !event.success ||
+      event.data.action.type !== 'submit_spelling' ||
+      !event.data.action.advanceAfterCorrect
+    )
+      return null;
+    return { action: event.data.action, occurredAt: event.data.occurredAt };
   }
   private atomic<T>(operation: () => T): T {
     this.db.exec('BEGIN IMMEDIATE');
@@ -683,6 +1007,8 @@ export class MiniStore {
         [...state.ledger.days].reverse().find((day) => day.phase !== 'finished')?.id ??
         state.ledger.days.at(-1)?.id ??
         null;
+      groupPendingMiniReviews(state, swiftTime(this.now()), input.timezone ?? this.timezone);
+      validateMiniFacts(state);
       validateMiniPlanning(state);
       validateMiniTeaching(state);
       validateMiniScheduling(state);
@@ -746,6 +1072,8 @@ export class MiniStore {
     });
     return this.atomic(() => {
       if (this.replay(input.requestId, hash)) return this.snapshot();
+      if (actor === 'ai' && input.action.type === 'qualitative_feedback')
+        miniNewFeedbackActionSchema.parse(input.action);
       if (
         actor === 'ai' &&
         (input.action.type === 'remember_preference' ||
@@ -760,7 +1088,13 @@ export class MiniStore {
       const state = this.snapshot();
       if (!state.imported)
         throw new LearningError('MINI_IMPORT_REQUIRED', '请先迁入原有学习记录。');
-      if (state.revision !== input.expectedRevision)
+      // A delayed hide describes a past observation. closeVisible checks both the
+      // word and its last displayed time before changing the current card.
+      const delayedHide =
+        input.action.type === 'hide_card' &&
+        input.occurredAt !== undefined &&
+        input.expectedRevision < state.revision;
+      if (state.revision !== input.expectedRevision && !delayedHide)
         throw new LearningError('MINI_REVISION_CONFLICT', '学习进度已更新，请刷新后重试。');
       const before = JSON.stringify(state);
       // This snapshot passed full validation when opened. Trusted mutators only
@@ -777,16 +1111,53 @@ export class MiniStore {
         input.action.type === 'begin' || actor === 'ai' || input.action.type === 'record_exposure'
           ? receivedAt
           : (input.occurredAt ?? receivedAt);
-      const measurement = applyMiniMeasurementAction(state, input.action, occurredAt, receivedAt);
+      const action = input.action;
+      if (
+        action.target === 'daily' &&
+        'dayId' in action &&
+        action.dayId &&
+        ![
+          'begin',
+          'qualitative_feedback',
+          'record_feedback',
+          'create_focus',
+          'update_focus',
+          'close_dictation',
+        ].includes(action.type)
+      ) {
+        const day = state.ledger.days.find((item) => item.id === action.dayId);
+        if (
+          day &&
+          !isMiniDayOnDate(day, localDay(unixDate(occurredAt), day.timezone ?? this.timezone))
+        )
+          throw new LearningError('MINI_PLAN_CONFLICT', '已进入新的一天，请开始今天的学习。');
+      }
+      const reviewSession =
+        input.action.type === 'complete_review' ? currentMiniPlanSession(state) : undefined;
+      const measurement = applyMiniMeasurementAction(
+        state,
+        input.action,
+        occurredAt,
+        receivedAt,
+        input.requestId.toLowerCase(),
+      );
       if (!measurement) {
         if (!applyMiniTeachingAction(state, input.action, occurredAt))
-          applyMiniPlannedAction(state, input.action, occurredAt, receivedAt, this.timezone);
+          applyMiniPlannedAction(
+            state,
+            input.action,
+            occurredAt,
+            receivedAt,
+            this.timezone,
+            input.requestId,
+          );
       }
       observeMiniFlowScheduling(state, receivedAt);
-      enforceMiniDueGate(state, input.action, receivedAt);
+      enforceMiniDueGate(state, input.action, receivedAt, this.timezone, reviewSession);
       if (!measurement) observeMiniLearningCommand(state, input.action, occurredAt);
       this.captureAssessmentSubmission(state, input.action);
-      this.freezeAssessments(state);
+      this.freezeAssessments(state, input.action);
+      this.freezeTranslationRevision(state, input.action, occurredAt);
       validateMiniFacts(state);
       validateMiniPlanning(state);
       validateMiniTeaching(state);

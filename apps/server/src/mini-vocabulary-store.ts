@@ -15,6 +15,7 @@ import {
   type MiniVocabularyOrder,
   type MiniVocabularySnapshot,
   type MiniWord,
+  type MiniLedger,
 } from '@lingoweave/contracts';
 import { LearningError } from './learning-store.js';
 import { wordKey } from './mini-study.js';
@@ -35,6 +36,34 @@ const stateSchema = z.object({
 type State = z.infer<typeof stateSchema>;
 const levels = ['A1', 'A2', 'B1', 'B2'] as const;
 const bodySchema = z.object({ body: z.string() });
+
+type BookIndex = { id: string; keys: ReadonlySet<string> };
+
+export function miniCompletedWordKeys(ledger: MiniLedger) {
+  const learned = new Set<string>();
+  for (const day of ledger.days) {
+    if (day.flow) {
+      for (const item of day.flow.completed) learned.add(wordKey(item.word));
+    } else if (day.phase === 'finished') {
+      for (const word of day.learningWords) learned.add(wordKey(word));
+    } else if (day.translationIndex > 0) {
+      // Legacy days advanced each translation index after feedback and explicit confirmation.
+      const newWords = new Set(day.learningWords.map(wordKey));
+      for (const attempt of day.translation.slice(0, day.translationIndex)) {
+        const key = wordKey(attempt.task.sentence.word);
+        if (newWords.has(key)) learned.add(key);
+      }
+    }
+  }
+  return learned;
+}
+export function miniWordProgress(ledger: MiniLedger, deck: MiniWord[], book?: BookIndex | null) {
+  const learned = miniCompletedWordKeys(ledger);
+  const keys = book?.keys ?? new Set(deck.map(wordKey));
+  let completed = 0;
+  for (const key of learned) if (keys.has(key)) completed++;
+  return { lifetime: learned.size, bookId: book?.id ?? null, completed, total: keys.size };
+}
 
 function words(
   collection: z.infer<typeof collectionSchema>,
@@ -63,6 +92,7 @@ function words(
 export class MiniVocabularyStore {
   private readonly db: DatabaseSync;
   private closed = false;
+  private bookIndex?: { version: number; book: BookIndex | null };
 
   constructor(filename: string) {
     if (filename !== ':memory:') mkdirSync(dirname(filename), { recursive: true, mode: 0o700 });
@@ -121,6 +151,37 @@ export class MiniVocabularyStore {
           .body,
       ),
     );
+  }
+
+  dataMetrics() {
+    const state = this.state();
+    return {
+      books: state.collections.length,
+      entries: state.collections.reduce((sum, collection) => sum + collection.entries.length, 0),
+    };
+  }
+
+  activeBookIndex() {
+    // Plan previews are read after every card. Rebuild book membership only when vocabulary changes.
+    const version = z
+      .object({ data_version: z.number() })
+      .parse(this.db.prepare('PRAGMA data_version').get()).data_version;
+    if (this.bookIndex?.version === version) return this.bookIndex.book;
+    const state = this.state();
+    const collection =
+      state.collections.find((item) => item.id === state.activeDeckId) ??
+      state.collections.find((item) =>
+        levels.some(
+          (level) =>
+            state.activeDeckId === item.id + '-' + level.toLowerCase() &&
+            item.entries.some((entry) => entry.level === level),
+        ),
+      );
+    const book = collection
+      ? { id: collection.id, keys: new Set(collection.entries.map((entry) => wordKey(entry.word))) }
+      : null;
+    this.bookIndex = { version, book };
+    return book;
   }
 
   snapshot(): MiniVocabularySnapshot {
@@ -247,6 +308,7 @@ export class MiniVocabularyStore {
       }
       const snapshot = this.snapshot();
       this.db.exec('COMMIT');
+      this.bookIndex = undefined;
       return snapshot;
     } catch (error) {
       this.db.exec('ROLLBACK');

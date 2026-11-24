@@ -109,6 +109,11 @@ struct MiniTranslationTask: Codable, Equatable, Sendable, Identifiable {
 }
 
 struct MiniTranslationAttempt: Codable, Equatable, Sendable, Identifiable {
+    struct Revision: Codable, Equatable, Sendable {
+        let id: UUID
+        let answer: String
+        let submittedAt: Date
+    }
     let id: UUID
     let task: MiniTranslationTask
     let answer: String
@@ -116,8 +121,15 @@ struct MiniTranslationAttempt: Codable, Equatable, Sendable, Identifiable {
     fileprivate(set) var feedback: MiniTranslationFeedback?
     fileprivate(set) var gradedAt: Date?
     var confirmedAt: Date? = nil
+    var revisions: [Revision]? = nil
 
     var taskID: String { task.id }
+    var latestID: UUID { revisions?.last?.id ?? id }
+    var latestAnswer: String { revisions?.last?.answer ?? answer }
+
+    static func draftKey(taskId: String, revision: UUID? = nil) -> String {
+        "translation/" + taskId + (revision.map { "/revision/" + $0.uuidString.lowercased() } ?? "")
+    }
 }
 
 struct MiniStudyExposure: Codable, Equatable, Sendable {
@@ -141,16 +153,6 @@ struct MiniDailySchedule: Codable, Equatable, Sendable {
     let recordedAt: Date
     let source: Source
     let policyVersion: Int
-}
-
-private struct MiniDailyWordKey: Hashable {
-    let spelling: String
-    let meaning: String
-
-    init(_ word: MiniWord) {
-        spelling = word.spelling.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        meaning = word.meaning.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
 }
 
 struct MiniMemoryRounds: Codable, Equatable, Sendable {
@@ -210,6 +212,7 @@ struct MiniDailyDay: Codable, Equatable, Sendable, Identifiable {
 
     let id: String
     let startedAt: Date
+    var archivedAt: Date? = nil
     var writingRequired: Bool? = nil
     var writingPrompts: [MiniWritingPrompt]? = nil
     var writingMode: String? = nil
@@ -217,9 +220,9 @@ struct MiniDailyDay: Codable, Equatable, Sendable, Identifiable {
     var memory: MiniMemoryRounds? = nil
     var flow: MiniLearningFlow? = nil
     let reviewWords: [MiniWord]
-    let learningWords: [MiniWord]
+    private(set) var learningWords: [MiniWord]
     private let reviewSteps: [Int]
-    private let directions: [MiniTranslationDirection]
+    private var directions: [MiniTranslationDirection]
     var review: MiniReviewSession?
     var learning: MiniReviewSession?
     private(set) var paused = false
@@ -268,8 +271,10 @@ struct MiniDailyDay: Codable, Equatable, Sendable, Identifiable {
         }
     }
 
+    var preparationWords: [MiniWord] { flow?.candidates ?? learningWords }
+
     var wordsToPrepare: [MiniWord] {
-        (flow?.candidates ?? learningWords).filter { word in !sentences.contains { $0.word == word } }
+        preparationWords.filter { word in !sentences.contains { $0.word == word } }
     }
 
     var nextUnstudiedWord: MiniWord? {
@@ -284,6 +289,74 @@ struct MiniDailyDay: Codable, Equatable, Sendable, Identifiable {
         if phase == .review { return review?.relearning?.visit == nil ? nil : review?.relearning }
         guard phase == .learning, let flow, flow.groupWords.count < flow.groupTarget else { return nil }
         return flow.window.visit == nil ? nil : flow.window
+    }
+
+    @discardableResult
+    mutating func updateWindowVisit(_ visit: MiniMemoryWindow.Visit) -> Bool {
+        guard memoryWindow?.visit?.id == visit.id else { return false }
+        if phase == .review { review?.relearning?.visit = visit }
+        else { flow?.window.visit = visit }
+        return true
+    }
+
+    /// Apply an unacknowledged input only to a presentation copy. The same request UUID
+    /// names its successor in SQLite, so rapid answers retain the actual visit identity.
+    @discardableResult
+    mutating func advanceWindow(visitId: UUID, nextId: UUID, remembered: Bool?, markWrong: Bool,
+                                familiar: Bool, draft: String?, at: Date) -> Bool {
+        guard !paused, var flow, var window = memoryWindow, let visit = window.visit,
+              visit.id == visitId,
+              phase == .review || sentences.contains(where: { MiniDailyWordKey($0.word) == MiniDailyWordKey(visit.word) }),
+              !familiar || (phase == .learning && visit.stage == 0 && visit.initial == nil && remembered == nil),
+              let event = window.finish(remembered: remembered, markWrong: markWrong, familiar: familiar, draft: draft, at: at)
+        else { return false }
+        let passed = familiar || (event.stage == 2 && event.remembered)
+        if phase == .review {
+            guard var session = review else { return false }
+            let passedWords = Set(window.events.filter { $0.stage == 2 && $0.remembered }.map { MiniDailyWordKey($0.word) })
+            var firstAdded: MiniWord?
+            for word in session.relearningWords ?? [] {
+                if window.members.count >= window.size { break }
+                let key = MiniDailyWordKey(word)
+                if passedWords.contains(key) || window.members.contains(where: { MiniDailyWordKey($0.word) == key }) { continue }
+                window.admit(word, at: at)
+                firstAdded = firstAdded ?? word
+            }
+            window.selectNext(id: nextId, preferred: passed ? firstAdded : nil, at: at)
+            session.relearning = window
+            if window.members.isEmpty { session.startWindowSpelling(seed: nextId) }
+            review = session
+            return true
+        }
+        if passed {
+            flow.groupWords.append(event.word)
+            studiedWords.append(.init(word: event.word, at: at))
+        }
+        let reachedTarget = !flow.groupWords.isEmpty && flow.groupWords.count >= flow.groupTarget
+        var firstAdded: MiniWord?
+        if passed && !reachedTarget {
+            while window.members.count < window.size, flow.candidateIndex < flow.candidates.count {
+                let word = flow.candidates[flow.candidateIndex]
+                flow.candidateIndex += 1
+                if learningWords.contains(where: { MiniDailyWordKey($0) == MiniDailyWordKey(word) }) { continue }
+                window.admit(word, at: at)
+                learningWords.append(word)
+                firstAdded = firstAdded ?? word
+            }
+        }
+        if reachedTarget || window.members.isEmpty {
+            learning = MiniReviewSession(windowWords: flow.groupWords, seed: nextId)
+            for word in flow.groupWords {
+                flow.translationWords.append(word)
+                directions.append(flow.translationWords.count.isMultiple(of: 2) ? .chineseToEnglish : .englishToChinese)
+            }
+            learningStartedAt = learningStartedAt ?? at
+        } else {
+            window.selectNext(id: nextId, preferred: firstAdded, at: at)
+        }
+        flow.window = window
+        self.flow = flow
+        return true
     }
 
     var memoryShowsFullCard: Bool {
@@ -373,12 +446,36 @@ struct MiniDailyDay: Codable, Equatable, Sendable, Identifiable {
     }
 
     var currentTranslation: MiniTranslationTask? {
-        guard phase == .translation, translationIndex < translationCount,
-              directions.indices.contains(translationIndex) else { return nil }
-        let taskID = "\(id)/\(translationIndex)"
+        translationTask(at: translationIndex)
+    }
+
+    var translationGroupStart: Int { flow?.groups.reduce(0) { $0 + $1.words.count } ?? 0 }
+
+    func translationPageIndex(selection: String?) -> Int {
+        guard let selection, let suffix = selection.split(separator: "/").last, let index = Int(suffix),
+              selection == "\(id)/\(index)", index >= translationGroupStart, index < translationIndex,
+              phase == .translation else { return translationIndex }
+        return index
+    }
+
+    func pendingTranslationEdit(in drafts: [String: String]) -> Int? {
+        guard phase == .translation, translationGroupStart <= translationIndex else { return nil }
+        return (translationGroupStart...translationIndex).first { index in
+            let taskID = "\(id)/\(index)"
+            guard let attempt = translation.last(where: { $0.taskID == taskID }),
+                  let draft = drafts[MiniTranslationAttempt.draftKey(taskId: taskID, revision: attempt.latestID)]
+            else { return false }
+            return draft != attempt.latestAnswer
+        }
+    }
+
+    func translationTask(at index: Int) -> MiniTranslationTask? {
+        guard phase == .translation, index >= translationGroupStart, index <= translationIndex,
+              index < translationCount, directions.indices.contains(index) else { return nil }
+        let taskID = "\(id)/\(index)"
         if let attempt = translation.last(where: { $0.taskID == taskID }) { return attempt.task }
-        let word = (flow?.translationWords ?? (reviewWords + learningWords))[translationIndex]
-        let direction = directions[translationIndex]
+        let word = (flow?.translationWords ?? (reviewWords + learningWords))[index]
+        let direction = directions[index]
         if let prompt = writingPrompts?.last(where: { $0.sentence.word == word && $0.direction == direction }) {
             return MiniTranslationTask(id: taskID, sentence: prompt.sentence, direction: direction,
                                        materialId: prompt.id, focusIds: prompt.focusIds)
@@ -468,6 +565,16 @@ struct MiniDailyDay: Codable, Equatable, Sendable, Identifiable {
         return attempt.id
     }
 
+    #if DEBUG
+    mutating func revisePreviewTranslation(attempt: MiniTranslationAttempt, answer: String) -> Bool {
+        guard let index = translation.firstIndex(where: { $0.latestID == attempt.latestID }),
+              !answer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, answer.count <= 4_000 else { return false }
+        translation[index].revisions = (translation[index].revisions ?? [])
+            + [.init(id: UUID(), answer: answer, submittedAt: .now)]
+        return true
+    }
+    #endif
+
     @discardableResult
     mutating func gradeTranslation(
         id: UUID,
@@ -524,43 +631,59 @@ struct MiniTodayActivity: Equatable, Sendable {
     let reviewedWords: Int
     let writingAnswers: Int
 
-    init(ledger: MiniDailyLedger, now: Date = .now, calendar: Calendar = .current) {
+    private struct Facts {
         var learned = Set<MiniDailyWordKey>()
         var completed = Set<MiniDailyWordKey>()
         var reviewed = Set<MiniDailyWordKey>()
         var writing = Set<UUID>()
-        func isToday(_ time: Date) -> Bool {
-            time <= now && calendar.isDate(time, inSameDayAs: now)
+    }
+
+    private init(_ facts: Facts, tracksCompletions: Bool) {
+        learnedWords = facts.learned.count
+        completedNewWords = tracksCompletions ? facts.completed.count : nil
+        reviewedWords = facts.reviewed.count
+        writingAnswers = facts.writing.count
+    }
+
+    init(ledger: MiniDailyLedger, now: Date = .now, calendar: Calendar = .current) {
+        let start = calendar.startOfDay(for: now)
+        self = Self.byDay(ledger: ledger, from: start, through: now, calendar: calendar)[start]
+            ?? Self(Facts(), tracksCompletions: ledger.days.contains { $0.flow != nil })
+    }
+
+    static func byDay(ledger: MiniDailyLedger, from start: Date, through now: Date, calendar: Calendar) -> [Date: Self] {
+        var buckets: [Date: Facts] = [:]
+        func record(_ time: Date, _ update: (inout Facts) -> Void) {
+            guard time >= start, time <= now else { return }
+            update(&buckets[calendar.startOfDay(for: time), default: Facts()])
         }
         for day in ledger.days {
-            for item in day.flow?.completed ?? [] where isToday(item.at) {
-                completed.insert(MiniDailyWordKey(item.word))
+            for item in day.flow?.completed ?? [] {
+                record(item.at) { $0.completed.insert(MiniDailyWordKey(item.word)) }
             }
-            for exposure in day.studiedWords where isToday(exposure.at) {
-                learned.insert(MiniDailyWordKey(exposure.word))
+            for exposure in day.studiedWords {
+                record(exposure.at) { $0.learned.insert(MiniDailyWordKey(exposure.word)) }
             }
             if let review = day.review {
-                for event in review.relearning?.events ?? [] where isToday(event.confirmedAt) {
-                    reviewed.insert(MiniDailyWordKey(event.word))
+                for event in review.relearning?.events ?? [] {
+                    record(event.confirmedAt) { $0.reviewed.insert(MiniDailyWordKey(event.word)) }
                 }
-                if let visit = review.relearning?.visit, let selectedAt = visit.selectedAt, isToday(selectedAt) {
-                    reviewed.insert(MiniDailyWordKey(visit.word))
+                if let visit = review.relearning?.visit, let selectedAt = visit.selectedAt {
+                    record(selectedAt) { $0.reviewed.insert(MiniDailyWordKey(visit.word)) }
                 }
-                for event in review.judgmentEvents where isToday(event.selectedAt) {
-                    reviewed.insert(MiniDailyWordKey(event.word))
+                for event in review.judgmentEvents {
+                    record(event.selectedAt) { $0.reviewed.insert(MiniDailyWordKey(event.word)) }
                 }
-                for attempt in review.spellingAttempts where isToday(attempt.submittedAt) {
-                    reviewed.insert(MiniDailyWordKey(attempt.word))
+                for attempt in review.spellingAttempts {
+                    record(attempt.submittedAt) { $0.reviewed.insert(MiniDailyWordKey(attempt.word)) }
                 }
             }
-            for attempt in day.translation where isToday(attempt.submittedAt) {
-                writing.insert(attempt.id)
+            for attempt in day.translation {
+                record(attempt.submittedAt) { $0.writing.insert(attempt.id) }
             }
         }
-        learnedWords = learned.count
-        completedNewWords = ledger.days.contains { $0.flow != nil } ? completed.count : nil
-        reviewedWords = reviewed.count
-        writingAnswers = writing.count
+        let tracksCompletions = ledger.days.contains { $0.flow != nil }
+        return buckets.mapValues { Self($0, tracksCompletions: tracksCompletions) }
     }
 }
 
@@ -569,7 +692,9 @@ struct MiniDailyLedger: Codable, Equatable, Sendable {
 
     @discardableResult
     mutating func beginOrResume(deck: [MiniWord], at: Date = .now, calendar: Calendar = .current, memoryRounds: Bool = false) -> MiniDailyDay {
-        if let pending = days.last(where: { $0.phase != .finished }) { return pending }
+        if let pending = days.last(where: { $0.phase != .finished && $0.archivedAt == nil && calendar.isDate($0.startedAt, inSameDayAs: at) }) {
+            return pending
+        }
         let parts = calendar.dateComponents([.year, .month, .day], from: at)
         let id = String(format: "%04d-%02d-%02d", parts.year ?? 0, parts.month ?? 0, parts.day ?? 0)
         let existingIndex = days.lastIndex { $0.id == id }

@@ -92,6 +92,7 @@ const app = buildApp({
     ? {
         mini: {
           store: miniStore,
+          dataDirectory,
           ai: miniAi,
           ...(miniAssessment ? { assessment: miniAssessment } : {}),
           ...(miniAudio ? { audio: miniAudio } : {}),

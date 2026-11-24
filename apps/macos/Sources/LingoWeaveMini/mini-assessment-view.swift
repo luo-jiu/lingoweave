@@ -42,11 +42,11 @@ struct MiniAssessmentHomeView: View {
                         Text("学习评价")
                         Spacer(minLength: 3)
                         if snapshot.processingCount > 0 {
-                            Text("\(snapshot.processingCount) 词处理中").foregroundStyle(.secondary)
+                            Text("\(snapshot.processingCount) 项处理中").foregroundStyle(.secondary)
                             ProgressView().controlSize(.mini)
                         } else { Text("查看记录").foregroundStyle(.secondary) }
                         if snapshot.failedCount > 0 {
-                            Text("\(snapshot.failedCount) 词待重试").foregroundStyle(.orange)
+                            Text("\(snapshot.failedCount) 项待重试").foregroundStyle(.orange)
                         }
                     }
                 }
@@ -73,14 +73,14 @@ struct MiniAssessmentHomeView: View {
                 Button("收起") { self.detail = nil }.buttonStyle(.plain)
             }
             Text(detail.source.question.direction == .englishToChinese ? detail.source.question.english : detail.source.question.chinese)
-            Text("原答：" + detail.source.answer)
+            labeledTranslation("原答：", detail.source.answer)
             if let application = detail.application {
                 Text(application.result.summary)
                 Text("词义：" + application.result.meaning.explanation)
                 Text("拼写：" + application.result.spelling.explanation)
                 Text("用法：" + application.result.usage.explanation)
                 if !application.result.referenceTranslation.isEmpty {
-                    Text("参考：" + application.result.referenceTranslation)
+                    labeledTranslation("参考：", application.result.referenceTranslation)
                 }
                 if !application.result.uncertainties.isEmpty {
                     Text(application.result.uncertainties.joined(separator: "；")).foregroundStyle(.secondary)
@@ -111,6 +111,13 @@ struct MiniAssessmentHomeView: View {
         }
         .textSelection(.enabled)
         .accessibilityIdentifier("assessmentAudit")
+    }
+
+    private func labeledTranslation(_ label: String, _ translation: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 0) {
+            Text(label).fixedSize()
+            Text(translation).miniTranslationPrivacy()
+        }
     }
 
     @MainActor

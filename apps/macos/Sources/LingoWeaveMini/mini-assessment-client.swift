@@ -87,6 +87,16 @@ struct MiniAssessmentDetail: Decodable, Sendable {
 
 struct MiniAssessmentClient: Sendable {
     let study: MiniStudyClient
+    func translations(date: String, timezone: String) async throws -> MiniTranslationReview {
+        try await study.serviceRequest(path: "translations/review", body: nil, query: [
+            URLQueryItem(name: "date", value: date), URLQueryItem(name: "timezone", value: timezone)
+        ])
+    }
+    func gradeMissing(date: String, timezone: String) async throws -> MiniTranslationReview {
+        struct Request: Encodable { let date: String; let timezone: String }
+        return try await study.serviceRequest(path: "translations/review/grade-missing",
+            body: JSONEncoder().encode(Request(date: date, timezone: timezone)))
+    }
     func snapshot() async throws -> MiniAssessmentSnapshot {
         try await study.serviceRequest(path: "assessments/snapshot", body: nil)
     }
@@ -97,6 +107,99 @@ struct MiniAssessmentClient: Sendable {
         struct Request: Encodable { let requestId: String; let jobId: String }
         return try await study.serviceRequest(path: "assessments/retry", body: JSONEncoder().encode(
             Request(requestId: requestId.uuidString.lowercased(), jobId: id.uuidString.lowercased())))
+    }
+}
+
+struct MiniTranslationReview: Decodable, Sendable {
+    enum ExpressionGrade: String, Decodable, Sendable {
+        case natural, understandable
+        case offMeaning = "off_meaning"
+    }
+    enum Verdict: String {
+        case correct = "翻译正确", natural = "表达地道", understandable = "可以润色", offMeaning = "偏离原意"
+        var description: String {
+            switch self {
+            case .correct: "译文传达了原文的意思。"
+            case .natural: "表达自然，保持这样的写法即可。"
+            case .understandable: "意思传达清楚，措辞还可以更自然。"
+            case .offMeaning: "译文偏离原意，需要重新对照原题。"
+            }
+        }
+    }
+    enum ExpressionGradeStatus: String, Decodable, Sendable { case queued, failed }
+
+    struct Commentary: Decodable, Sendable {
+        let summary: String
+        let strengths: [String]
+        let improvements: [String]
+        let keyPoints: [String]
+        let referenceTranslation: String
+    }
+
+    struct Entry: Decodable, Identifiable, Sendable {
+        enum Status: String, Decodable, Sendable {
+            case submitted, queued, running, failed, ready
+
+            var label: String {
+                switch self {
+                case .submitted: "已提交"
+                case .queued: "等待点评"
+                case .running: "点评中"
+                case .failed: "待重试"
+                case .ready: "已点评"
+                }
+            }
+        }
+        let attemptId: UUID
+        let word: MiniWord
+        let direction: MiniTranslationDirection
+        let question: String
+        let answer: String
+        let submittedAt: Date
+        let status: Status
+        let commentary: Commentary?
+        let retryJobId: UUID?
+        var expressionGrade: ExpressionGrade? = nil
+        var expressionGradeStatus: ExpressionGradeStatus? = nil
+        var id: UUID { attemptId }
+        var directionLabel: String { direction == .englishToChinese ? "英译中" : "中译英" }
+        var verdict: Verdict? {
+            switch expressionGrade {
+            case .natural: direction == .englishToChinese ? .correct : .natural
+            case .understandable: direction == .englishToChinese ? nil : .understandable
+            case .offMeaning: .offMeaning
+            case nil: nil
+            }
+        }
+        var needsMeaningGrade: Bool {
+            direction == .englishToChinese && status == .ready && verdict == nil
+        }
+        var visibleCommentary: Commentary? { needsMeaningGrade ? nil : commentary }
+        var alternativeChineseTranslation: String? {
+            guard verdict == .correct, let reference = visibleCommentary?.referenceTranslation else { return nil }
+            let ignored = CharacterSet.punctuationCharacters.union(.whitespacesAndNewlines)
+            let letters = reference.unicodeScalars.filter { !ignored.contains($0) }
+            let original = answer.unicodeScalars.filter { !ignored.contains($0) }
+            guard !letters.isEmpty, !letters.elementsEqual(original) else { return nil }
+            return reference
+        }
+        var canGradeExpression: Bool {
+            status == .ready && verdict == nil && expressionGradeStatus != .queued
+        }
+    }
+    let date: String
+    let timezone: String
+    let entries: [Entry]
+    var processing: Bool {
+        entries.contains { $0.status == .queued || $0.status == .running || $0.expressionGradeStatus == .queued }
+    }
+    var retryableJobs: [UUID] { entries.filter { $0.status == .failed }.compactMap(\.retryJobId) }
+
+    static func dateKey(_ date: Date, timezone: TimeZone) -> String {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = timezone
+        let parts = calendar.dateComponents([.year, .month, .day], from: date)
+        return String(format: "%04d-%02d-%02d", parts.year ?? 0, parts.month ?? 0, parts.day ?? 0)
     }
 }
 

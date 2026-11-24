@@ -41,7 +41,7 @@ struct MiniAudioPresentation: Equatable, Sendable {
 }
 
 enum MiniAudioPreparationStatus: Sendable {
-    case waiting, requesting, queued, running, ready, failed
+    case waiting, requesting, queued, running, retrying, ready, failed
 }
 
 struct MiniAudioPreparationItem: Identifiable, Sendable {
@@ -58,59 +58,24 @@ struct MiniAudioPreparationProgress: Sendable {
     var total: Int { items.count }
     var ready: Int { items.filter { $0.status == .ready }.count }
     var failed: Int { items.filter { $0.status == .failed }.count }
-    var inProgress: Int { items.filter { $0.status == .requesting || $0.status == .queued || $0.status == .running }.count }
+    var inProgress: Int { items.filter { $0.status == .requesting || $0.status == .queued || $0.status == .running || $0.status == .retrying }.count }
     var isReady: Bool { ready == total }
     var error: String? { items.first { $0.error != nil }?.error }
-}
-
-@MainActor
-protocol MiniAudioPlaying: AnyObject {
-    var onFinish: ((Bool) -> Void)? { get set }
-    func play(_ data: Data) throws -> Bool
-    func stop()
-}
-
-@MainActor
-final class MiniAudioPlayer: NSObject, MiniAudioPlaying, @preconcurrency AVAudioPlayerDelegate {
-    var onFinish: ((Bool) -> Void)?
-    private var player: AVAudioPlayer?
-
-    func play(_ data: Data) throws -> Bool {
-        stop()
-        let next = try AVAudioPlayer(data: data)
-        next.delegate = self
-        next.prepareToPlay()
-        player = next
-        return next.play()
-    }
-
-    func stop() { player?.stop(); player = nil }
-    func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
-        guard self.player === player else { return }
-        self.player = nil
-        onFinish?(flag)
-    }
-    func audioPlayerDecodeErrorDidOccur(_ player: AVAudioPlayer, error: (any Error)?) {
-        guard self.player === player else { return }
-        self.player = nil
-        onFinish?(false)
-    }
-}
-
-enum MiniAudioFailure: LocalizedError {
-    case interrupted, notReady, playback
-    var errorDescription: String? {
-        switch self {
-        case .interrupted: "这条音频尚未生成成功，可以重播或重新生成。"
-        case .notReady: "这条音频等待较久，生成任务仍保留，可稍后重播。"
-        case .playback: "音频暂时无法播放，可以重新生成这一条。"
-        }
-    }
 }
 
 /// Controls a card visit and playback only. Assets and learning facts stay on the service.
 @MainActor
 final class MiniAudioController: ObservableObject {
+    private enum SpellingResult {
+        case saved(UUID)
+        case preview
+
+        var submissionId: UUID? {
+            if case .saved(let id) = self { return id }
+            return nil
+        }
+    }
+
     @Published private(set) var busyTarget: MiniAudioTarget?
     @Published private(set) var playingTarget: MiniAudioTarget?
     @Published private(set) var notice: String?
@@ -124,6 +89,7 @@ final class MiniAudioController: ObservableObject {
     private let pollNanoseconds: UInt64
     private let maximumPolls: Int
     private let sentenceDelayNanoseconds: UInt64
+    private let preparationRetryDelay: Duration
     private var presentation: MiniAudioPresentation?
     private var visitId = UUID()
     private var autoAttempted = false
@@ -131,6 +97,7 @@ final class MiniAudioController: ObservableObject {
     private var muted = false
     private var operation = UUID()
     private var automaticNextTarget: MiniAudioTarget?
+    private var playingSpellingResult = false
     private var task: Task<Void, Never>?
     private var receiptTask: Task<Void, Never>?
     private var receiptToken = UUID()
@@ -143,20 +110,27 @@ final class MiniAudioController: ObservableObject {
 
     init(client: any MiniAudioServing = MiniAudioClient(), player: (any MiniAudioPlaying)? = nil,
          recovery: MiniAudioRecovery = MiniAudioRecovery(), pollNanoseconds: UInt64 = 400_000_000,
-         maximumPolls: Int = 900, sentenceDelayNanoseconds: UInt64 = 500_000_000) {
+         maximumPolls: Int = 900, sentenceDelayNanoseconds: UInt64 = 500_000_000,
+         preparationRetryDelay: Duration = .seconds(1)) {
         self.client = client
         self.player = player ?? MiniAudioPlayer()
         self.recovery = recovery
         self.pollNanoseconds = pollNanoseconds
         self.maximumPolls = maximumPolls
         self.sentenceDelayNanoseconds = sentenceDelayNanoseconds
+        self.preparationRetryDelay = preparationRetryDelay
+    }
+
+    func setVolume(_ volume: Double) {
+        player.setVolume(volume)
     }
 
     func update(_ next: MiniAudioPresentation?, visible: Bool, muted: Bool,
                 refresh: @escaping (Int?) async throws -> Void) {
         self.refresh = refresh
         let identityChanged = presentation?.id != next?.id || presentation?.preview != next?.preview
-        let becameUnavailable = !visible || muted || next?.enabled != true
+        let enabled = next?.enabled ?? playingSpellingResult
+        let becameUnavailable = !visible || muted || !enabled
         if identityChanged || becameUnavailable { stop() }
         self.visible = visible
         self.muted = muted
@@ -193,11 +167,15 @@ final class MiniAudioController: ObservableObject {
         }
     }
 
+    func preparationItem(for target: MiniAudioTarget, scope: String?) -> MiniAudioPreparationItem {
+        if scope == nil || preparationScope == scope, let item = preparationItems[target.requestKey] { return item }
+        return MiniAudioPreparationItem(target: target, status: .waiting)
+    }
+
     func preparationProgress(for targets: [MiniAudioTarget], scope: String? = nil) -> MiniAudioPreparationProgress {
         var seen = Set<String>()
         let items = targets.filter { seen.insert($0.requestKey).inserted }.map { target in
-            if scope == nil || preparationScope == scope, let item = preparationItems[target.requestKey] { return item }
-            return MiniAudioPreparationItem(target: target, status: .waiting)
+            preparationItem(for: target, scope: scope)
         }
         return MiniAudioPreparationProgress(items: items)
     }
@@ -214,53 +192,74 @@ final class MiniAudioController: ObservableObject {
 
     private func startPreparation(_ target: MiniAudioTarget) {
         let key = target.requestKey, token = prefetchToken
-        preparationItems[key] = MiniAudioPreparationItem(target: target, status: .waiting)
+        preparationItems[key] = MiniAudioPreparationItem(target: target, status: busyTarget == nil ? .requesting : .waiting)
         preparationTasks[key] = Task { [weak self] in
             guard let self else { return }
             defer { if prefetchToken == token { preparationTasks[key] = nil } }
-            do {
-                // A card's immediate playback request gets to enter the service queue first.
-                // Each remaining target then enqueues independently of long-running jobs.
-                while busyTarget != nil {
-                    try Task.checkCancellation()
-                    try await Task.sleep(nanoseconds: pollNanoseconds)
-                }
-                try checkPreparation(token)
-                preparationItems[key]?.status = .requesting
-                let result = try await client.request(MiniAudioRequest(target: target))
-                try checkPreparation(token)
-                if let asset = result.asset {
-                    preparationItems[key] = MiniAudioPreparationItem(target: target, status: .ready, asset: asset)
+            var request = MiniAudioRequest(target: target)
+            let maximumRetries = 3
+            for attempt in 0...maximumRetries {
+                do {
+                    try await prepareAudio(request, key: key, token: token)
                     return
-                }
-                guard var job = result.job else { throw MiniAudioFailure.interrupted }
-                while true {
-                    try checkPreparation(token)
-                    preparationItems[key]?.job = job
-                    switch job.status {
-                    case .queued: preparationItems[key]?.status = .queued
-                    case .running: preparationItems[key]?.status = .running
-                    case .completed:
-                        guard let assetId = job.assetId else { throw MiniStudyClientError.invalidResponse }
-                        let snapshot = try await client.snapshot()
-                        try checkPreparation(token)
-                        guard let asset = snapshot.assets.first(where: { $0.id == assetId }) else {
-                            throw MiniStudyClientError.invalidResponse
-                        }
-                        preparationItems[key] = MiniAudioPreparationItem(target: target, status: .ready, job: job, asset: asset)
+                } catch {
+                    guard !Task.isCancelled, prefetchToken == token else { return }
+                    guard attempt < maximumRetries else {
+                        preparationItems[key]?.status = .failed
+                        preparationItems[key]?.error = error.localizedDescription
                         return
-                    case .failed, .interrupted:
-                        throw MiniStudyClientError.service(job.error ?? "音频生成中断，可以重试缺少的音频。")
                     }
-                    try await Task.sleep(nanoseconds: pollNanoseconds)
-                    job = try await client.job(job.id)
+                    // A replay of a confirmed terminal job would replay its failure. For an
+                    // uncertain HTTP outcome the same request ID resumes the original work.
+                    if let status = preparationItems[key]?.job?.status, status == .failed || status == .interrupted {
+                        request = MiniAudioRequest(target: target)
+                    }
+                    preparationItems[key]?.status = .retrying
+                    do { try await Task.sleep(for: preparationRetryDelay * (1 << attempt)) }
+                    catch { return }
                 }
-            } catch is CancellationError { return }
-            catch {
-                guard prefetchToken == token, !Task.isCancelled else { return }
-                preparationItems[key]?.status = .failed
-                preparationItems[key]?.error = error.localizedDescription
             }
+        }
+    }
+
+    private func prepareAudio(_ request: MiniAudioRequest, key: String, token: UUID) async throws {
+        // A foreground playback request enters the service queue before background targets.
+        while busyTarget != nil {
+            try checkPreparation(token)
+            try await Task.sleep(nanoseconds: pollNanoseconds)
+        }
+        try checkPreparation(token)
+        preparationItems[key] = MiniAudioPreparationItem(target: request.target, status: .requesting)
+        let result = try await client.request(request, retryTransport: false)
+        try checkPreparation(token)
+        if let asset = result.asset {
+            preparationItems[key] = MiniAudioPreparationItem(target: request.target, status: .ready, asset: asset)
+            return
+        }
+        guard var job = result.job else { throw MiniAudioFailure.interrupted }
+        while true {
+            try checkPreparation(token)
+            switch job.status {
+            case .queued, .running:
+                if preparationItems[key]?.job?.id != job.id || preparationItems[key]?.job?.status != job.status {
+                    let status: MiniAudioPreparationStatus = job.status == .queued ? .queued : .running
+                    preparationItems[key] = MiniAudioPreparationItem(target: request.target, status: status, job: job)
+                }
+            case .completed:
+                guard let assetId = job.assetId else { throw MiniStudyClientError.invalidResponse }
+                let snapshot = try await client.snapshot()
+                try checkPreparation(token)
+                guard let asset = snapshot.assets.first(where: { $0.id == assetId }) else {
+                    throw MiniStudyClientError.invalidResponse
+                }
+                preparationItems[key] = MiniAudioPreparationItem(target: request.target, status: .ready, job: job, asset: asset)
+                return
+            case .failed, .interrupted:
+                preparationItems[key]?.job = job
+                throw MiniStudyClientError.service(job.error ?? "音频生成中断，可以重试缺少的音频。")
+            }
+            try await Task.sleep(nanoseconds: pollNanoseconds)
+            job = try await client.job(job.id)
         }
     }
 
@@ -280,21 +279,33 @@ final class MiniAudioController: ObservableObject {
         play(target, automatic: automatic, followedBy: nil)
     }
 
+    func playSpellingResult(_ word: MiniWord, submissionId: UUID) {
+        play(.word(word), automatic: true, followedBy: nil, spellingResult: .saved(submissionId))
+    }
+
+    func playPreviewSpellingResult(_ word: MiniWord) {
+        play(.word(word), automatic: true, followedBy: nil, spellingResult: .preview)
+    }
+
     private func play(_ target: MiniAudioTarget, automatic: Bool, followedBy: MiniAudioTarget?,
-                      notBefore: ContinuousClock.Instant? = nil) {
-        guard let card = presentation else { return }
-        guard visible, card.enabled else { return }
+                      notBefore: ContinuousClock.Instant? = nil, spellingResult: SpellingResult? = nil) {
+        let card = presentation
+        let preview = spellingResult.map { $0.submissionId == nil } ?? card?.preview ?? false
+        guard visible, card?.enabled ?? (spellingResult != nil),
+              (card?.preview ?? preview) == preview else { return }
         guard !muted else { notice = "已静音，打开声音后可以重播。"; return }
-        guard target.word == card.word else { return }
-        if !card.preview {
+        guard spellingResult != nil || target.word == card?.word else { return }
+        if !preview {
+            if spellingResult != nil { recoveryAllowed = true }
             loadRecoveryIfNeeded()
             guard recoveryLoaded else { return }
         }
         stop()
         let token = operation, visit = visitId
-        if automatic, followedBy?.word == card.word { automaticNextTarget = followedBy }
+        playingSpellingResult = spellingResult != nil
+        if automatic, followedBy?.word == card?.word { automaticNextTarget = followedBy }
         player.onFinish = { [weak self] successful in
-            self?.finishedPlayback(token: token, visit: visit, preview: card.preview, successful: successful)
+            self?.finishedPlayback(token: token, visit: visit, preview: preview, successful: successful)
         }
         busyTarget = target
         notice = nil
@@ -303,15 +314,17 @@ final class MiniAudioController: ObservableObject {
             defer { if operation == token { authorizing = false } }
             do {
                 let asset = try await readyAsset(target, regenerate: false)
-                try ensureCurrent(token, visit: visit, preview: card.preview)
+                try ensureCurrent(token, visit: visit, preview: preview)
                 let bytes = try await client.file(asset.id)
-                try ensureCurrent(token, visit: visit, preview: card.preview)
+                try ensureCurrent(token, visit: visit, preview: preview)
                 var authorization: MiniAudioPlaybackReceipt?
-                if !card.preview {
+                if !preview {
                     authorizing = true
                     authorization = try await client.authorize(MiniAudioPlaybackRequest(
                         requestId: UUID(), assetId: asset.id, visitId: visit,
-                        mode: automatic ? .automatic : .manual, context: card.context))
+                        mode: automatic ? .automatic : .manual,
+                        context: spellingResult == nil ? card?.context : nil,
+                        spellingSubmissionId: spellingResult?.submissionId))
                     try ensureCurrent(token, visit: visit, preview: false)
                     // Refresh a committed support fact before accepting further study commands.
                     try await refresh?(authorization?.learningRevision)
@@ -319,7 +332,7 @@ final class MiniAudioController: ObservableObject {
                     authorizing = false
                 }
                 if let notBefore { try await ContinuousClock().sleep(until: notBefore) }
-                try ensureCurrent(token, visit: visit, preview: card.preview)
+                try ensureCurrent(token, visit: visit, preview: preview)
                 guard try player.play(bytes) else { throw MiniAudioFailure.playback }
                 playingTarget = target
                 busyTarget = nil
@@ -340,14 +353,17 @@ final class MiniAudioController: ObservableObject {
                 busyTarget = nil
                 playingTarget = nil
                 automaticNextTarget = nil
+                playingSpellingResult = false
+                if automatic, case MiniStudyClientError.staleAudio = error { return }
                 notice = error.localizedDescription
             }
         }
     }
 
     private func finishedPlayback(token: UUID, visit: UUID, preview: Bool, successful: Bool) {
-        guard operation == token, visitId == visit, presentation?.preview == preview else { return }
+        guard operation == token, visitId == visit, (presentation?.preview ?? preview) == preview else { return }
         playingTarget = nil
+        playingSpellingResult = false
         guard successful else {
             automaticNextTarget = nil
             notice = MiniAudioFailure.playback.localizedDescription
@@ -386,6 +402,7 @@ final class MiniAudioController: ObservableObject {
     func stop() {
         operation = UUID()
         automaticNextTarget = nil
+        playingSpellingResult = false
         task?.cancel(); task = nil
         player.onFinish = nil
         player.stop()
@@ -453,12 +470,13 @@ final class MiniAudioController: ObservableObject {
 
     private func ensureCurrent(_ token: UUID, visit: UUID, preview: Bool) throws {
         guard !Task.isCancelled, operation == token, visitId == visit, visible, !muted,
-              presentation?.enabled == true, presentation?.preview == preview else { throw CancellationError() }
+              presentation?.enabled ?? playingSpellingResult,
+              (presentation?.preview ?? preview) == preview else { throw CancellationError() }
     }
 
     private func readyAsset(_ target: MiniAudioTarget, regenerate: Bool, voice: String? = nil) async throws -> MiniAudioAsset {
         let result = try await client.request(MiniAudioRequest(target: target,
-            operation: regenerate ? .regenerate : .ensure, voice: voice))
+            operation: regenerate ? .regenerate : .ensure, voice: voice), retryTransport: true)
         if !regenerate, let asset = result.asset { return asset }
         guard var job = result.job else {
             if let asset = result.asset { return asset }
