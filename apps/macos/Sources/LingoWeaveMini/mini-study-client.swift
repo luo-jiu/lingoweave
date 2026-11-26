@@ -179,7 +179,12 @@ struct MiniAISelection: Codable, Equatable, Sendable {
     var model: String
     var effort: String
 
-    static let initial = Self(model: "gpt-6.1-sol", effort: "xhigh")
+    static let initial: Self = {
+        if Bundle.main.object(forInfoDictionaryKey: "LingoWeaveFriendBuild") as? Bool == true {
+            return Self(model: "gpt-6.2-sol", effort: "medium")
+        }
+        return Self(model: "gpt-6.1-sol", effort: "xhigh")
+    }()
 }
 
 struct MiniStudyAction: Codable, Sendable {

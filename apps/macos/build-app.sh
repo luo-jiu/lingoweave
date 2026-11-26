@@ -2,19 +2,25 @@
 set -euo pipefail
 
 usage() {
-  printf 'Usage: %s [--dev] [--open]\n' "$0"
+  printf 'Usage: %s [--dev | --friend] [--open]\n' "$0"
 }
 
 launch=false
+friend=false
 configuration=release
 for argument in "$@"; do
   case "$argument" in
     --dev) configuration=debug ;;
+    --friend) friend=true ;;
     --open) launch=true ;;
     -h|--help) usage; exit 0 ;;
     *) usage >&2; exit 2 ;;
   esac
 done
+if $friend && [ "$configuration" = debug ]; then
+  usage >&2
+  exit 2
+fi
 
 script_dir="$(cd -- "$(dirname -- "$0")" && pwd -P)"
 project_dir="$(cd -- "$script_dir/../.." && pwd -P)"
@@ -28,6 +34,8 @@ dist_dir="$script_dir/dist"
 app_name="LingoWeave Mini"
 if [ "$configuration" = debug ]; then
   app_name="LingoWeave Mini Dev"
+elif $friend; then
+  app_name="LingoWeave Mini Friend"
 fi
 app_bundle="$dist_dir/$app_name.app"
 
@@ -63,6 +71,9 @@ if [ "$configuration" = debug ]; then
   /usr/bin/plutil -replace CFBundleIdentifier -string com.lingoweave.mini.dev "$plist"
   /usr/bin/plutil -replace CFBundleName -string "$app_name" "$plist"
   /usr/bin/plutil -replace CFBundleDisplayName -string "$app_name" "$plist"
+fi
+if $friend; then
+  /usr/bin/plutil -insert LingoWeaveFriendBuild -bool true "$plist"
 fi
 /usr/bin/plutil -replace CFBundleExecutable -string launch "$plist"
 /usr/bin/plutil -insert LingoWeaveServiceURL -string "http://127.0.0.1:$service_port" "$plist"
